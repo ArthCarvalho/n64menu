@@ -1,6 +1,0 @@
-#ifndef RSP_BLEND_CONSTANTS_H
-#define RSP_BLEND_CONSTANTS_H
-
-#define ASSERT_INVALID_WIDTH   0x0101
-
-#endif

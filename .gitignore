@@ -23,6 +23,8 @@ build/
 *.d
 
 node_modules
+libdragon
 
 ## Editors
 .vscode
+
