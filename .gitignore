@@ -1,0 +1,28 @@
+## Build files
+*.a
+build/
+
+.libdragon
+
+## OSX junk
+.DS_Store
+.Trashes
+._*
+
+## Temporary files
+*.tmp
+*.swp
+*~
+
+*.v64
+*.z64
+*.elf
+*.bin
+*.o
+*.dfs
+*.d
+
+node_modules
+
+## Editors
+.vscode
