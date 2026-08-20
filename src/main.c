@@ -4,6 +4,7 @@
 
 #include "boot/boot.h"
 #include "flashcart/flashcart.h"
+#include "utils/fs.h"
 
 #define PI 3.141592653f
 #define PI2 (PI*2.0f)
@@ -435,17 +436,48 @@ void setRomPath(char * code) {
     strcat(rom_path, code);
     strcat(rom_path, "_e.z64");
 }
-void setupRomLoad(TitleBox * title) {
+flashcart_save_type_t getSaveType(char * code) {
+    char path[128];
+    char value[32] = {0};
+    snprintf(path, sizeof(path), "sd:/menu/title/%s/%s_e.save", code, code);
+
+    FILE * f = fopen(path, "r");
+    if(f == NULL) return FLASHCART_SAVE_TYPE_NONE;
+    fgets(value, sizeof(value), f);
+    fclose(f);
+    value[strcspn(value, "\r\n")] = 0;
+
+    if(strcmp(value, "eeprom4k") == 0) return FLASHCART_SAVE_TYPE_EEPROM_4K;
+    if(strcmp(value, "eeprom16k") == 0) return FLASHCART_SAVE_TYPE_EEPROM_16K;
+    if(strcmp(value, "sram") == 0) return FLASHCART_SAVE_TYPE_SRAM;
+    if(strcmp(value, "srambanked") == 0) return FLASHCART_SAVE_TYPE_SRAM_BANKED;
+    if(strcmp(value, "sram128k") == 0) return FLASHCART_SAVE_TYPE_SRAM_128K;
+    if(strcmp(value, "flashram") == 0) return FLASHCART_SAVE_TYPE_FLASHRAM;
+    if(strcmp(value, "flashram-pkst2") == 0) return FLASHCART_SAVE_TYPE_FLASHRAM_PKST2;
+    return FLASHCART_SAVE_TYPE_NONE;
+}
+bool setupRomLoad(TitleBox * title) {
     setRomPath(title->id);
 
-    flashcart_load_rom(rom_path, false, cart_load_progress);
+    if(flashcart_load_rom(rom_path, false, cart_load_progress) != FLASHCART_OK) return false;
+
+    flashcart_save_type_t save_type = getSaveType(title->id);
+    if(save_type == FLASHCART_SAVE_TYPE_NONE) {
+        if(flashcart_load_save(NULL, save_type) != FLASHCART_OK) return false;
+    } else {
+        char save_path[128];
+        directory_create("sd:/menu/save");
+        snprintf(save_path, sizeof(save_path), "sd:/menu/save/%s.sav", title->id);
+        if(flashcart_load_save(save_path, save_type) != FLASHCART_OK) return false;
+    }
 
     //boot_params.reset_type = BOOT_RESET_TYPE_NMI;
     boot_params.device_type = BOOT_DEVICE_TYPE_ROM;
     boot_params.tv_type = BOOT_TV_TYPE_PASSTHROUGH;
     boot_params.detect_cic_seed = true;
 
-     menu_active = false;
+    menu_active = false;
+    return true;
 }
 
 void load_titles() {
@@ -734,8 +766,7 @@ void menu_update() {
                 }
                 break;
             case 5:
-                setupRomLoad(selectedTitle);
-                if(p1_buttons_press.b) {
+                if(!setupRomLoad(selectedTitle) || p1_buttons_press.b) {
                     main_state = 6;
                     spinner_fade = 0.0f;
                     spinner_fade_counter = 0;
