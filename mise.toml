@@ -1,0 +1,6 @@
+[tools]
+zig = "0.14.0"
+
+[tasks.menu]
+description = "Build sc64menu.n64"
+run = "zig build menu"

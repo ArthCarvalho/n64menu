@@ -1,6 +1,9 @@
 ## Build files
 *.a
 build/
+.n64/
+zig-out/
+.zig-cache/
 
 .libdragon
 
