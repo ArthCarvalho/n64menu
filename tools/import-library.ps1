@@ -300,6 +300,12 @@ foreach ($rom in $roms) {
     $destination = Join-Path $titleRoot $id
     [System.IO.Directory]::CreateDirectory($destination) | Out-Null
     Copy-Rom $rom (Join-Path $destination "${id}_e.z64")
+    $displayName = [System.IO.Path]::GetFileNameWithoutExtension($rom)
+    [System.IO.File]::WriteAllText(
+        (Join-Path $destination "${id}_e.name"),
+        $displayName,
+        [System.Text.Encoding]::ASCII
+    )
 
     $artwork = Find-Artwork $rom $images $retroArchImages $cacheRoot
     if ($null -eq $artwork) {
