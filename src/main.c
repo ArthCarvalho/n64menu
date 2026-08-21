@@ -68,9 +68,11 @@ sprite_t *logo_splash;
 
 rdpq_font_t *font_body;
 rdpq_font_t *font_title;
+rdpq_font_t *font_small;
 
 #define FONT_BODY    1
 #define FONT_TITLE   2
+#define FONT_SMALL   3
 
 #define STYLE_WHITE      0
 #define STYLE_YELLOW     1
@@ -267,22 +269,24 @@ void disc_draw(float cx, float cy, int radius, color_t color) {
 
 // Layered circular button cap: shadow, body, and a small top-left highlight.
 // Unlike the old two-rectangle octagon, the silhouette stays round at this size.
+// Sized from the console's own legend, whose caps measure about 20 framebuffer
+// pixels across once its native 1080p output is scaled to ours.
 void button_cap_draw(float cx, float cy, color_t dark, color_t color, color_t light) {
-    disc_draw(cx + 1, cy + 2, 11, RGBA32(0, 0, 0, 255));
-    disc_draw(cx, cy, 11, dark);
-    disc_draw(cx, cy - 1, 9, color);
-    disc_draw(cx - 3, cy - 5, 3, light);
+    disc_draw(cx + 1, cy + 1, 10, RGBA32(0, 0, 0, 255));
+    disc_draw(cx, cy, 10, dark);
+    disc_draw(cx, cy - 1, 8, color);
+    disc_draw(cx - 3, cy - 4, 2, light);
 }
 
 // Centred through the layout engine rather than by hand, then nudged by the
 // residual measured off a capture: the glyph box centres the advance width, which
 // leaves the inked shape slightly high and left of the cap.
 void button_letter_draw(float cx, float cy, const char *label) {
-    const float box = 24.0f;
+    const float box = 20.0f;
     rdpq_text_print(&(rdpq_textparms_t){
         .width = box, .height = box,
         .align = ALIGN_CENTER, .valign = VALIGN_CENTER,
-    }, FONT_BODY, cx - box * 0.5f + 1.0f, cy - box * 0.5f + 2.0f, label);
+    }, FONT_SMALL, cx - box * 0.5f + 1.0f, cy - box * 0.5f + 2.0f, label);
 }
 
 // M64 marks the active row with a solid yellow triangle, not a highlighted card.
@@ -316,7 +320,9 @@ void logo_draw(sprite_t *logo, float x, float y) {
     };
 
     rdpq_set_mode_standard();
-    rdpq_mode_filter(FILTER_BILINEAR);
+    // Blitted one to one, so sampling must be point: bilinear averages neighbouring
+    // texels and erases single-pixel detail such as the counter inside the 6.
+    rdpq_mode_filter(FILTER_POINT);
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
 
     for(int i = 0; i < 3; i++) {
@@ -1195,7 +1201,7 @@ void draw(int cur_frame) {
         rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
         rdpq_text_print(NULL, FONT_TITLE, BOX_REGION_X_MIN, 104, "LIBRARY");
 
-        rdpq_text_printf(NULL, FONT_BODY, BOX_REGION_X_MIN, HINT_Y + 12,
+        rdpq_text_printf(NULL, FONT_SMALL, BOX_REGION_X_MIN, HINT_Y + 12,
             title_truncated ? "^02%d TITLES (LIMIT)" : "^02%d TITLES", title_count);
 
         // Circular M64-style caps. The letter is centred on the cap and drawn in
@@ -1203,12 +1209,12 @@ void draw(int cur_frame) {
         button_cap_draw(427, HINT_Y + 10,
             RGBA32(0, 50, 150, 255), RGBA32(0, 104, 230, 255), RGBA32(62, 160, 255, 255));
         button_letter_draw(427, HINT_Y + 10, "^05A");
-        rdpq_text_print(NULL, FONT_BODY, 446, HINT_Y + 16, "PLAY");
+        rdpq_text_print(NULL, FONT_SMALL, 446, HINT_Y + 14, "PLAY");
 
         button_cap_draw(527, HINT_Y + 10,
             RGBA32(0, 96, 40, 255), RGBA32(0, 183, 73, 255), RGBA32(55, 235, 120, 255));
         button_letter_draw(527, HINT_Y + 10, "^05B");
-        rdpq_text_print(NULL, FONT_BODY, 546, HINT_Y + 16, "BACK");
+        rdpq_text_print(NULL, FONT_SMALL, 546, HINT_Y + 14, "BACK");
     }
 
 
@@ -1256,7 +1262,9 @@ void draw(int cur_frame) {
 int main(void)
 {
     /* Initialize peripherals */
-    display_init(RESOLUTION_640x480, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_DEDITHER);
+    // No VI filtering: the menu is flat colour and pixel art, so dedither only
+    // softens it, and the console's own UI is crisp by comparison.
+    display_init(RESOLUTION_640x480, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_DISABLED);
     dfs_init( DFS_DEFAULT_LOCATION );
     debug_init_sdfs("sd:/", -1);
     rdpq_init();
@@ -1268,8 +1276,10 @@ int main(void)
 
     font_body = rdpq_font_load("rom:/m64_body.font64");
     font_title = rdpq_font_load("rom:/m64_title.font64");
+    font_small = rdpq_font_load("rom:/m64_small.font64");
     rdpq_text_register_font(FONT_BODY, font_body);
     rdpq_text_register_font(FONT_TITLE, font_title);
+    rdpq_text_register_font(FONT_SMALL, font_small);
 
     rdpq_fontstyle_t white  = { .color = RGBA32(255, 255, 255, 255) };
     rdpq_fontstyle_t yellow = { .color = RGBA32(255, 214, 0, 255) };
@@ -1289,6 +1299,9 @@ int main(void)
     rdpq_font_style(font_body,  STYLE_SHADOW_SEL, &shadowsel);
     rdpq_font_style(font_title, STYLE_WHITE,  &white);
     rdpq_font_style(font_title, STYLE_YELLOW, &yellow);
+    rdpq_font_style(font_small, STYLE_WHITE, &white);
+    rdpq_font_style(font_small, STYLE_DIM, &dim);
+    rdpq_font_style(font_small, STYLE_OUTLINE, &keyline);
 
 
     menu_sidebar.sprite.x = 0;
