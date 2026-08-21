@@ -387,9 +387,23 @@ void ribbon_draw(void) {
         float x = RIBBON_T0 + i * RIBBON_STEP - 13.0f;
         float y = 47.0f;
 
-        // A single shadow, tinted to the tab it falls on.
-        rdpq_text_printf(NULL, FONT_BODY, x + 4.0f, y + 3.0f,
-            i == library_position_segment ? "^06%c" : "^04%c", initial);
+        // A uniform offset reads as the letter hovering, or as extrusion. A real
+        // shadow is anchored at the base and sweeps further the higher up the
+        // glyph it is cast from, so shear it: each horizontal slice is displaced
+        // in proportion to its height above the letter's feet.
+        const int bands = 5;
+        const float band_h = 16.0f / bands;
+        for(int b = 0; b < bands; b++) {
+            float band_top = y - 16.0f + b * band_h;
+            float lift = 1.0f - (float)b / (float)(bands - 1);
+            float ox = 1.0f + lift * 5.0f;
+            float oy = lift * 3.0f;
+
+            rdpq_set_scissor(0, band_top + oy, SCREEN_WIDTH, band_top + band_h + oy);
+            rdpq_text_printf(NULL, FONT_BODY, x + ox, y + oy,
+                i == library_position_segment ? "^06%c" : "^04%c", initial);
+        }
+        rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 
         static const float outline_x[4] = { -1.0f, 1.0f,  0.0f, 0.0f };
         static const float outline_y[4] = {  0.0f, 0.0f, -1.0f, 1.0f };
