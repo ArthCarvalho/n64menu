@@ -41,18 +41,23 @@ float bezier_interp(float t, float x1, float y1, float x2, float y2) {
 }
 
 sprite_t *logo;
-sprite_t *shadow;
-sprite_t *loading_dot;
+
+rdpq_font_t *font_body;
+rdpq_font_t *font_title;
+
+#define FONT_BODY    1
+#define FONT_TITLE   2
+
+#define STYLE_WHITE  0
+#define STYLE_YELLOW 1
+#define STYLE_DIM    2
 
 int spinner_fade_counter = 0;
 float spinner_fade = 0.0f;
 float spinner_counter = 0.0f;
 
 void spinner_draw(float x, float y, float size, float alpha) {
-    float dot_size = (11.0f * 0.5f) * 0.4f;
-    rdpq_set_prim_color(RGBA32(255, 255, 255, alpha * 255.0f));
-    rdpq_mode_combiner(RDPQ_COMBINER_TEX_ALPHA);
-    rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
+    float dot_size = 4.0f;
     for(int a = 11; a >= 0 ; a--) {
         float thisAnimSize = (12.0f - fmod((spinner_counter + a),12.0f))- 9.0f;
         if(thisAnimSize < 0.0f) thisAnimSize = 0.0f;
@@ -61,9 +66,9 @@ void spinner_draw(float x, float y, float size, float alpha) {
         float dot_ang = (a / 12.0f) * PI2;
         float dot_x = (x + sin(dot_ang) * size) - dot_size * scaled;
         float dot_y = (y + cos(dot_ang) * size) - dot_size * scaled;
-        rdpq_sprite_blit(loading_dot, dot_x, dot_y, &(rdpq_blitparms_t){
-            .scale_x = scaled, .scale_y = scaled,
-        });
+        int intensity = alpha * (90 + animParam * 165.0f);
+        rdpq_set_mode_fill(RGBA32(255, 204, 0, intensity));
+        rdpq_fill_rectangle(dot_x, dot_y, dot_x + dot_size * scaled * 2.0f, dot_y + dot_size * scaled * 2.0f);
     }
     spinner_counter += 0.25f;
 }
@@ -97,15 +102,6 @@ joypad_buttons_t p1_buttons;
 joypad_buttons_t p1_buttons_press;
 joypad_inputs_t p1_inputs;
 
-rdpq_font_t * font;
-
-static wav64_t se_titlelogo;
-static wav64_t se_cursor_ng;
-static wav64_t se_gametitle_cursor;
-static wav64_t se_filemenu_close;
-static wav64_t se_filemenu_open;
-static wav64_t se_gametitle_click; 
-
 #define SCREEN_WIDTH 640
 #define SCREEN_HEIGHT 480
 
@@ -119,9 +115,18 @@ static wav64_t se_gametitle_click;
 
 #define SCR_REGION_X_MIN 16.0f
 #define BOX_REGION_X_MIN 64.0f
-#define BOX_REGION_X_MAX 624.0f
-#define BOX_REGION_Y_MIN 16.0f
-#define BOX_REGION_Y_MAX 464.0f
+#define BOX_REGION_X_MAX 608.0f
+#define BOX_REGION_Y_MIN 120.0f
+#define BOX_REGION_Y_MAX 413.0f
+
+// M64 leans on negative space: covers get real gutters instead of NSO's flush packing.
+#define GRID_GUTTER 16.0f
+#define GRID_SCISSOR_X_MIN (BOX_REGION_X_MIN - 48.0f)
+#define GRID_SCISSOR_X_MAX (BOX_REGION_X_MAX + 16.0f)
+#define GRID_SCISSOR_Y_MIN (BOX_REGION_Y_MIN - 4.0f)
+#define GRID_SCISSOR_Y_MAX (BOX_REGION_Y_MAX + 4.0f)
+#define CHROME_RULE_Y 62.0f
+#define HINT_Y 444.0f
 
 #define TITLE_BOX_WIDTH_E 256.0f
 #define TITLE_BOX_HEIGHT_E 179.0f
@@ -155,50 +160,120 @@ int main_state = 0;
 int opening_counter = OPENING_WAIT;
 float opening_card_offset_x = 0.0f;
 
-float shadow_vertex[8];
-
-void shadow_draw(float x, float y, float width, float height, float alpha) {
-    // Load shadow sprite surface
-    surface_t surf = sprite_get_pixels(shadow);
-    rdpq_set_prim_color(RGBA32(0, 0, 0, alpha * 255.0f));
-    rdpq_mode_combiner(RDPQ_COMBINER_TEX_ALPHA);
-    rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
-    rdpq_mode_dithering(DITHER_BAYER_BAYER);
-    rdpq_mode_tlut(TLUT_NONE);
-    rdpq_tex_upload(TILE0, &surf, &(rdpq_texparms_t){.s.repeats = 1, .t.repeats = 1});
-
-    float xw = x + width;
-    float yh = y + height;
-
-    rdpq_triangle(&TRIFMT_TEX,
-        (float[]){ x,  y,  0.0f, 0.0f, 1.0f },
-        (float[]){xw,  y, 64.0f, 0.0f, 1.0f },
-        (float[]){xw, yh, 64.0f,64.0f, 1.0f }
-    );
-
-    rdpq_triangle(&TRIFMT_TEX,
-        (float[]){ x,  y,  0.0f, 0.0f, 1.0f },
-        (float[]){xw, yh, 64.0f,64.0f, 1.0f },
-        (float[]){ x, yh, 64.0f, 0.0f, 1.0f }
-    );
-    
-    // Revert combiner
-    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
-}
-
-void outline_draw(float x, float y, float width, float height, float brightness) {
-    #define OUTLINE_WIDTH 1
-    int brightv = brightness * 255.0f;
+void outline_draw(float x, float y, float width, float height, int size, color_t color) {
     x = round(x);
     y = round(y);
     width = ceil(width);
     height = ceil(height);
-    rdpq_set_mode_fill(RGBA32(brightv,brightv,brightv,0));
-    rdpq_fill_rectangle(x, y, x + width, y + OUTLINE_WIDTH);
-    rdpq_fill_rectangle(x, y+height-OUTLINE_WIDTH, x + width, y + height);
-    rdpq_fill_rectangle(x, y, x+OUTLINE_WIDTH, y+height);
-    rdpq_fill_rectangle(x+width-OUTLINE_WIDTH, y, x+width, y+height);
+    rdpq_set_mode_fill(color);
+    rdpq_fill_rectangle(x, y, x + width, y + size);
+    rdpq_fill_rectangle(x, y + height - size, x + width, y + height);
+    rdpq_fill_rectangle(x, y, x + size, y + height);
+    rdpq_fill_rectangle(x + width - size, y, x + width, y + height);
 }
+
+void quad_draw(float x1, float y1, float x2, float y2, float skew, color_t color) {
+    rdpq_set_mode_fill(color);
+    rdpq_triangle(&TRIFMT_FILL,
+        (float[]){ x1 + skew, y1 }, (float[]){ x2, y1 }, (float[]){ x1, y2 });
+    rdpq_triangle(&TRIFMT_FILL,
+        (float[]){ x2, y1 }, (float[]){ x2 - skew, y2 }, (float[]){ x1, y2 });
+}
+
+// Rounded "button" blob used for the A/B legend glyphs.
+void pill_draw(float x, float y, float w, float h, color_t color) {
+    rdpq_set_mode_fill(color);
+    rdpq_fill_rectangle(x + 2, y, x + w - 2, y + h);
+    rdpq_fill_rectangle(x, y + 2, x + w, y + h - 2);
+}
+
+// M64 marks the active row with a solid yellow triangle, not a highlighted card.
+void marker_draw(float x, float y, float size, color_t color) {
+    rdpq_set_mode_fill(color);
+    rdpq_triangle(&TRIFMT_FILL,
+        (float[]){ x, y }, (float[]){ x + size, y + size * 0.5f }, (float[]){ x, y + size });
+}
+
+void focus_draw(float x, float y, float width, float height) {
+    // Thin yellow hairline frame; the emphasis comes from brightness + marker, not chrome.
+    outline_draw(x, y, width, height, 2, RGBA32(255, 214, 0, 255));
+    marker_draw(x - 14, y + height * 0.5f - 7, 11, RGBA32(255, 214, 0, 255));
+}
+
+// The M64 mark is layered yellow -> orange -> pink rather than a flat tint. The
+// sprite is a white mask, so we blit it once per horizontal band, clipped by scissor.
+void logo_draw(float x, float y, float scale) {
+    if(logo == NULL || logo->width <= 0 || logo->width > 512 ||
+       logo->height <= 0 || logo->height > 256) return;
+
+    float w = logo->width * scale;
+    float h = logo->height * scale;
+
+    const float band_top[3] = { 0.00f, 0.44f, 0.74f };
+    const float band_bot[3] = { 0.44f, 0.74f, 1.00f };
+    color_t band_col[3] = {
+        RGBA32(255, 214, 0, 255),
+        RGBA32(255, 122, 0, 255),
+        RGBA32(255, 35, 156, 255),
+    };
+
+    rdpq_set_mode_standard();
+    rdpq_mode_filter(FILTER_BILINEAR);
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+
+    for(int i = 0; i < 3; i++) {
+        // The splash slides the mark off-screen, so the band rect must be clamped
+        // to the framebuffer: rdpq_set_scissor rejects negative coordinates.
+        float sx0 = x;
+        float sx1 = x + w + 2;
+        float sy0 = y + h * band_top[i];
+        float sy1 = y + h * band_bot[i];
+
+        if(sx0 < 0.0f) sx0 = 0.0f;
+        if(sy0 < 0.0f) sy0 = 0.0f;
+        if(sx1 > SCREEN_WIDTH) sx1 = SCREEN_WIDTH;
+        if(sy1 > SCREEN_HEIGHT) sy1 = SCREEN_HEIGHT;
+        if(sx1 <= sx0 || sy1 <= sy0) continue;
+
+        rdpq_set_scissor(sx0, sy0, sx1, sy1);
+        rdpq_set_prim_color(band_col[i]);
+        rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){ .scale_x = scale, .scale_y = scale });
+    }
+
+    rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+}
+
+void ribbon_draw(void) {
+    const float y0 = 16.0f, y1 = 58.0f, skew = 16.0f;
+    color_t stripes[5] = {
+        RGBA32(74, 32, 122, 255),
+        RGBA32(113, 48, 183, 255),
+        RGBA32(255, 35, 156, 255),   // active tab
+        RGBA32(113, 48, 183, 255),
+        RGBA32(74, 32, 122, 255),
+    };
+    // Adjacent parallelograms separated by thin black diagonals, so the band reads
+    // as one ribbon instead of five floating bars.
+    float x = 340.0f;
+    for(int i = 0; i < 5; i++) {
+        quad_draw(x, y0, x + 50.0f, y1, skew, stripes[i]);
+        x += 56.0f;
+    }
+}
+
+void chrome_draw(void) {
+    rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
+    rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+
+    ribbon_draw();
+
+    // Pink rule anchoring the header, as on the M64's own pages.
+    rdpq_set_mode_fill(RGBA32(255, 35, 156, 255));
+    rdpq_fill_rectangle(BOX_REGION_X_MIN, CHROME_RULE_Y, 620, CHROME_RULE_Y + 3);
+
+    logo_draw(BOX_REGION_X_MIN, 18, 0.32f);
+}
+
 
 typedef struct SquareSprite_s {
     float x, y;
@@ -225,6 +300,18 @@ float title_brightness = 1.0f;
 #define MAX_TITLE_COUNT 40
 
 int title_count = 0;
+
+/** Set when the catalog was larger than the menu can hold, so the UI can say so. */
+int title_truncated = 0;
+
+/** Longest title ID accepted, excluding the terminator (TitleBox.id is 8 bytes). */
+#define TITLE_ID_MAX 7
+
+/** Upper bound on menu/title.csv, so a malformed card cannot exhaust memory. */
+#define TITLE_CSV_MAX 1024
+
+/** Static storage avoids disturbing the heap that owns all loaded sprites. */
+static char title_csv[TITLE_CSV_MAX + 1];
 
 TitleBox title_list[MAX_TITLE_COUNT];
 
@@ -268,7 +355,10 @@ void TitleBox_create(TitleBox * title, sprite_t * image, float x, float y) {
 }
 
 void TitleBox_create2(TitleBox * title, sprite_t * image, char * id) {
-    memcpy(title->id, id, 8);
+    size_t id_length = strlen(id);
+    if(id_length >= sizeof(title->id)) id_length = sizeof(title->id) - 1;
+    memcpy(title->id, id, id_length);
+    title->id[id_length] = 0;
     title->image = image;
     title->sprite.x = 0.0f;
     title->sprite.y = 0.0f;
@@ -304,7 +394,7 @@ void TitleBox_draw(TitleBox * title) {
     float originalWidth = title->sprite.width * title->scale;
     float originalHeight = title->sprite.height * title->scale;
     if(title->isSelected) {
-        float scaleHeight = (originalHeight + 16) / originalHeight;
+        float scaleHeight = (originalHeight + 8) / originalHeight;
         float scaleFactor = titleScale * scaleHeight;
         titleScale = titleScale + title->scaleGrow * (scaleFactor - titleScale);
     }
@@ -329,29 +419,24 @@ void TitleBox_draw(TitleBox * title) {
         return;
     }
 
-    if(title->isSelected) {
-        float shadow_scaleX = titleScale * 1.1f;  
-        float shadow_scaleY = titleScale * 1.05f; 
-        float shadowSizeX = scaledWidth * shadow_scaleX;
-        float shadowSizeY = scaledHeight * shadow_scaleY;
-        float shadowOffsetX = offsetX - (shadowSizeX - scaledWidth) * 0.5f;
-        
-        shadow_draw(shadowOffsetX, offsetY - (viewport_y - BOX_REGION_Y_MIN), shadowSizeX, shadowSizeY, 0.23f);
-    }
-    int b = title_brightness * 255.0f;
+    float screenY = offsetY - (viewport_y - BOX_REGION_Y_MIN);
+
+    // Unselected art recedes into the black field; the active cover is the only one at full strength.
+    float level = title->isSelected ? 1.0f : 0.40f;
+    int b = title_brightness * level * 255.0f;
+    rdpq_set_mode_standard();
+    rdpq_mode_filter(FILTER_BILINEAR);
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
     rdpq_set_prim_color(RGBA32(b, b, b, 255));
-    rdpq_sprite_blit(title->image, offsetX, offsetY - (viewport_y - BOX_REGION_Y_MIN), &(rdpq_blitparms_t){
+    rdpq_sprite_blit(title->image, offsetX, screenY, &(rdpq_blitparms_t){
         .scale_x = titleScale, .scale_y = titleScale,
     });
 
     if(title->isSelected) {
-        outline_draw(
-            offsetX, offsetY - (viewport_y - BOX_REGION_Y_MIN),
-            title->sprite.width * titleScale, title->sprite.height * titleScale,
-            title->selectedOutline
-        );
+        focus_draw(offsetX - 3, screenY - 3, scaledWidth + 6, scaledHeight + 6);
     }
 }
+
 
 typedef struct MenuSidebar_s {
     SquareSprite sprite;
@@ -390,9 +475,7 @@ void menu_sidebar_update(MenuSidebar * obj) {
 
     if(obj->prevIsOpen != obj->isOpen) {
         if(obj->isOpen) {
-            wav64_play(&se_filemenu_open, CHANNEL_SFX1);            
         } else {
-            wav64_play(&se_filemenu_close, CHANNEL_SFX1);
         }
     }
 
@@ -423,10 +506,11 @@ void menu_sidebar_update(MenuSidebar * obj) {
 
 }
 void menu_sidebar_draw(MenuSidebar * obj) {
-    rdpq_set_prim_color(RGBA32(255, 0, 0, 0));
+    rdpq_set_prim_color(RGBA32(32, 13, 54, 255));
     rdpq_triangle(&TRIFMT_FILL, &obj->vertex[0], &obj->vertex[2], &obj->vertex[4]);
     rdpq_triangle(&TRIFMT_FILL, &obj->vertex[0], &obj->vertex[6], &obj->vertex[2]);
 }
+
 
 void setRomPath(char * code) {
     memset(rom_path, 0, sizeof(rom_path));
@@ -447,13 +531,16 @@ flashcart_save_type_t getSaveType(char * code) {
     fclose(f);
     value[strcspn(value, "\r\n")] = 0;
 
-    if(strcmp(value, "eeprom4k") == 0) return FLASHCART_SAVE_TYPE_EEPROM_4K;
-    if(strcmp(value, "eeprom16k") == 0) return FLASHCART_SAVE_TYPE_EEPROM_16K;
-    if(strcmp(value, "sram") == 0) return FLASHCART_SAVE_TYPE_SRAM;
-    if(strcmp(value, "srambanked") == 0) return FLASHCART_SAVE_TYPE_SRAM_BANKED;
-    if(strcmp(value, "sram128k") == 0) return FLASHCART_SAVE_TYPE_SRAM_128K;
-    if(strcmp(value, "flashram") == 0) return FLASHCART_SAVE_TYPE_FLASHRAM;
-    if(strcmp(value, "flashram-pkst2") == 0) return FLASHCART_SAVE_TYPE_FLASHRAM_PKST2;
+    // Older library exports stored the enum as one digit. Keep accepting those
+    // persisted sidecars while using names for all new files.
+    if(strcmp(value, "none") == 0 || strcmp(value, "0") == 0) return FLASHCART_SAVE_TYPE_NONE;
+    if(strcmp(value, "eeprom4k") == 0 || strcmp(value, "1") == 0) return FLASHCART_SAVE_TYPE_EEPROM_4K;
+    if(strcmp(value, "eeprom16k") == 0 || strcmp(value, "2") == 0) return FLASHCART_SAVE_TYPE_EEPROM_16K;
+    if(strcmp(value, "sram") == 0 || strcmp(value, "3") == 0) return FLASHCART_SAVE_TYPE_SRAM;
+    if(strcmp(value, "srambanked") == 0 || strcmp(value, "4") == 0) return FLASHCART_SAVE_TYPE_SRAM_BANKED;
+    if(strcmp(value, "sram128k") == 0 || strcmp(value, "5") == 0) return FLASHCART_SAVE_TYPE_SRAM_128K;
+    if(strcmp(value, "flashram") == 0 || strcmp(value, "6") == 0) return FLASHCART_SAVE_TYPE_FLASHRAM;
+    if(strcmp(value, "flashram-pkst2") == 0 || strcmp(value, "7") == 0) return FLASHCART_SAVE_TYPE_FLASHRAM_PKST2;
     return FLASHCART_SAVE_TYPE_NONE;
 }
 bool setupRomLoad(TitleBox * title) {
@@ -485,42 +572,61 @@ void load_titles() {
 
     //row_max = 4; // Quick hack to reduce the number of titles per row
 
-    char pathstr[256];
-    strcpy(pathstr, "sd:/menu/title/");
-    
     FILE * f = fopen("sd://menu/title.csv", "r");
     if(f != NULL){
         setvbuf(f, NULL, _IONBF, 0);
         fseek(f, 0, SEEK_END);
-        int csvsize = ftell(f);
+        long csvsize = ftell(f);
         fseek(f, 0, SEEK_SET);
-        fread(pathstr, 1, csvsize, f);
+
+        if(csvsize < 0) csvsize = 0;
+        if(csvsize > TITLE_CSV_MAX) {
+            // Read only what we will parse rather than overrunning the buffer.
+            csvsize = TITLE_CSV_MAX;
+            title_truncated = 1;
+        }
+
+        size_t read = fread(title_csv, 1, csvsize, f);
+        title_csv[read] = 0;
         fclose(f);
-        char * pathstritr = pathstr;
-        char flbuf[8];
+
+        char flbuf[TITLE_ID_MAX + 1];
         int flbfpos = 0;
+        bool invalid_id = false;
         title_count = 0;
-        do {
-            if(*pathstritr == ',' || *pathstritr == ' ' || *pathstritr == 0x0) {
-                if(flbfpos != 0) {
-                    char filename[64];
+
+        for(char * it = title_csv; ; it++) {
+            char c = *it;
+            if(c == ',' || c == ' ' || c == '\r' || c == '\n' || c == 0) {
+                if(flbfpos != 0 && !invalid_id) {
                     flbuf[flbfpos] = 0;
-                    strcpy(filename, "sd:/menu/title/");
-                    strcat(filename, flbuf);
-                    strcat(filename, "/");
-                    strcat(filename, flbuf);
-                    strcat(filename, "_e.sprite");
-                    TitleBox_create2(&title_list[title_count], sprite_load(filename), flbuf);
-                    title_row[title_count/row_max][title_count%row_max] = &title_list[title_count];
+
+                    if(title_count >= MAX_TITLE_COUNT || (title_count / row_max) >= TITLE_ROWS) {
+                        title_truncated = 1;
+                        break;
+                    }
+
+                    char filename[64];
+                    snprintf(filename, sizeof(filename), "sd:/menu/title/%s/%s_e.sprite", flbuf, flbuf);
+
+                    sprite_t * image = sprite_load(filename);
+                    TitleBox_create2(&title_list[title_count], image, flbuf);
+                    title_row[title_count / row_max][title_count % row_max] = &title_list[title_count];
                     title_count++;
                 }
                 flbfpos = 0;
-            } else {
-                flbuf[flbfpos] = *pathstritr;
+                invalid_id = false;
+            } else if(flbfpos < TITLE_ID_MAX) {
+                flbuf[flbfpos] = c;
                 flbfpos++;
+            } else {
+                // Consume an oversized token, but never add its truncated prefix.
+                invalid_id = true;
+                title_truncated = 1;
             }
-            pathstritr++;
-        } while(*pathstritr != 0x00);
+
+            if(c == 0) break;
+        }
     }
 
     for(int y = 0; y < TITLE_ROWS; y++) { 
@@ -531,26 +637,26 @@ void load_titles() {
         title_row_count[y] = row_count;
     }
     
+    // Fixed tile pitch with real gutters, rather than scaling covers to fill the row edge-to-edge.
+    float tileWidth = (BOX_REGION_X_MAX - BOX_REGION_X_MIN - GRID_GUTTER * (TITLE_COLUMNS - 1)) / TITLE_COLUMNS;
+    float rowScale = tileWidth / TITLE_BOX_WIDTH_E;
+    float tileHeight = TITLE_BOX_HEIGHT_E * rowScale;
+
     float currentRowY = box_region_min_y;
     for(int y = 0; y < TITLE_ROWS; y++) {
         int currentRowCount = title_row_count[y];
         if(currentRowCount == 0) continue;
-        float rowScale = 1.0f;
-        if(currentRowCount > 2) {
-            rowScale = (BOX_REGION_X_MAX - BOX_REGION_X_MIN)  / (currentRowCount * TITLE_BOX_WIDTH_E);
-        }
-        float scaledTitleX = TITLE_BOX_WIDTH_E * rowScale;
-        
+
         for(int x = 0; x < row_max; x++) {
             TitleBox * current = title_row[y][x];
             if(current == NULL) continue;
             current->scale = rowScale;
 
-            current->sprite.x = box_region_min_x + scaledTitleX * x;
+            current->sprite.x = BOX_REGION_X_MIN + (tileWidth + GRID_GUTTER) * x;
             current->sprite.y = currentRowY;
 
         }
-        currentRowY += TITLE_BOX_HEIGHT_E * rowScale;
+        currentRowY += tileHeight + GRID_GUTTER;
     }
 
     if(currentRowY > SCREEN_HEIGHT) {
@@ -619,6 +725,9 @@ void menu_update() {
         } else {
             cursor_x_timer = 0;
         }
+        // No lateral menu in this theme: pressing left at the first column must not
+        // drop into a selection-less state.
+        if(cursor_x < 0) cursor_x = 0;
         if(cursor_x >= 0) {
             if(input_y < 0) {
                 if(cursor_y_timer == 0){ 
@@ -696,10 +805,8 @@ void menu_update() {
     
 
     if(limit_reached) {
-        wav64_play(&se_cursor_ng, CHANNEL_SFX1);
     }
     if(cursor_move) {
-        wav64_play(&se_gametitle_cursor, CHANNEL_SFX1);
     }
 
     if(cursor_x >= 0) {
@@ -722,7 +829,6 @@ void menu_update() {
         if(p1_buttons_press.a) {
             main_state = 4;
             selectedTitle->scaleGrow = 0.0f;
-            wav64_play(&se_gametitle_click, CHANNEL_SFX1);
         }
     }
 
@@ -798,8 +904,10 @@ void menu_draw() {
     rdpq_mode_combiner(RDPQ_COMBINER_FLAT);    
     
     if(main_state != 5) {
-        int minSciss = opening_card_offset_x < menu_sidebar.sprite.width ? opening_card_offset_x : menu_sidebar.sprite.width;
-        rdpq_set_scissor(minSciss,BOX_REGION_Y_MIN,BOX_REGION_X_MAX,BOX_REGION_Y_MAX);
+        // Scissor left of the grid so the selection marker has room; the old NSO
+        // left rail no longer exists in this theme.
+        rdpq_set_scissor(GRID_SCISSOR_X_MIN, GRID_SCISSOR_Y_MIN,
+            GRID_SCISSOR_X_MAX, GRID_SCISSOR_Y_MAX);
 
         rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
         
@@ -816,13 +924,6 @@ void menu_draw() {
             // Draw last
             TitleBox_draw(selectedTitle);
         }
-
-        rdpq_set_scissor(BOX_REGION_Y_MIN,BOX_REGION_Y_MIN,BOX_REGION_X_MAX,BOX_REGION_Y_MAX);
-
-        rdpq_set_mode_standard();
-        rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
-        
-        menu_sidebar_draw(&menu_sidebar);
 
     }
 
@@ -866,7 +967,6 @@ void update(int ovfl) {
             opening_counter--;
             if(opening_counter == OPENING_SOUND_PLAY) {
                 
-                wav64_play(&se_titlelogo, CHANNEL_SFX1);
             }
             if(opening_counter == 0) {
                 main_state = 2;
@@ -879,7 +979,6 @@ void update(int ovfl) {
             opening_counter--;
             if(opening_counter == 0) {
                 main_state = 3;
-                sprite_free(logo);
             }
             break;
     }
@@ -891,24 +990,50 @@ void draw(int cur_frame) {
     surface_t *disp = display_get();
     rdpq_attach(disp, NULL);
 
-    rdpq_set_scissor(SCR_REGION_X_MIN,BOX_REGION_Y_MIN,BOX_REGION_X_MAX,BOX_REGION_Y_MAX);
-
     if(main_state >= 2) {
-        rdpq_set_mode_fill(RGBA32(48,48,48,0));
-        rdpq_fill_rectangle(64, BOX_REGION_Y_MIN, BOX_REGION_X_MAX, BOX_REGION_Y_MAX);
+        rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        chrome_draw();
+        rdpq_set_scissor(GRID_SCISSOR_X_MIN, GRID_SCISSOR_Y_MIN,
+            GRID_SCISSOR_X_MAX, GRID_SCISSOR_Y_MAX);
         menu_draw();
+
+        rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        rdpq_text_print(NULL, FONT_TITLE, BOX_REGION_X_MIN, 104, "LIBRARY");
+
+        rdpq_text_printf(NULL, FONT_BODY, BOX_REGION_X_MIN, HINT_Y + 12,
+            title_truncated ? "^02%d TITLES (LIMIT)" : "^02%d TITLES", title_count);
+
+        // A/B legend, right-aligned. Press Start 2P is monospace at ~16px/char.
+        pill_draw(416, HINT_Y, 20, 20, RGBA32(41, 121, 255, 255));
+        rdpq_text_print(NULL, FONT_BODY, 418, HINT_Y + 16, "A");
+        rdpq_text_print(NULL, FONT_BODY, 444, HINT_Y + 16, "PLAY");
+
+        pill_draw(520, HINT_Y, 20, 20, RGBA32(0, 200, 83, 255));
+        rdpq_text_print(NULL, FONT_BODY, 522, HINT_Y + 16, "B");
+        rdpq_text_print(NULL, FONT_BODY, 548, HINT_Y + 16, "BACK");
     }
 
-    if(main_state < 3) { 
-        rdpq_set_mode_fill(RGBA32(255,0,0,0));
-        rdpq_fill_rectangle(SCR_REGION_X_MIN, BOX_REGION_Y_MIN, 640 - opening_card_offset_x, BOX_REGION_Y_MAX);
 
-        rdpq_set_mode_copy(true);
+    if(main_state < 3) {
+        rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
+        rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 
-        rdpq_sprite_blit(logo, 194 - opening_card_offset_x, 112, &(rdpq_blitparms_t){
-            .scale_x = 1, .scale_y = 1,
-        });
+        // Centred mark over a pink rule, matching the header treatment.
+        float scale = 0.70f;
+        float lw = logo->width * scale;
+        float lx = (SCREEN_WIDTH - lw) * 0.5f - opening_card_offset_x;
+        float ly = 176.0f;
+        logo_draw(lx, ly, scale);
+
+        rdpq_set_mode_fill(RGBA32(255, 35, 156, 255));
+        float rx0 = lx < 0.0f ? 0.0f : lx;
+        float rx1 = lx + lw > SCREEN_WIDTH ? SCREEN_WIDTH : lx + lw;
+        if(rx1 > rx0) {
+            rdpq_fill_rectangle(rx0, ly + logo->height * scale + 14, rx1, ly + logo->height * scale + 17);
+        }
     }
+
 
      // Draw Fade
     if(fade_state != 1) {
@@ -941,22 +1066,22 @@ int main(void)
     joypad_init();
     timer_init();
 
-    audio_init(44100, 4);
-	mixer_init(20);
+    logo = sprite_load("rom:/m64_logo.sprite");
 
-    wav64_open(&se_titlelogo, "rom:/se/titlelogo.wav64");
-    wav64_open(&se_cursor_ng, "rom:/se/cursor_ng.wav64");
-    wav64_open(&se_gametitle_cursor, "rom:/se/gametitle_cursor.wav64");
-    wav64_open(&se_filemenu_close, "rom:/se/filemenu_close.wav64");
-    wav64_open(&se_filemenu_open, "rom:/se/filemenu_open.wav64");
-    wav64_open(&se_gametitle_click, "rom:/se/gametitle_click.wav64");
-    
-    logo = sprite_load("rom:/logo.sprite");
-    shadow = sprite_load("rom:/shadow.sprite");
-    loading_dot = sprite_load("rom:/loading_dot.sprite");
-    font = rdpq_font_load("rom:/default.font64");
-    rdpq_text_register_font(1, font);
-    
+    font_body = rdpq_font_load("rom:/m64_body.font64");
+    font_title = rdpq_font_load("rom:/m64_title.font64");
+    rdpq_text_register_font(FONT_BODY, font_body);
+    rdpq_text_register_font(FONT_TITLE, font_title);
+
+    rdpq_fontstyle_t white  = { .color = RGBA32(255, 255, 255, 255) };
+    rdpq_fontstyle_t yellow = { .color = RGBA32(255, 214, 0, 255) };
+    rdpq_fontstyle_t dim    = { .color = RGBA32(132, 116, 148, 255) };
+    rdpq_font_style(font_body,  STYLE_WHITE,  &white);
+    rdpq_font_style(font_body,  STYLE_YELLOW, &yellow);
+    rdpq_font_style(font_body,  STYLE_DIM,    &dim);
+    rdpq_font_style(font_title, STYLE_WHITE,  &white);
+    rdpq_font_style(font_title, STYLE_YELLOW, &yellow);
+
 
     menu_sidebar.sprite.x = 0;
     menu_sidebar.sprite.y = 0;
@@ -977,15 +1102,11 @@ int main(void)
         p1_buttons = joypad_get_buttons(JOYPAD_PORT_1);
         p1_buttons_press = joypad_get_buttons_pressed(JOYPAD_PORT_1);
         p1_inputs = joypad_get_inputs(JOYPAD_PORT_1);
-        mixer_try_play();
         cur_frame++;
     }
 
     flashcart_deinit();
 
-
-	mixer_close();
-    audio_close();
 
     rdpq_close();
     rspq_close();

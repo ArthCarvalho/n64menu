@@ -249,7 +249,7 @@ function Convert-Image([string]$Source, [string]$Destination) {
 
 function New-TitleCard([string]$Title, [string]$Destination) {
     Add-Type -AssemblyName System.Drawing
-    $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("n64menu-{0}.png" -f [System.Guid]::NewGuid().ToString("N"))
+    $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("m64menu-{0}.png" -f [System.Guid]::NewGuid().ToString("N"))
     $canvas = [System.Drawing.Bitmap]::new(256, 179)
     try {
         $graphics = [System.Drawing.Graphics]::FromImage($canvas)
@@ -275,7 +275,7 @@ $romRoot = Get-Directory $RomPath "-RomPath"
 $option = if ($Recursive) { [System.IO.SearchOption]::AllDirectories } else { [System.IO.SearchOption]::TopDirectoryOnly }
 $roms = @(Get-Files $romRoot $RomExtensions $option)
 if ($roms.Count -eq 0) { throw "No N64 ROMs were found." }
-if ($roms.Count -gt $MaximumTitles) { throw "n64menu supports at most $MaximumTitles titles." }
+if ($roms.Count -gt $MaximumTitles) { throw "m64menu supports at most $MaximumTitles titles." }
 
 $images = $null
 if (-not [string]::IsNullOrWhiteSpace($ImagePath)) {
@@ -289,11 +289,11 @@ if (-not [string]::IsNullOrWhiteSpace($RetroArchThumbnailPath)) {
 }
 
 $titleRoot = Join-Path $output "menu\title"
-$cacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "n64menu-boxart-cache"
+$cacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "m64menu-boxart-cache"
 [System.IO.Directory]::CreateDirectory($titleRoot) | Out-Null
 $ids = [System.Collections.Generic.List[string]]::new()
 foreach ($rom in $roms) {
-    if ([System.IO.FileInfo]::new($rom).Length -gt (78 * 1024 * 1024)) { throw "ROM exceeds n64menu's 78 MiB limit: $rom" }
+    if ([System.IO.FileInfo]::new($rom).Length -gt (78 * 1024 * 1024)) { throw "ROM exceeds m64menu's 78 MiB limit: $rom" }
     $id = Get-RomId $rom
     if ($ids.Contains($id)) { throw "Generated ID collision: $id" }
     $ids.Add($id)
@@ -317,4 +317,6 @@ foreach ($rom in $roms) {
     (Join-Path $output "menu\title.csv"),
     [System.Text.Encoding]::ASCII.GetBytes(($ids -join ",") + ",`0")
 )
+$themeRoot = Join-Path $output "menu\theme"
+& (Join-Path $PSScriptRoot "build-theme-assets.ps1") -OutputDirectory $themeRoot
 Write-Host "Imported $($ids.Count) title(s) into $output"
