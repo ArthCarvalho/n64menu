@@ -340,9 +340,9 @@ void logo_draw(sprite_t *logo, sprite_t *inner, float x, float y) {
         RGBA32(255, 35, 156, 255),
     };
     color_t edge_col[3] = {
-        RGBA32(206, 166, 0, 255),
-        RGBA32(208, 88, 0, 255),
-        RGBA32(205, 18, 116, 255),
+        RGBA32(235, 190, 0, 255),
+        RGBA32(235, 104, 0, 255),
+        RGBA32(230, 25, 137, 255),
     };
 
     rdpq_set_mode_standard();
@@ -384,10 +384,10 @@ void logo_draw(sprite_t *logo, sprite_t *inner, float x, float y) {
         if(sx1 <= sx0 || sy1 <= sy0) continue;
 
         rdpq_set_scissor(sx0, sy0, sx1, sy1);
-        // The full silhouette goes down dark first. The eroded mask then replaces
-        // its interior with the normal colour, leaving one source texel of shading
-        // immediately inside the black keyline. Point sampling keeps that fringe
-        // as discrete squares instead of softening the whole mark.
+        // The full silhouette goes down slightly darker first. The inner mask then
+        // replaces almost all of it with normal colour, leaving sparse Bayer-selected
+        // squares on the one-texel boundary. Point sampling keeps those discrete
+        // instead of softening the whole mark.
         rdpq_set_prim_color(edge_col[i]);
         rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){
             .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE,

@@ -57,24 +57,29 @@ function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$
         for ($y = 0; $y -lt $Height; $y++) {
             for ($x = 0; $x -lt $Width; $x++) {
                 $p = ($y * $data.Stride) + ($x * 4)
-                $covered = $pixels[$p + 3] -ge 128
+                $alpha = $pixels[$p + 3]
+                $covered = $alpha -ge 128
                 if ($covered -and $Erode) {
-                    # Keep only texels whose full 3x3 neighbourhood is covered. Drawn
-                    # over the original silhouette, this leaves exactly one source
-                    # texel of the darker colour visible inside every keylined edge.
-                    # Out-of-bounds neighbours count as clear.
-                    for ($ny = $y - 1; $ny -le $y + 1 -and $covered; $ny++) {
-                        for ($nx = $x - 1; $nx -le $x + 1; $nx++) {
-                            if ($nx -lt 0 -or $nx -ge $Width -or $ny -lt 0 -or $ny -ge $Height) {
-                                $covered = $false
-                                break
-                            }
-                            $np = ($ny * $data.Stride) + ($nx * 4)
-                            if ($pixels[$np + 3] -lt 128) {
-                                $covered = $false
-                                break
-                            }
-                        }
+                    # Shade fractional coverage only where the silhouette changes on
+                    # both axes. A straight edge changes on one axis only and stays
+                    # solid; a diagonal has a clear neighbour horizontally and
+                    # vertically, so its partial texel can show the darker underlay.
+                    $clearX = $false
+                    $clearY = $false
+                    foreach ($dx in @(-1, 1)) {
+                        $nx = $x + $dx
+                        if ($nx -lt 0 -or $nx -ge $Width) { $clearX = $true; break }
+                        $np = ($y * $data.Stride) + ($nx * 4)
+                        if ($pixels[$np + 3] -lt 128) { $clearX = $true; break }
+                    }
+                    foreach ($dy in @(-1, 1)) {
+                        $ny = $y + $dy
+                        if ($ny -lt 0 -or $ny -ge $Height) { $clearY = $true; break }
+                        $np = ($ny * $data.Stride) + ($x * 4)
+                        if ($pixels[$np + 3] -lt 128) { $clearY = $true; break }
+                    }
+                    if ($clearX -and $clearY -and $alpha -lt 224) {
+                        $covered = $false
                     }
                 }
                 $value = if ($covered) { (31 -shl 11) -bor (31 -shl 6) -bor (31 -shl 1) -bor 1 } else { 0 }
