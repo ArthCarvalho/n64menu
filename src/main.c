@@ -356,10 +356,13 @@ void logo_draw(sprite_t *logo, float x, float y) {
 }
 
 // The tabs are the mark's slashes reused as navigation, so their lean is taken
-// from the logo artwork (dx/dy = 0.875, measured from the asset). Slant is applied
+// from the logo artwork (dx/dy = 1.0, measured from the asset). Slant is applied
 // per height rather than as a fixed offset, otherwise tabs of different depths
 // would end up at different angles.
-#define RIBBON_SLANT     0.875f
+//
+// One to one is also what keeps the diagonals clean: every row steps exactly one
+// pixel, where a fractional lean holds every few rows and reads as ragged.
+#define RIBBON_SLANT     1.0f
 #define RIBBON_Y0        14.0f
 #define RIBBON_LEAD_H    44.0f          // tabs before the selection
 #define RIBBON_FULL_H    50.0f          // selection and the tabs behind it
