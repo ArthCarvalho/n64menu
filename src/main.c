@@ -484,32 +484,29 @@ void ribbon_draw(void) {
 #define BG_BOT_R 68
 #define BG_BOT_G 18
 #define BG_BOT_B 86
-#define BG_BANDS 120
+#define BG_BANDS 32
 
-// The ground animates like tape: a head-switching bar drifting up the screen, with
-// grain riding on it. Both are folded into the band fills that already happen, so
-// the motion costs no extra drawing.
+// The ground is a static ramp with a tape bar sliding up it.
 //
-// The framebuffer is 16 bit, so each channel quantises to steps of 8. Anything
-// gentler than that either disappears or snaps a whole band at once, which is why
-// the bar is a wide soft ramp rather than a thin bright line, and why the grain is
-// deliberately coarse instead of a fine dither.
+// The bar is drawn as a stack of translucent strips that move as one rigid object,
+// one pixel per frame, every frame. An earlier version animated per band brightness
+// instead, which looked slow and jerky at the same time: each band's lift changed by
+// about two units a frame, but the framebuffer is sixteen bit and quantises in steps
+// of eight, so bands sat still and then popped a whole level, each at its own moment.
+// Sliding a fixed shape sidesteps that entirely, because nothing has to change value
+// to make the bar appear to move.
 //
-// The band count also sets how finely the bar can be positioned, not just how smooth
-// the ramp is. At 32 bands the bar could only ever sit on a 15px boundary, so it
-// lurched a whole band at a time and slowing it down only lengthened the pauses
-// between jumps. At 120 the step is 4px and the travel reads as a drift.
-#define BG_TRACK_PERIOD 6                    /* frames spent crossing one band */
-#define BG_TRACK_HALF   14                   /* bands of falloff either side */
-#define BG_TRACK_SPAN   (BG_BANDS + 34)      /* overrun, so the bar rests off screen */
-#define BG_TRACK_GAIN   2
-#define BG_GRAIN        3
-#define BG_SPECKLES     14
-#define BG_NOISE_HOLD   8                    /* frames a grain pattern persists */
+// Noise dithering on the strips does the rest. It scatters the remaining banding into
+// grain, which is both what stops the edges stepping and what sells the effect, so the
+// bar carries its own noise rather than needing a separate grain pass.
+#define BAR_STEPS   16
+#define BAR_STEP_H  5                        /* 80px tall, soft enough not to step */
+#define BAR_PEAK    56                       /* alpha at the centre of the bar */
+#define BAR_PX_PER_SEC 60                    /* upward travel, independent of frame rate */
+#define BAR_MARGIN  40                       /* rest off screen between passes */
+#define BG_SPECKLES 10
 
-static uint32_t bg_tick = 0;
-
-// Xorshift rather than rand(): it is a few instructions, and it keeps the grain from
+// Xorshift rather than rand(): it is a few instructions, and it keeps the speckle from
 // correlating with anything else that might draw on random numbers.
 static uint32_t bg_noise = 0x1234567u;
 static inline uint32_t bg_rand(void) {
@@ -519,59 +516,72 @@ static inline uint32_t bg_rand(void) {
     return bg_noise;
 }
 
-static inline uint8_t bg_clamp(int v) {
-    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
-}
-
 void background_draw(void) {
-    bg_tick++;
+    // Drive the motion from elapsed time, not from a frame counter. Tying it to the
+    // number of draws makes the speed a function of how fast the console happens to
+    // be rendering, so the same constant means different things on a loaded frame or
+    // at a different clock. Milliseconds keep it fixed at so many pixels a second.
+    // The multiply is done at 64 bits because the millisecond count times the speed
+    // overruns 32 bits after about forty minutes of uptime.
+    unsigned long long ms = (unsigned long long)get_ticks_ms();
 
-    // Reseed from a slowly advancing value so a whole grain pattern persists for
-    // several frames. Left free running it re-randomised every band every frame,
-    // which strobes at the full refresh rate and reads as static rather than tape.
-    bg_noise = 0x9E3779B9u ^ ((bg_tick / BG_NOISE_HOLD) * 2654435761u);
-    if(bg_noise == 0) bg_noise = 1;   /* xorshift is dead at zero */
+    const int bar_h = BAR_STEPS * BAR_STEP_H;
+    const int span  = SCREEN_HEIGHT + bar_h + BAR_MARGIN;
 
-    // Counts downward so the bar travels up the screen, the direction tape drifts.
-    int track = (BG_TRACK_SPAN - 1) - (int)((bg_tick / BG_TRACK_PERIOD) % BG_TRACK_SPAN);
-
+    // Static ramp underneath. Nothing here animates, so it can stay in fill mode.
+    // Set the mode once and then only change the colour: rdpq_set_mode_fill resets the
+    // whole pipeline state, and calling it per band cost more than the fill itself.
+    rdpq_set_mode_fill(RGBA32(BG_TOP_R, BG_TOP_G, BG_TOP_B, 255));
     for(int i = 0; i < BG_BANDS; i++) {
         float t = (float)i / (float)(BG_BANDS - 1);
-        int r = (int)(BG_TOP_R + (BG_BOT_R - BG_TOP_R) * t);
-        int g = (int)(BG_TOP_G + (BG_BOT_G - BG_TOP_G) * t);
-        int b = (int)(BG_TOP_B + (BG_BOT_B - BG_TOP_B) * t);
-
-        int d = i - track;
-        if(d < 0) d = -d;
-        if(d <= BG_TRACK_HALF) {
-            int lift = (BG_TRACK_HALF + 1 - d) * BG_TRACK_GAIN;
-            // Lift blue hardest so the bar reads as a violet bloom rather than a grey
-            // wash, which would look like a dead pixel row instead of tape.
-            r += lift;
-            g += lift / 2;
-            b += lift + (lift / 2);
-        }
-
-        int grain = (int)(bg_rand() % (BG_GRAIN * 2 + 1)) - BG_GRAIN;
-        r += grain; g += grain; b += grain;
-
+        uint8_t r = (uint8_t)(BG_TOP_R + (BG_BOT_R - BG_TOP_R) * t);
+        uint8_t g = (uint8_t)(BG_TOP_G + (BG_BOT_G - BG_TOP_G) * t);
+        uint8_t b = (uint8_t)(BG_TOP_B + (BG_BOT_B - BG_TOP_B) * t);
         int y0 = (SCREEN_HEIGHT * i) / BG_BANDS;
+        // Derive the end from the next band rather than adding a height, so rounding
+        // cannot leave a seam of stale framebuffer between bands.
         int y1 = (SCREEN_HEIGHT * (i + 1)) / BG_BANDS;
-        rdpq_set_mode_fill(RGBA32(bg_clamp(r), bg_clamp(g), bg_clamp(b), 255));
+        rdpq_set_fill_color(RGBA32(r, g, b, 255));
         rdpq_fill_rectangle(0, y0, SCREEN_WIDTH, y1);
     }
 
-    // Speckle only inside the bar, which is where dropout actually shows on tape.
-    // One fill mode for the lot: changing it per dot would cost more than the dots.
-    int band_h = SCREEN_HEIGHT / BG_BANDS;
-    int sy0 = (track - BG_TRACK_HALF) * band_h;
-    int span = (BG_TRACK_HALF * 2 + 1) * band_h;
-    rdpq_set_mode_fill(RGBA32(150, 120, 175, 255));
+    // Counts downward so the bar travels up the screen, the direction tape drifts.
+    int travel = (int)((ms * BAR_PX_PER_SEC / 1000ULL) % (unsigned long long)span);
+    int bar_y = SCREEN_HEIGHT + BAR_MARGIN - travel;
+
+    rdpq_set_mode_standard();
+    rdpq_mode_dithering(DITHER_NOISE_NOISE);
+    rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
+    rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
+
+    for(int i = 0; i < BAR_STEPS; i++) {
+        // Triangular ramp, so the bar fades in and out rather than presenting an edge.
+        int half = BAR_STEPS / 2;
+        int d = (i < half) ? i : (BAR_STEPS - 1 - i);
+        int a = (d * BAR_PEAK) / half;
+        if(a <= 0) continue;
+
+        int y0 = bar_y + i * BAR_STEP_H;
+        int y1 = y0 + BAR_STEP_H;
+        if(y1 <= 0 || y0 >= SCREEN_HEIGHT) continue;
+        if(y0 < 0) y0 = 0;
+        if(y1 > SCREEN_HEIGHT) y1 = SCREEN_HEIGHT;
+
+        rdpq_set_prim_color(RGBA32(168, 132, 220, a));
+        rdpq_fill_rectangle(0, y0, SCREEN_WIDTH, y1);
+    }
+
+    // A little dropout inside the bar, which is where tape noise actually shows.
+    // Reseed from a coarse slice of the clock so a pattern holds for an eighth of a
+    // second: left free running the speckle repositions every frame and sparkles.
+    bg_noise = 0x9E3779B9u ^ (uint32_t)((ms / 125ULL) * 2654435761ULL);
+    if(bg_noise == 0) bg_noise = 1;   /* xorshift is dead at zero */
     for(int i = 0; i < BG_SPECKLES; i++) {
         int sx = (int)(bg_rand() % SCREEN_WIDTH);
-        int sy = sy0 + (int)(bg_rand() % span);
+        int sy = bar_y + (int)(bg_rand() % bar_h);
         if(sy < 0 || sy >= SCREEN_HEIGHT - 2) continue;
-        rdpq_fill_rectangle(sx, sy, sx + 2 > SCREEN_WIDTH ? SCREEN_WIDTH : sx + 2, sy + 2);
+        rdpq_set_prim_color(RGBA32(210, 190, 245, 190));
+        rdpq_fill_rectangle(sx, sy, (sx + 2 > SCREEN_WIDTH) ? SCREEN_WIDTH : sx + 2, sy + 2);
     }
 }
 
