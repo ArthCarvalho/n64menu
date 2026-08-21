@@ -3,6 +3,15 @@ param([Parameter(Mandatory = $true)][string]$Zig)
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# build.zig runs this with powershell.exe. When that is launched from PowerShell 7
+# it inherits a PSModulePath pointing at pwsh's module directories, so Windows
+# PowerShell cannot resolve its own modules and loses cmdlets such as
+# Invoke-WebRequest. Put the system module path back before anything needs it.
+$systemModules = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\Modules"
+if (($env:PSModulePath -split ';') -notcontains $systemModules) {
+    $env:PSModulePath = "$systemModules;$env:PSModulePath"
+}
+
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $cache = Join-Path $root ".n64"
 $toolchain = Join-Path $cache "toolchain"
@@ -15,8 +24,22 @@ $archive = Join-Path $cache "gcc-toolchain-mips64-win64.zip"
 $toolchainUrl = "https://api.github.com/repos/DragonMinded/libdragon/releases/assets/511634373"
 $toolchainSha256 = "E5B9866B28F8DF21267D9A66A77672EA5A9AC9A528A0BC18E915DC6D7D4316F3"
 
+# Computed through .NET rather than Get-FileHash. build.zig invokes this script
+# with powershell.exe, and when that is launched from PowerShell 7 it inherits a
+# PSModulePath pointing at pwsh's module directories, leaving Windows PowerShell
+# unable to resolve Microsoft.PowerShell.Utility.
+function Get-Sha256([string]$Path) {
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try { return [System.BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace("-", "") }
+        finally { $stream.Dispose() }
+    }
+    finally { $algorithm.Dispose() }
+}
+
 function Save-VerifiedDownload([string]$Uri, [string]$Destination, [string]$Sha256, [hashtable]$Headers) {
-    if ([System.IO.File]::Exists($Destination) -and (Get-FileHash -Algorithm SHA256 -LiteralPath $Destination).Hash -eq $Sha256) {
+    if ([System.IO.File]::Exists($Destination) -and (Get-Sha256 $Destination) -eq $Sha256) {
         return
     }
     if ([System.IO.File]::Exists($Destination)) { [System.IO.File]::Delete($Destination) }
@@ -24,7 +47,7 @@ function Save-VerifiedDownload([string]$Uri, [string]$Destination, [string]$Sha2
     $temporary = "$Destination.$([System.Guid]::NewGuid().ToString('N')).download"
     try {
         Invoke-WebRequest -UseBasicParsing -Headers $Headers -Uri $Uri -OutFile $temporary
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $temporary).Hash
+        $actual = Get-Sha256 $temporary
         if ($actual -ne $Sha256) { throw "Unexpected download checksum: $actual" }
         [System.IO.File]::Move($temporary, $Destination)
     }
