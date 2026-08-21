@@ -294,59 +294,65 @@ void logo_draw(float x, float y, float scale) {
 }
 
 // The tabs are the mark's slashes reused as navigation, so their lean is taken
-// from the logo artwork (dx/dy = 0.875) rather than chosen by eye. Adjacency then
-// follows from the geometry: a skewed quad only shows (width - skew) horizontally,
-// so the pitch must be that visible width plus the separator.
+// from the logo artwork (dx/dy = 0.875, measured from the asset). Slant is applied
+// per height rather than as a fixed offset, otherwise tabs of different depths
+// would end up at different angles.
+#define RIBBON_SLANT     0.875f
 #define RIBBON_Y0        14.0f
-#define RIBBON_Y1        62.0f
-#define RIBBON_BEHIND_Y1 57.0f
-#define RIBBON_SKEW      42.0f          // (RIBBON_Y1 - RIBBON_Y0) * 0.875
+#define RIBBON_LEAD_H    44.0f          // tabs before the selection
+#define RIBBON_FULL_H    50.0f          // selection and the tabs behind it
 #define RIBBON_GLYPH_W   32.0f
-#define RIBBON_TAB_W     (RIBBON_GLYPH_W + RIBBON_SKEW)
 #define RIBBON_GAP       4.0f
 #define RIBBON_STEP      (RIBBON_GLYPH_W + RIBBON_GAP)
-#define RIBBON_X0        (620.0f - (4.0f * RIBBON_STEP + RIBBON_TAB_W))
+#define RIBBON_T0        444.0f         // top-left of the first tab
+#define RIBBON_RULE_TOP  61.0f
+#define RIBBON_RULE_BOT  64.0f
+
+// Anchored on the tab's top-left corner so every tab tiles from the same edge
+// regardless of how deep it runs.
+void ribbon_tab(float top_x, float height, color_t color) {
+    float skew = height * RIBBON_SLANT;
+    quad_draw(top_x - skew, RIBBON_Y0, top_x + RIBBON_GLYPH_W,
+        RIBBON_Y0 + height, skew, color);
+}
 
 void ribbon_draw(void) {
     color_t inactive[2] = {
         RGBA32(74, 32, 122, 255),
         RGBA32(113, 48, 183, 255),
     };
+    color_t pink = RGBA32(255, 35, 156, 255);
 
     int tab_count = library_populated_rows < 5 ? library_populated_rows : 5;
     if(tab_count < 1) tab_count = 1;
 
-    float active_x = RIBBON_X0 + library_position_segment * RIBBON_STEP;
+    float selected_x = RIBBON_T0 + library_position_segment * RIBBON_STEP;
+    float skew_full = RIBBON_FULL_H * RIBBON_SLANT;
+    float skew_rule = (RIBBON_RULE_BOT - RIBBON_RULE_TOP) * RIBBON_SLANT;
 
-    // The baseline is the ribbon's own lower edge and stops at the current tab,
-    // rather than running on as a decorative rule.
-    rdpq_set_mode_fill(RGBA32(255, 35, 156, 255));
-    rdpq_fill_rectangle(BOX_REGION_X_MIN, RIBBON_Y1,
-        active_x + RIBBON_TAB_W - RIBBON_SKEW, RIBBON_Y1 + 4.0f);
+    // The baseline is the ribbon's lower edge. Its right end is slanted so it
+    // meets the selection's edge instead of protruding past it.
+    float rule_end = selected_x + RIBBON_GLYPH_W - skew_full;
+    quad_draw(BOX_REGION_X_MIN - skew_rule, RIBBON_RULE_TOP,
+        rule_end + skew_rule, RIBBON_RULE_BOT, skew_rule, pink);
 
-    // Tabs behind the current one sit shallower. Draw them first so the selection
-    // owns the foreground edge.
-    for(int i = tab_count - 1; i > library_position_segment; i--) {
-        float x = RIBBON_X0 + i * RIBBON_STEP;
-        quad_draw(x, RIBBON_Y0, x + RIBBON_TAB_W, RIBBON_BEHIND_Y1, RIBBON_SKEW, inactive[i & 1]);
+    // Tabs ahead of the selection stop short of the baseline, leaving a gap.
+    // Tabs behind it run down to the baseline's underside, so the ribbon reads
+    // as one continuous edge from the rule through the selection.
+    for(int i = 0; i < tab_count; i++) {
+        if(i == library_position_segment) continue;
+        float top_x = RIBBON_T0 + i * RIBBON_STEP;
+        float height = i < library_position_segment ? RIBBON_LEAD_H : RIBBON_FULL_H;
+        ribbon_tab(top_x, height, inactive[i & 1]);
     }
 
-    for(int i = 0; i < library_position_segment && i < tab_count; i++) {
-        float x = RIBBON_X0 + i * RIBBON_STEP;
-        quad_draw(x, RIBBON_Y0, x + RIBBON_TAB_W, RIBBON_Y1, RIBBON_SKEW, inactive[i & 1]);
-    }
+    ribbon_tab(selected_x, RIBBON_FULL_H, pink);
 
-    // Selection is pink and meets the baseline. Yellow belongs to the glyph.
-    quad_draw(active_x, RIBBON_Y0, active_x + RIBBON_TAB_W, RIBBON_Y1, RIBBON_SKEW,
-        RGBA32(255, 35, 156, 255));
-
-    // Each tab names its row by the first letter of that row's first title,
-    // centred on the parallelogram's midline.
+    // Each tab names its row by the first letter of that row's first title.
     for(int i = 0; i < tab_count; i++) {
         int row = library_row_window_start + i;
         char initial = library_row_initial[row] != 0 ? library_row_initial[row] : '?';
-        float x = RIBBON_X0 + i * RIBBON_STEP + (RIBBON_SKEW * 0.5f) + 8.0f;
-        rdpq_text_printf(NULL, FONT_BODY, x, 44.0f,
+        rdpq_text_printf(NULL, FONT_BODY, RIBBON_T0 + i * RIBBON_STEP - 11.0f, 42.0f,
             i == library_position_segment ? "^01%c" : "^03%c", initial);
     }
 }
