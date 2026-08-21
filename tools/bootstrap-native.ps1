@@ -136,19 +136,77 @@ if (-not [System.IO.File]::Exists((Join-Path $hostTools "n64sym.exe"))) {
     }
     finally { if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) } }
 }
+if (-not [System.IO.File]::Exists((Join-Path $hostTools "mkdfs.exe"))) {
+    $temporary = Join-Path $hostTools "mkdfs.building.exe"
+    try {
+        & $Zig cc -std=gnu11 -O2 -o $temporary -I (Join-Path $libdragon "include") (Join-Path $libdragon "tools\mkdfs\mkdfs.c")
+        if ($LASTEXITCODE -ne 0) { throw "Zig could not compile mkdfs." }
+        [System.IO.File]::Move($temporary, (Join-Path $hostTools "mkdfs.exe"))
+    }
+    finally { if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) } }
+}
 $sdkBin = Join-Path $sdk "bin"
 [System.IO.Directory]::CreateDirectory($sdkBin) | Out-Null
-foreach ($name in @("n64tool.exe", "n64sym.exe")) {
+
+# mkfont/mksprite pull in libdragon's asset compressors, one of which (Shrinkler)
+# is C++, so these need a C++ link step unlike the tools above.
+$assetObjects = @()
+foreach ($unit in @("assetcomp.c", "lz4_compress.c", "aplib_compress.c")) {
+    $object = Join-Path $hostTools ([System.IO.Path]::GetFileNameWithoutExtension($unit) + ".o")
+    if (-not [System.IO.File]::Exists($object)) {
+        & $Zig cc -std=gnu11 -O2 -w -c -I (Join-Path $libdragon "include") -I (Join-Path $libdragon "src") -I (Join-Path $libdragon "tools\common") -o $object (Join-Path $libdragon "tools\common\$unit")
+        if ($LASTEXITCODE -ne 0) { throw "Zig could not compile $unit." }
+    }
+    $assetObjects += $object
+}
+$shrinkler = Join-Path $hostTools "shrinkler_compress.o"
+if (-not [System.IO.File]::Exists($shrinkler)) {
+    & $Zig c++ -O2 -w -c -I (Join-Path $libdragon "include") -I (Join-Path $libdragon "src") -I (Join-Path $libdragon "tools\common") -o $shrinkler (Join-Path $libdragon "tools\common\shrinkler_compress.cpp")
+    if ($LASTEXITCODE -ne 0) { throw "Zig could not compile shrinkler_compress." }
+}
+$assetObjects += $shrinkler
+
+foreach ($tool in @(@{ Name = "mksprite"; Source = "tools\mksprite\mksprite.c" }, @{ Name = "mkfont"; Source = "tools\mkfont\mkfont.c" })) {
+    $exe = Join-Path $hostTools "$($tool.Name).exe"
+    if (-not [System.IO.File]::Exists($exe)) {
+        $object = Join-Path $hostTools "$($tool.Name).o"
+        & $Zig cc -std=gnu11 -O2 -w -c -I (Join-Path $libdragon "include") -I (Join-Path $libdragon "src") -I (Join-Path $libdragon "tools\common") -o $object (Join-Path $libdragon $tool.Source)
+        if ($LASTEXITCODE -ne 0) { throw "Zig could not compile $($tool.Name)." }
+        & $Zig c++ -O2 -w -o $exe $object @assetObjects
+        if ($LASTEXITCODE -ne 0) { throw "Zig could not link $($tool.Name)." }
+    }
+}
+
+foreach ($name in @("n64tool.exe", "n64sym.exe", "mksprite.exe")) {
     [System.IO.File]::Copy((Join-Path $hostTools $name), (Join-Path $sdkBin $name), $true)
 }
 
 $dfs = Join-Path $root "build\spritemap.dfs"
 [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($dfs)) | Out-Null
-$rom = [System.IO.File]::ReadAllBytes((Join-Path $root "sc64menu.n64"))
-$dfsOffset = 0x63B10
-$dfsBytes = [byte[]]::new($rom.Length - $dfsOffset)
-[System.Array]::Copy($rom, $dfsOffset, $dfsBytes, 0, $dfsBytes.Length)
-[System.IO.File]::WriteAllBytes($dfs, $dfsBytes)
+$themeFilesystem = Join-Path $cache "theme-filesystem"
+& (Join-Path $root "tools\build-theme-assets.ps1") -OutputDirectory $themeFilesystem
+
+# Press Start 2P (SIL OFL 1.1) is vendored in tools/fonts. mkfont derives the output
+# name from the input basename and mishandles Windows absolute paths, so invoke it
+# from the font directory with a relative filename.
+$fontSource = Join-Path $root "tools\fonts"
+foreach ($face in @(@{ Size = 16; Name = "m64_body" }, @{ Size = 32; Name = "m64_title" })) {
+    $target = Join-Path $themeFilesystem "$($face.Name).font64"
+    if (-not [System.IO.File]::Exists($target)) {
+        Push-Location $fontSource
+        try {
+            $env:N64_INST = $sdk
+            & (Join-Path $hostTools "mkfont.exe") -o $themeFilesystem -s $face.Size -r 20-7F "PressStart2P-Regular.ttf"
+            if ($LASTEXITCODE -ne 0) { throw "Could not build the $($face.Name) font." }
+        }
+        finally { Pop-Location }
+        [System.IO.File]::Move((Join-Path $themeFilesystem "PressStart2P-Regular.font64"), $target)
+    }
+}
+
+& (Join-Path $hostTools "mkdfs.exe") $dfs $themeFilesystem
+if ($LASTEXITCODE -ne 0) { throw "Could not create the M64 theme filesystem." }
+
 
 $toolchainBash = Convert-ToGitBashPath $toolchain
 $sdkBash = Convert-ToGitBashPath $sdk
@@ -157,11 +215,11 @@ $toolchainNative = $toolchain.Replace("\", "/")
 $sdkNative = $sdk.Replace("\", "/")
 $commonFlags = "-march=vr4300 -mtune=vr4300 -I${sdkNative}/mips64-elf/include -falign-functions=32 -ffunction-sections -fdata-sections -g -ffile-prefix-map=${root}=/ -ffast-math -ftrapping-math -fno-associative-math -DN64 -O2 -Wall -Werror -Wno-error=deprecated-declarations -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=unused-function -Wno-error=unused-parameter -Wno-error=unused-label -Wno-error=unused-const-variable"
 $linkFlags = "-g -L${sdkNative}/mips64-elf/lib -ldragon -lm -ldragonsys -Tn64.ld --gc-sections --wrap __do_global_ctors"
-Invoke-GitBash "export PATH='${toolchainBash}/bin:/usr/bin'; make -C '$rootBash' build/mockup_menu.elf N64_INST='$sdkNative' N64_GCCPREFIX='$toolchainNative' CC='${toolchainNative}/bin/mips64-elf-gcc' CXX='${toolchainNative}/bin/mips64-elf-g++' AS='${toolchainNative}/bin/mips64-elf-as' LD='${toolchainNative}/bin/mips64-elf-ld' CFLAGS='$commonFlags -std=gnu99 -MMD' CXXFLAGS='$commonFlags -MMD' ASFLAGS='-mtune=vr4300 -march=vr4300 -Wa,--fatal-warnings -I${sdkNative}/mips64-elf/include -MMD' LDFLAGS='$linkFlags'"
+Invoke-GitBash "export PATH='${toolchainBash}/bin:/usr/bin'; make -C '$rootBash' build/m64menu.elf N64_INST='$sdkNative' N64_GCCPREFIX='$toolchainNative' CC='${toolchainNative}/bin/mips64-elf-gcc' CXX='${toolchainNative}/bin/mips64-elf-g++' AS='${toolchainNative}/bin/mips64-elf-as' LD='${toolchainNative}/bin/mips64-elf-ld' CFLAGS='$commonFlags -std=gnu99 -MMD' CXXFLAGS='$commonFlags -MMD' ASFLAGS='-mtune=vr4300 -march=vr4300 -Wa,--fatal-warnings -I${sdkNative}/mips64-elf/include -MMD' LDFLAGS='$linkFlags'"
 
-$elf = Join-Path $root "build\mockup_menu.elf"
-$stripped = Join-Path $root "build\mockup_menu.elf.stripped"
-$symbols = Join-Path $root "build\mockup_menu.elf.sym"
+$elf = Join-Path $root "build\m64menu.elf"
+$stripped = Join-Path $root "build\m64menu.elf.stripped"
+$symbols = Join-Path $root "build\m64menu.elf.sym"
 [System.Environment]::SetEnvironmentVariable("N64_INST", $toolchain, "Process")
 & (Join-Path $hostTools "n64sym.exe") $elf $symbols
 if ($LASTEXITCODE -ne 0) { throw "Could not create the menu symbol table." }
@@ -169,8 +227,8 @@ if ($LASTEXITCODE -ne 0) { throw "Could not create the menu symbol table." }
 & (Join-Path $toolchain "bin\mips64-elf-strip.exe") -s $stripped
 if ($LASTEXITCODE -ne 0) { throw "Could not strip the menu ELF." }
 
-$menuRom = Join-Path $root "mockup_menu.z64"
-& (Join-Path $hostTools "n64tool.exe") --title "Mockup Menu" --toc --output $menuRom --align 256 $stripped --align 8 $symbols --align 16 $dfs
+$menuRom = Join-Path $root "m64menu.z64"
+& (Join-Path $hostTools "n64tool.exe") --title "M64 Menu" --toc --output $menuRom --align 256 $stripped --align 8 $symbols --align 16 $dfs
 if ($LASTEXITCODE -ne 0) { throw "Could not package the menu ROM." }
 
 $bin = Join-Path $root "zig-out\bin"
