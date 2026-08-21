@@ -75,9 +75,14 @@ function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$
 # Rasterize each use at its final framebuffer size. Generating one large sprite
 # and scaling it again on the N64 quantizes the diagonal edges twice.
 #
-# The header mark is sized so the counter inside the 6 survives the 1-bit alpha
-# cutoff. Below roughly 190px wide that gap averages away and the digit fills in
-# solid; the band above the rule limits the height, so 190x52 is the largest that
-# fits and still reads.
-Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo_header.sprite") 190 52
-Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo_splash.sprite") 336 92
+# These are half the size they are drawn at, and the menu blits them at an exact
+# 2x with point sampling. The console's own mark sits on a far coarser grid than
+# a one-to-one sprite gives us: measured off a capture, its pixels are about four
+# display pixels across, where one-to-one here yields about two. Halving the grid
+# and doubling on output matches it, and an integer scale keeps every block square.
+#
+# The header mark is sized so the counter inside the 6 survives the coverage
+# cutoff. Below roughly 95 wide at this grid that gap closes and the digit fills
+# in solid; the band above the rule limits the height.
+Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo_header.sprite") 95 26
+Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo_splash.sprite") 168 46

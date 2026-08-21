@@ -304,12 +304,18 @@ void focus_draw(float x, float y, float width, float height) {
 
 // The M64 mark is layered yellow -> orange -> pink rather than a flat tint. The
 // sprite is a white mask, so we blit it once per horizontal band, clipped by scissor.
+//
+// Drawn at an exact 2x with point sampling: the sprite is generated on half the
+// grid so each texel lands as a clean square block, matching how coarse the
+// console's own mark is. An integer factor keeps every block the same size.
+#define LOGO_SCALE 2.0f
+
 void logo_draw(sprite_t *logo, float x, float y) {
     if(logo == NULL || logo->width <= 0 || logo->width > 512 ||
        logo->height <= 0 || logo->height > 256) return;
 
-    float w = logo->width;
-    float h = logo->height;
+    float w = logo->width * LOGO_SCALE;
+    float h = logo->height * LOGO_SCALE;
 
     const float band_top[3] = { 0.00f, 0.44f, 0.74f };
     const float band_bot[3] = { 0.44f, 0.74f, 1.00f };
@@ -341,7 +347,9 @@ void logo_draw(sprite_t *logo, float x, float y) {
 
         rdpq_set_scissor(sx0, sy0, sx1, sy1);
         rdpq_set_prim_color(band_col[i]);
-        rdpq_sprite_blit(logo, x, y, NULL);
+        rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){
+            .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE,
+        });
     }
 
     rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -1224,7 +1232,8 @@ void draw(int cur_frame) {
         rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 
         // Centred mark over a pink rule, matching the header treatment.
-        float lw = logo_splash->width;
+        float lw = logo_splash->width * LOGO_SCALE;
+        float lh = logo_splash->height * LOGO_SCALE;
         float lx = (SCREEN_WIDTH - lw) * 0.5f - opening_card_offset_x;
         float ly = 176.0f;
         logo_draw(logo_splash, lx, ly);
@@ -1233,7 +1242,7 @@ void draw(int cur_frame) {
         float rx0 = lx < 0.0f ? 0.0f : lx;
         float rx1 = lx + lw > SCREEN_WIDTH ? SCREEN_WIDTH : lx + lw;
         if(rx1 > rx0) {
-            rdpq_fill_rectangle(rx0, ly + logo_splash->height + 14, rx1, ly + logo_splash->height + 17);
+            rdpq_fill_rectangle(rx0, ly + lh + 14, rx1, ly + lh + 17);
         }
     }
 
