@@ -63,13 +63,20 @@ float bezier_interp(float t, float x1, float y1, float x2, float y2) {
     return 3.0f * pow(1.0f - refinedT, 2.0f) * refinedT * y1 + 3.0f * (1.0f - refinedT) * pow(refinedT, 2.0f) * y2 + pow(refinedT, 3.0f);
 }
 
-sprite_t *logo;
+sprite_t *logo_header;
+sprite_t *logo_splash;
+sprite_t *logo_header_inner;
+sprite_t *logo_splash_inner;
 
 rdpq_font_t *font_body;
 rdpq_font_t *font_title;
+rdpq_font_t *font_small;
+rdpq_font_t *font_cap;
 
 #define FONT_BODY    1
 #define FONT_TITLE   2
+#define FONT_SMALL   3
+#define FONT_CAP     4
 
 #define STYLE_WHITE      0
 #define STYLE_YELLOW     1
@@ -256,11 +263,44 @@ void quad_draw(float x1, float y1, float x2, float y2, float skew, color_t color
         (float[]){ x2, y1 }, (float[]){ x2 - skew, y2 }, (float[]){ x1, y2 });
 }
 
-// Rounded "button" blob used for the A/B legend glyphs.
-void pill_draw(float x, float y, float w, float h, color_t color) {
+void disc_draw(float cx, float cy, int radius, color_t color) {
     rdpq_set_mode_fill(color);
-    rdpq_fill_rectangle(x + 2, y, x + w - 2, y + h);
-    rdpq_fill_rectangle(x, y + 2, x + w, y + h - 2);
+    for(int y = -radius; y <= radius; y++) {
+        int half_width = sqrt(radius * radius - y * y);
+        rdpq_fill_rectangle(cx - half_width, cy + y, cx + half_width + 1, cy + y + 1);
+    }
+}
+
+// Layered circular button cap: shadow, body, and a small top-left highlight.
+// Unlike the old two-rectangle octagon, the silhouette stays round at this size.
+// Sized against the console's own legend measured in the same frame, with its
+// overlay open so both legends sat at one scale: theirs is 38 capture pixels
+// across, so the radius is 8 for 17 framebuffer pixels rather than the 21 that
+// an earlier reading off separate captures produced.
+void button_cap_draw(float cx, float cy, color_t dark, color_t color, color_t light) {
+    disc_draw(cx + 1, cy + 1, 8, RGBA32(0, 0, 0, 255));
+    disc_draw(cx, cy, 8, dark);
+    disc_draw(cx, cy - 1, 6, color);
+    disc_draw(cx - 2, cy - 3, 2, light);
+}
+
+// Centred through the layout engine rather than by hand, then nudged by the
+// residual measured off a capture: the glyph box centres the advance width, which
+// leaves the inked shape slightly high and left of the cap.
+//
+// Drawn at 8pt rather than the 12pt used elsewhere. At 12pt the letter filled most
+// of the inner disc, where the console leaves clear colour around it on all sides.
+// Press Start 2P ships regular only, so the weight comes from overdrawing a second
+// pass one pixel across: the console's letter is heavier than a single pass gives,
+// and thickening by hand keeps it a font rather than a hand-built glyph.
+void button_letter_draw(float cx, float cy, const char *label) {
+    const float box = 14.0f;
+    for(int dx = 0; dx <= 1; dx++) {
+        rdpq_text_print(&(rdpq_textparms_t){
+            .width = box, .height = box,
+            .align = ALIGN_CENTER, .valign = VALIGN_CENTER,
+        }, FONT_CAP, cx - box * 0.5f + dx + 0.5f, cy - box * 0.5f + 2.0f, label);
+    }
 }
 
 // M64 marks the active row with a solid yellow triangle, not a highlighted card.
@@ -278,12 +318,19 @@ void focus_draw(float x, float y, float width, float height) {
 
 // The M64 mark is layered yellow -> orange -> pink rather than a flat tint. The
 // sprite is a white mask, so we blit it once per horizontal band, clipped by scissor.
-void logo_draw(float x, float y, float scale) {
-    if(logo == NULL || logo->width <= 0 || logo->width > 512 ||
-       logo->height <= 0 || logo->height > 256) return;
+//
+// Drawn at an exact 2x with point sampling: the sprite is generated on half the
+// grid so each texel lands as a clean square block, matching how coarse the
+// console's own mark is. An integer factor keeps every block the same size.
+#define LOGO_SCALE 2.0f
 
-    float w = logo->width * scale;
-    float h = logo->height * scale;
+void logo_draw(sprite_t *logo, sprite_t *inner, float x, float y) {
+    if(logo == NULL || logo->width <= 0 || logo->width > 512 ||
+       logo->height <= 0 || logo->height > 256 || inner == NULL ||
+       inner->width != logo->width || inner->height != logo->height) return;
+
+    float w = logo->width * LOGO_SCALE;
+    float h = logo->height * LOGO_SCALE;
 
     const float band_top[3] = { 0.00f, 0.44f, 0.74f };
     const float band_bot[3] = { 0.44f, 0.74f, 1.00f };
@@ -292,10 +339,35 @@ void logo_draw(float x, float y, float scale) {
         RGBA32(255, 122, 0, 255),
         RGBA32(255, 35, 156, 255),
     };
+    color_t edge_col[3] = {
+        RGBA32(235, 190, 0, 255),
+        RGBA32(235, 104, 0, 255),
+        RGBA32(230, 25, 137, 255),
+    };
 
     rdpq_set_mode_standard();
-    rdpq_mode_filter(FILTER_BILINEAR);
+    // Blitted at an exact scale, so sampling must be point: bilinear averages
+    // neighbouring texels and erases single-pixel detail such as the counter
+    // inside the 6.
+    rdpq_mode_filter(FILTER_POINT);
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+    // Drop the uncovered texels rather than drawing them black. Without this the
+    // blit lays down an opaque quad, so offset copies square each other off and no
+    // outline survives. The sprites are decimated to a hard one-bit edge, so a
+    // threshold compare is enough and costs no blending.
+    rdpq_mode_alphacompare(1);
+
+    // Keyline first, one source pixel thick, so the bands land on top of it and
+    // leave only the outline showing. The reference carries one because its mark
+    // sits over game content, where an unoutlined shape loses its edges.
+    rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    rdpq_set_prim_color(RGBA32(0, 0, 0, 255));
+    static const float key_x[8] = { -1.0f, 1.0f,  0.0f, 0.0f, -1.0f, 1.0f, -1.0f, 1.0f };
+    static const float key_y[8] = {  0.0f, 0.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f };
+    for(int k = 0; k < 8; k++) {
+        rdpq_sprite_blit(logo, x + key_x[k] * LOGO_SCALE, y + key_y[k] * LOGO_SCALE,
+            &(rdpq_blitparms_t){ .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE });
+    }
 
     for(int i = 0; i < 3; i++) {
         // The splash slides the mark off-screen, so the band rect must be clamped
@@ -312,18 +384,28 @@ void logo_draw(float x, float y, float scale) {
         if(sx1 <= sx0 || sy1 <= sy0) continue;
 
         rdpq_set_scissor(sx0, sy0, sx1, sy1);
+        // The full silhouette goes down slightly darker first. The inner mask then
+        // replaces almost all of it with normal colour, leaving sparse Bayer-selected
+        // squares on the one-texel boundary. Point sampling keeps those discrete
+        // instead of softening the whole mark.
+        rdpq_set_prim_color(edge_col[i]);
+        rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){
+            .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE,
+        });
         rdpq_set_prim_color(band_col[i]);
-        rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){ .scale_x = scale, .scale_y = scale });
+        rdpq_sprite_blit(inner, x, y, &(rdpq_blitparms_t){
+            .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE,
+        });
     }
 
     rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 }
 
 // The tabs are the mark's slashes reused as navigation, so their lean is taken
-// from the logo artwork (dx/dy = 0.875, measured from the asset). Slant is applied
+// from the supplied logo artwork (dx/dy = 1.0, measured from the asset). Slant is applied
 // per height rather than as a fixed offset, otherwise tabs of different depths
 // would end up at different angles.
-#define RIBBON_SLANT     0.875f
+#define RIBBON_SLANT     1.0f
 #define RIBBON_Y0        14.0f
 #define RIBBON_LEAD_H    44.0f          // tabs before the selection
 #define RIBBON_FULL_H    50.0f          // selection and the tabs behind it
@@ -418,13 +500,104 @@ void ribbon_draw(void) {
     }
 }
 
+// Vertical ramp from deep violet to a warmer purple, laid down as bands. Kept dark
+// on purpose: box art sits on top of it, and anything brighter costs the covers
+// their contrast, especially the ones dimmed while unselected.
+#define BG_TOP_R 16
+#define BG_TOP_G 6
+#define BG_TOP_B 38
+#define BG_BOT_R 68
+#define BG_BOT_G 18
+#define BG_BOT_B 86
+#define BG_BANDS 32
+
+// The ground is a static ramp with a soft sheen sliding up it.
+//
+// This started as a VHS treatment with grain and dropout speckle over the bar. That
+// was dropped: the console's own interface is flat colour with no texture, and the
+// rest of this work goes out of its way to keep the image crisp, disabling the video
+// filters, sampling sprites point and blitting at whole scales. Animated grain pulls
+// against all of it, so only the movement is kept.
+//
+// The sheen is a stack of translucent strips that move as one rigid object. An earlier
+// version animated per band brightness instead, which looked slow and jerky at the
+// same time: each band's lift changed by about two units a frame, but the framebuffer
+// is sixteen bit and quantises in steps of eight, so bands sat still and then popped a
+// whole level, each at its own moment. Sliding a fixed shape sidesteps that entirely,
+// because nothing has to change value to make it appear to move.
+#define BAR_STEPS   16
+#define BAR_STEP_H  5                        /* 80px tall, soft enough not to step */
+#define BAR_PEAK    56                       /* alpha at the centre of the sheen */
+#define BAR_PX_PER_SEC 60                    /* upward travel, independent of frame rate */
+#define BAR_MARGIN  40                       /* rest off screen between passes */
+
+
+void background_draw(void) {
+    // Drive the motion from elapsed time, not from a frame counter. Tying it to the
+    // number of draws makes the speed a function of how fast the console happens to
+    // be rendering, so the same constant means different things on a loaded frame or
+    // at a different clock. Milliseconds keep it fixed at so many pixels a second.
+    // The multiply is done at 64 bits because the millisecond count times the speed
+    // overruns 32 bits after about forty minutes of uptime.
+    unsigned long long ms = (unsigned long long)get_ticks_ms();
+
+    const int bar_h = BAR_STEPS * BAR_STEP_H;
+    const int span  = SCREEN_HEIGHT + bar_h + BAR_MARGIN;
+
+    // Static ramp underneath. Nothing here animates, so it can stay in fill mode.
+    // Set the mode once and then only change the colour: rdpq_set_mode_fill resets the
+    // whole pipeline state, and calling it per band cost more than the fill itself.
+    rdpq_set_mode_fill(RGBA32(BG_TOP_R, BG_TOP_G, BG_TOP_B, 255));
+    for(int i = 0; i < BG_BANDS; i++) {
+        float t = (float)i / (float)(BG_BANDS - 1);
+        uint8_t r = (uint8_t)(BG_TOP_R + (BG_BOT_R - BG_TOP_R) * t);
+        uint8_t g = (uint8_t)(BG_TOP_G + (BG_BOT_G - BG_TOP_G) * t);
+        uint8_t b = (uint8_t)(BG_TOP_B + (BG_BOT_B - BG_TOP_B) * t);
+        int y0 = (SCREEN_HEIGHT * i) / BG_BANDS;
+        // Derive the end from the next band rather than adding a height, so rounding
+        // cannot leave a seam of stale framebuffer between bands.
+        int y1 = (SCREEN_HEIGHT * (i + 1)) / BG_BANDS;
+        rdpq_set_fill_color(RGBA32(r, g, b, 255));
+        rdpq_fill_rectangle(0, y0, SCREEN_WIDTH, y1);
+    }
+
+    // Counts downward so the bar travels up the screen, the direction tape drifts.
+    int travel = (int)((ms * BAR_PX_PER_SEC / 1000ULL) % (unsigned long long)span);
+    int bar_y = SCREEN_HEIGHT + BAR_MARGIN - travel;
+
+    rdpq_set_mode_standard();
+    // Ordered dithering, not noise. Something has to break up the sixteen bit
+    // quantisation or the bar's ramp lands in hard steps, but noise dithering
+    // regenerates every frame and reads as grain. A Bayer pattern is fixed in screen
+    // space, so it smooths the ramp without anything shimmering on top of it.
+    rdpq_mode_dithering(DITHER_BAYER_BAYER);
+    rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
+    rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
+
+    for(int i = 0; i < BAR_STEPS; i++) {
+        // Triangular ramp, so the bar fades in and out rather than presenting an edge.
+        int half = BAR_STEPS / 2;
+        int d = (i < half) ? i : (BAR_STEPS - 1 - i);
+        int a = (d * BAR_PEAK) / half;
+        if(a <= 0) continue;
+
+        int y0 = bar_y + i * BAR_STEP_H;
+        int y1 = y0 + BAR_STEP_H;
+        if(y1 <= 0 || y0 >= SCREEN_HEIGHT) continue;
+        if(y0 < 0) y0 = 0;
+        if(y1 > SCREEN_HEIGHT) y1 = SCREEN_HEIGHT;
+
+        rdpq_set_prim_color(RGBA32(168, 132, 220, a));
+        rdpq_fill_rectangle(0, y0, SCREEN_WIDTH, y1);
+    }
+}
+
 void chrome_draw(void) {
-    rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
-    rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    background_draw();
 
     ribbon_draw();
 
-    logo_draw(BOX_REGION_X_MIN, 18, 0.32f);
+    logo_draw(logo_header, logo_header_inner, BOX_REGION_X_MIN, 8);
 }
 
 
@@ -1171,39 +1344,47 @@ void draw(int cur_frame) {
         menu_draw();
 
         rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-        rdpq_text_print(NULL, FONT_TITLE, BOX_REGION_X_MIN, 104, "LIBRARY");
+        // A section label rather than a page title, so it sits at body size. The
+        // ribbon and the mark already carry the top of the screen.
+        rdpq_text_print(NULL, FONT_BODY, BOX_REGION_X_MIN, 104, "LIBRARY");
 
-        rdpq_text_printf(NULL, FONT_BODY, BOX_REGION_X_MIN, HINT_Y + 12,
-            title_truncated ? "^02%d TITLES (LIMIT)" : "^02%d TITLES", title_count);
+        // The count carries the emphasis and the word stays secondary, which lifts
+        // the figure without turning the whole line into another heading. The old
+        // dim violet was chosen against black and lost most of its contrast once the
+        // ground became violet too.
+        rdpq_text_printf(NULL, FONT_SMALL, BOX_REGION_X_MIN, HINT_Y + 12,
+            title_truncated ? "^00%d ^02TITLES (LIMIT)" : "^00%d ^02TITLES", title_count);
 
-        // A/B legend, right-aligned. Press Start 2P is monospace at ~16px/char.
-        pill_draw(416, HINT_Y, 20, 20, RGBA32(41, 121, 255, 255));
-        rdpq_text_print(NULL, FONT_BODY, 418, HINT_Y + 16, "A");
-        rdpq_text_print(NULL, FONT_BODY, 444, HINT_Y + 16, "PLAY");
+        // Circular M64-style caps. The letter is centred on the cap and drawn in
+        // black, so it reads as printed on the button rather than floating over it.
+        button_cap_draw(427, HINT_Y + 9,
+            RGBA32(0, 50, 150, 255), RGBA32(0, 104, 230, 255), RGBA32(62, 160, 255, 255));
+        button_letter_draw(427, HINT_Y + 9, "^05A");
+        rdpq_text_print(NULL, FONT_SMALL, 446, HINT_Y + 14, "PLAY");
 
-        pill_draw(520, HINT_Y, 20, 20, RGBA32(0, 200, 83, 255));
-        rdpq_text_print(NULL, FONT_BODY, 522, HINT_Y + 16, "B");
-        rdpq_text_print(NULL, FONT_BODY, 548, HINT_Y + 16, "BACK");
+        button_cap_draw(527, HINT_Y + 9,
+            RGBA32(0, 96, 40, 255), RGBA32(0, 183, 73, 255), RGBA32(55, 235, 120, 255));
+        button_letter_draw(527, HINT_Y + 9, "^05B");
+        rdpq_text_print(NULL, FONT_SMALL, 546, HINT_Y + 14, "BACK");
     }
 
 
     if(main_state < 3) {
         rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-        rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
-        rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        background_draw();
 
         // Centred mark over a pink rule, matching the header treatment.
-        float scale = 0.70f;
-        float lw = logo->width * scale;
+        float lw = logo_splash->width * LOGO_SCALE;
+        float lh = logo_splash->height * LOGO_SCALE;
         float lx = (SCREEN_WIDTH - lw) * 0.5f - opening_card_offset_x;
         float ly = 176.0f;
-        logo_draw(lx, ly, scale);
+        logo_draw(logo_splash, logo_splash_inner, lx, ly);
 
         rdpq_set_mode_fill(RGBA32(255, 35, 156, 255));
         float rx0 = lx < 0.0f ? 0.0f : lx;
         float rx1 = lx + lw > SCREEN_WIDTH ? SCREEN_WIDTH : lx + lw;
         if(rx1 > rx0) {
-            rdpq_fill_rectangle(rx0, ly + logo->height * scale + 14, rx1, ly + logo->height * scale + 17);
+            rdpq_fill_rectangle(rx0, ly + lh + 14, rx1, ly + lh + 17);
         }
     }
 
@@ -1232,23 +1413,36 @@ void draw(int cur_frame) {
 int main(void)
 {
     /* Initialize peripherals */
-    display_init(RESOLUTION_640x480, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_DEDITHER);
+    // No VI filtering: the menu is flat colour and pixel art, so dedither only
+    // softens it, and the console's own UI is crisp by comparison.
+    display_init(RESOLUTION_640x480, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_DISABLED);
     dfs_init( DFS_DEFAULT_LOCATION );
     debug_init_sdfs("sd:/", -1);
     rdpq_init();
     joypad_init();
     timer_init();
 
-    logo = sprite_load("rom:/sc64_logo.sprite");
+    logo_header = sprite_load("rom:/sc64_logo_header.sprite");
+    logo_splash = sprite_load("rom:/sc64_logo_splash.sprite");
+    logo_header_inner = sprite_load("rom:/sc64_logo_header_inner.sprite");
+    logo_splash_inner = sprite_load("rom:/sc64_logo_splash_inner.sprite");
 
     font_body = rdpq_font_load("rom:/m64_body.font64");
     font_title = rdpq_font_load("rom:/m64_title.font64");
+    font_small = rdpq_font_load("rom:/m64_small.font64");
+    font_cap = rdpq_font_load("rom:/m64_cap.font64");
     rdpq_text_register_font(FONT_BODY, font_body);
     rdpq_text_register_font(FONT_TITLE, font_title);
+    rdpq_text_register_font(FONT_SMALL, font_small);
+    rdpq_text_register_font(FONT_CAP, font_cap);
 
     rdpq_fontstyle_t white  = { .color = RGBA32(255, 255, 255, 255) };
     rdpq_fontstyle_t yellow = { .color = RGBA32(255, 214, 0, 255) };
-    rdpq_fontstyle_t dim    = { .color = RGBA32(132, 116, 148, 255) };
+    // Secondary text. The old value was picked against black and sank once the ground
+    // became violet. It still has to sit clearly below white, or pairing the two
+    // conveys no hierarchy: grey against white measured 725 against 765, which is not
+    // a difference anyone can see.
+    rdpq_fontstyle_t dim    = { .color = RGBA32(178, 168, 198, 255) };
     rdpq_fontstyle_t grey   = { .color = RGBA32(206, 206, 216, 255) };
     // Shadows are a darkened tint of the tab they fall on, not black, so they
     // read as cast onto the surface instead of punched through it.
@@ -1264,6 +1458,11 @@ int main(void)
     rdpq_font_style(font_body,  STYLE_SHADOW_SEL, &shadowsel);
     rdpq_font_style(font_title, STYLE_WHITE,  &white);
     rdpq_font_style(font_title, STYLE_YELLOW, &yellow);
+    rdpq_font_style(font_small, STYLE_WHITE, &white);
+    rdpq_font_style(font_small, STYLE_DIM, &dim);
+    rdpq_font_style(font_small, STYLE_GREY, &grey);
+    rdpq_font_style(font_small, STYLE_OUTLINE, &keyline);
+    rdpq_font_style(font_cap, STYLE_OUTLINE, &keyline);
 
 
     menu_sidebar.sprite.x = 0;
