@@ -222,7 +222,7 @@ $themeFilesystem = Join-Path $cache "theme-filesystem"
 # name from the input basename and mishandles Windows absolute paths, so invoke it
 # from the font directory with a relative filename.
 $fontSource = Join-Path $root "tools\fonts"
-foreach ($face in @(@{ Size = 12; Name = "m64_small" }, @{ Size = 16; Name = "m64_body" }, @{ Size = 32; Name = "m64_title" })) {
+foreach ($face in @(@{ Size = 8; Name = "m64_cap" }, @{ Size = 12; Name = "m64_small" }, @{ Size = 16; Name = "m64_body" }, @{ Size = 32; Name = "m64_title" })) {
     $target = Join-Path $themeFilesystem "$($face.Name).font64"
     if (-not [System.IO.File]::Exists($target)) {
         Push-Location $fontSource

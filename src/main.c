@@ -69,10 +69,12 @@ sprite_t *logo_splash;
 rdpq_font_t *font_body;
 rdpq_font_t *font_title;
 rdpq_font_t *font_small;
+rdpq_font_t *font_cap;
 
 #define FONT_BODY    1
 #define FONT_TITLE   2
 #define FONT_SMALL   3
+#define FONT_CAP     4
 
 #define STYLE_WHITE      0
 #define STYLE_YELLOW     1
@@ -283,12 +285,20 @@ void button_cap_draw(float cx, float cy, color_t dark, color_t color, color_t li
 // Centred through the layout engine rather than by hand, then nudged by the
 // residual measured off a capture: the glyph box centres the advance width, which
 // leaves the inked shape slightly high and left of the cap.
+//
+// Drawn at 8pt rather than the 12pt used elsewhere. At 12pt the letter filled most
+// of the inner disc, where the console leaves clear colour around it on all sides.
+// Press Start 2P ships regular only, so the weight comes from overdrawing a second
+// pass one pixel across: the console's letter is heavier than a single pass gives,
+// and thickening by hand keeps it a font rather than a hand-built glyph.
 void button_letter_draw(float cx, float cy, const char *label) {
-    const float box = 18.0f;
-    rdpq_text_print(&(rdpq_textparms_t){
-        .width = box, .height = box,
-        .align = ALIGN_CENTER, .valign = VALIGN_CENTER,
-    }, FONT_SMALL, cx - box * 0.5f + 1.0f, cy - box * 0.5f + 2.0f, label);
+    const float box = 14.0f;
+    for(int dx = 0; dx <= 1; dx++) {
+        rdpq_text_print(&(rdpq_textparms_t){
+            .width = box, .height = box,
+            .align = ALIGN_CENTER, .valign = VALIGN_CENTER,
+        }, FONT_CAP, cx - box * 0.5f + dx + 0.5f, cy - box * 0.5f + 2.0f, label);
+    }
 }
 
 // M64 marks the active row with a solid yellow triangle, not a highlighted card.
@@ -1402,9 +1412,11 @@ int main(void)
     font_body = rdpq_font_load("rom:/m64_body.font64");
     font_title = rdpq_font_load("rom:/m64_title.font64");
     font_small = rdpq_font_load("rom:/m64_small.font64");
+    font_cap = rdpq_font_load("rom:/m64_cap.font64");
     rdpq_text_register_font(FONT_BODY, font_body);
     rdpq_text_register_font(FONT_TITLE, font_title);
     rdpq_text_register_font(FONT_SMALL, font_small);
+    rdpq_text_register_font(FONT_CAP, font_cap);
 
     rdpq_fontstyle_t white  = { .color = RGBA32(255, 255, 255, 255) };
     rdpq_fontstyle_t yellow = { .color = RGBA32(255, 214, 0, 255) };
@@ -1432,6 +1444,7 @@ int main(void)
     rdpq_font_style(font_small, STYLE_DIM, &dim);
     rdpq_font_style(font_small, STYLE_GREY, &grey);
     rdpq_font_style(font_small, STYLE_OUTLINE, &keyline);
+    rdpq_font_style(font_cap, STYLE_OUTLINE, &keyline);
 
 
     menu_sidebar.sprite.x = 0;
