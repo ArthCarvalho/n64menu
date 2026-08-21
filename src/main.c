@@ -390,14 +390,15 @@ void ribbon_draw(void) {
         // A uniform offset reads as the letter hovering, or as extrusion. A real
         // shadow is anchored at the base and sweeps further the higher up the
         // glyph it is cast from, so shear it: each horizontal slice is displaced
-        // in proportion to its height above the letter's feet.
-        const int bands = 5;
+        // in proportion to its height above the letter's feet. The throw is taken
+        // from the reference icons, whose shadows reach about 0.45 of their height.
+        const int bands = 8;
         const float band_h = 16.0f / bands;
         for(int b = 0; b < bands; b++) {
             float band_top = y - 16.0f + b * band_h;
             float lift = 1.0f - (float)b / (float)(bands - 1);
-            float ox = 1.0f + lift * 5.0f;
-            float oy = lift * 3.0f;
+            float ox = 1.0f + lift * 9.0f;
+            float oy = lift * 4.0f;
 
             rdpq_set_scissor(0, band_top + oy, SCREEN_WIDTH, band_top + band_h + oy);
             rdpq_text_printf(NULL, FONT_BODY, x + ox, y + oy,
