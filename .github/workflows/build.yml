@@ -1,0 +1,53 @@
+name: Build
+
+# Verification only: the ROM is uploaded as a build artifact and nothing is
+# published. Release artifacts would embed the M64 wordmark, which the MIT
+# licence does not cover, so that stays a deliberate decision rather than a
+# side effect of tagging.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.0
+
+      # Exercises the whole bootstrap on a clean machine: the pinned toolchain,
+      # the host tools compiled with Zig, and the generated sprites and fonts.
+      # Building by hand cannot catch an asset that only exists locally.
+      - name: Build menu
+        run: zig build menu
+
+      - name: Report ROM hashes
+        shell: pwsh
+        run: |
+          $built = "zig-out/bin/sc64menu.n64"
+          if (-not (Test-Path $built)) { throw "Build did not produce $built" }
+          $builtHash = (Get-FileHash $built -Algorithm SHA256).Hash
+          Write-Host "built   $builtHash"
+          if (Test-Path "sc64menu.n64") {
+            $trackedHash = (Get-FileHash "sc64menu.n64" -Algorithm SHA256).Hash
+            Write-Host "tracked $trackedHash"
+            if ($builtHash -ne $trackedHash) {
+              # Reported rather than fatal: the filesystem image is not
+              # guaranteed byte-reproducible, so a mismatch is a prompt to
+              # refresh the tracked ROM, not proof of a broken build.
+              Write-Host "::warning::Tracked ROM differs from the build output."
+            }
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sc64menu
+          path: zig-out/bin/sc64menu.n64
+          if-no-files-found: error
