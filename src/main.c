@@ -1,9 +1,11 @@
 #include <stdio.h>
 
+#include <libcart/cart.h>
 #include <libdragon.h>
 
 #include "boot/boot.h"
 #include "flashcart/flashcart.h"
+#include "flashcart/sc64/sc64_ll.h"
 #include "utils/fs.h"
 
 #define PI 3.141592653f
@@ -14,6 +16,27 @@
 int menu_active;
 boot_params_t boot_params;
 char rom_path[1024];
+
+// sc64_init() leaves the boot mode at BOOT_MODE_MENU and nothing in the menu
+// changes it, so a switch to BOOT_MODE_ROM means sc64deployer has just written a
+// ROM into cartridge SDRAM over USB. Booting it here removes the manual reset
+// from the development loop; the SD card stays locked to the console throughout.
+void usb_upload_poll(void) {
+    static int countdown = 30;
+    uint32_t mode;
+
+    if(cart_type != CART_SC) return;
+    if(--countdown > 0) return;
+    countdown = 30;
+
+    if(sc64_ll_get_config(CFG_ID_BOOT_MODE, &mode) != SC64_OK) return;
+    if(mode != BOOT_MODE_ROM) return;
+
+    boot_params.device_type = BOOT_DEVICE_TYPE_ROM;
+    boot_params.tv_type = BOOT_TV_TYPE_PASSTHROUGH;
+    boot_params.detect_cic_seed = true;
+    menu_active = false;
+}
 
 float lerp(float t, float a, float b) {
     return a + (b - a) * t;
@@ -48,10 +71,13 @@ rdpq_font_t *font_title;
 #define FONT_BODY    1
 #define FONT_TITLE   2
 
-#define STYLE_WHITE  0
-#define STYLE_YELLOW 1
-#define STYLE_DIM    2
-#define STYLE_GREY   3
+#define STYLE_WHITE      0
+#define STYLE_YELLOW     1
+#define STYLE_DIM        2
+#define STYLE_GREY       3
+#define STYLE_SHADOW     4
+#define STYLE_OUTLINE    5
+#define STYLE_SHADOW_SEL 6
 
 int spinner_fade_counter = 0;
 float spinner_fade = 0.0f;
@@ -301,10 +327,10 @@ void logo_draw(float x, float y, float scale) {
 #define RIBBON_Y0        14.0f
 #define RIBBON_LEAD_H    44.0f          // tabs before the selection
 #define RIBBON_FULL_H    50.0f          // selection and the tabs behind it
-#define RIBBON_GLYPH_W   32.0f
+#define RIBBON_GLYPH_W   40.0f
 #define RIBBON_GAP       4.0f
 #define RIBBON_STEP      (RIBBON_GLYPH_W + RIBBON_GAP)
-#define RIBBON_T0        444.0f         // top-left of the first tab
+#define RIBBON_T0        404.0f         // top-left of the first tab
 #define RIBBON_RULE_TOP  61.0f
 #define RIBBON_RULE_BOT  64.0f
 
@@ -348,11 +374,31 @@ void ribbon_draw(void) {
 
     ribbon_tab(selected_x, RIBBON_FULL_H, pink);
 
-    // Each tab names its row by the first letter of that row's first title.
+    // Each tab names its row by the first letter of that row's first title. The
+    // reference icons carry a keyline and a shadow cast along the tab, which is
+    // what makes them read as standing on the plane rather than printed on it.
     for(int i = 0; i < tab_count; i++) {
         int row = library_row_window_start + i;
         char initial = library_row_initial[row] != 0 ? library_row_initial[row] : '?';
-        rdpq_text_printf(NULL, FONT_BODY, RIBBON_T0 + i * RIBBON_STEP - 11.0f, 42.0f,
+
+        // Sit the letter low and left on the tab. Descending the slant already
+        // carries it left, so the offset is measured from the tab's midline at
+        // the letter's own height rather than from its top corner.
+        float x = RIBBON_T0 + i * RIBBON_STEP - 13.0f;
+        float y = 47.0f;
+
+        // A single shadow, tinted to the tab it falls on.
+        rdpq_text_printf(NULL, FONT_BODY, x + 4.0f, y + 3.0f,
+            i == library_position_segment ? "^06%c" : "^04%c", initial);
+
+        static const float outline_x[4] = { -1.0f, 1.0f,  0.0f, 0.0f };
+        static const float outline_y[4] = {  0.0f, 0.0f, -1.0f, 1.0f };
+        for(int o = 0; o < 4; o++) {
+            rdpq_text_printf(NULL, FONT_BODY, x + outline_x[o], y + outline_y[o],
+                "^05%c", initial);
+        }
+
+        rdpq_text_printf(NULL, FONT_BODY, x, y,
             i == library_position_segment ? "^01%c" : "^03%c", initial);
     }
 }
@@ -1093,6 +1139,9 @@ void update(int ovfl) {
     }
 
     if(main_state >= 2) menu_update();
+
+    // Only while browsing: launching a game already owns the boot path.
+    if(main_state == 3) usb_upload_poll();
 }
 
 void draw(int cur_frame) {
@@ -1186,10 +1235,18 @@ int main(void)
     rdpq_fontstyle_t yellow = { .color = RGBA32(255, 214, 0, 255) };
     rdpq_fontstyle_t dim    = { .color = RGBA32(132, 116, 148, 255) };
     rdpq_fontstyle_t grey   = { .color = RGBA32(206, 206, 216, 255) };
+    // Shadows are a darkened tint of the tab they fall on, not black, so they
+    // read as cast onto the surface instead of punched through it.
+    rdpq_fontstyle_t shadow = { .color = RGBA32(44, 18, 78, 255) };
+    rdpq_fontstyle_t shadowsel = { .color = RGBA32(170, 16, 82, 255) };
+    rdpq_fontstyle_t keyline= { .color = RGBA32(0, 0, 0, 255) };
     rdpq_font_style(font_body,  STYLE_WHITE,  &white);
     rdpq_font_style(font_body,  STYLE_YELLOW, &yellow);
     rdpq_font_style(font_body,  STYLE_DIM,    &dim);
     rdpq_font_style(font_body,  STYLE_GREY,   &grey);
+    rdpq_font_style(font_body,  STYLE_SHADOW, &shadow);
+    rdpq_font_style(font_body,  STYLE_OUTLINE,&keyline);
+    rdpq_font_style(font_body,  STYLE_SHADOW_SEL, &shadowsel);
     rdpq_font_style(font_title, STYLE_WHITE,  &white);
     rdpq_font_style(font_title, STYLE_YELLOW, &yellow);
 
