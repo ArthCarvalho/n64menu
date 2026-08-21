@@ -269,20 +269,22 @@ void disc_draw(float cx, float cy, int radius, color_t color) {
 
 // Layered circular button cap: shadow, body, and a small top-left highlight.
 // Unlike the old two-rectangle octagon, the silhouette stays round at this size.
-// Sized from the console's own legend, whose caps measure about 20 framebuffer
-// pixels across once its native 1080p output is scaled to ours.
+// Sized against the console's own legend measured in the same frame, with its
+// overlay open so both legends sat at one scale: theirs is 38 capture pixels
+// across, so the radius is 8 for 17 framebuffer pixels rather than the 21 that
+// an earlier reading off separate captures produced.
 void button_cap_draw(float cx, float cy, color_t dark, color_t color, color_t light) {
-    disc_draw(cx + 1, cy + 1, 10, RGBA32(0, 0, 0, 255));
-    disc_draw(cx, cy, 10, dark);
-    disc_draw(cx, cy - 1, 8, color);
-    disc_draw(cx - 3, cy - 4, 2, light);
+    disc_draw(cx + 1, cy + 1, 8, RGBA32(0, 0, 0, 255));
+    disc_draw(cx, cy, 8, dark);
+    disc_draw(cx, cy - 1, 6, color);
+    disc_draw(cx - 2, cy - 3, 2, light);
 }
 
 // Centred through the layout engine rather than by hand, then nudged by the
 // residual measured off a capture: the glyph box centres the advance width, which
 // leaves the inked shape slightly high and left of the cap.
 void button_letter_draw(float cx, float cy, const char *label) {
-    const float box = 20.0f;
+    const float box = 18.0f;
     rdpq_text_print(&(rdpq_textparms_t){
         .width = box, .height = box,
         .align = ALIGN_CENTER, .valign = VALIGN_CENTER,
@@ -486,35 +488,26 @@ void ribbon_draw(void) {
 #define BG_BOT_B 86
 #define BG_BANDS 32
 
-// The ground is a static ramp with a tape bar sliding up it.
+// The ground is a static ramp with a soft sheen sliding up it.
 //
-// The bar is drawn as a stack of translucent strips that move as one rigid object,
-// one pixel per frame, every frame. An earlier version animated per band brightness
-// instead, which looked slow and jerky at the same time: each band's lift changed by
-// about two units a frame, but the framebuffer is sixteen bit and quantises in steps
-// of eight, so bands sat still and then popped a whole level, each at its own moment.
-// Sliding a fixed shape sidesteps that entirely, because nothing has to change value
-// to make the bar appear to move.
+// This started as a VHS treatment with grain and dropout speckle over the bar. That
+// was dropped: the console's own interface is flat colour with no texture, and the
+// rest of this work goes out of its way to keep the image crisp, disabling the video
+// filters, sampling sprites point and blitting at whole scales. Animated grain pulls
+// against all of it, so only the movement is kept.
 //
-// Noise dithering on the strips does the rest. It scatters the remaining banding into
-// grain, which is both what stops the edges stepping and what sells the effect, so the
-// bar carries its own noise rather than needing a separate grain pass.
+// The sheen is a stack of translucent strips that move as one rigid object. An earlier
+// version animated per band brightness instead, which looked slow and jerky at the
+// same time: each band's lift changed by about two units a frame, but the framebuffer
+// is sixteen bit and quantises in steps of eight, so bands sat still and then popped a
+// whole level, each at its own moment. Sliding a fixed shape sidesteps that entirely,
+// because nothing has to change value to make it appear to move.
 #define BAR_STEPS   16
 #define BAR_STEP_H  5                        /* 80px tall, soft enough not to step */
-#define BAR_PEAK    56                       /* alpha at the centre of the bar */
+#define BAR_PEAK    56                       /* alpha at the centre of the sheen */
 #define BAR_PX_PER_SEC 60                    /* upward travel, independent of frame rate */
 #define BAR_MARGIN  40                       /* rest off screen between passes */
-#define BG_SPECKLES 10
 
-// Xorshift rather than rand(): it is a few instructions, and it keeps the speckle from
-// correlating with anything else that might draw on random numbers.
-static uint32_t bg_noise = 0x1234567u;
-static inline uint32_t bg_rand(void) {
-    bg_noise ^= bg_noise << 13;
-    bg_noise ^= bg_noise >> 17;
-    bg_noise ^= bg_noise << 5;
-    return bg_noise;
-}
 
 void background_draw(void) {
     // Drive the motion from elapsed time, not from a frame counter. Tying it to the
@@ -550,7 +543,11 @@ void background_draw(void) {
     int bar_y = SCREEN_HEIGHT + BAR_MARGIN - travel;
 
     rdpq_set_mode_standard();
-    rdpq_mode_dithering(DITHER_NOISE_NOISE);
+    // Ordered dithering, not noise. Something has to break up the sixteen bit
+    // quantisation or the bar's ramp lands in hard steps, but noise dithering
+    // regenerates every frame and reads as grain. A Bayer pattern is fixed in screen
+    // space, so it smooths the ramp without anything shimmering on top of it.
+    rdpq_mode_dithering(DITHER_BAYER_BAYER);
     rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
     rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
 
@@ -569,19 +566,6 @@ void background_draw(void) {
 
         rdpq_set_prim_color(RGBA32(168, 132, 220, a));
         rdpq_fill_rectangle(0, y0, SCREEN_WIDTH, y1);
-    }
-
-    // A little dropout inside the bar, which is where tape noise actually shows.
-    // Reseed from a coarse slice of the clock so a pattern holds for an eighth of a
-    // second: left free running the speckle repositions every frame and sparkles.
-    bg_noise = 0x9E3779B9u ^ (uint32_t)((ms / 125ULL) * 2654435761ULL);
-    if(bg_noise == 0) bg_noise = 1;   /* xorshift is dead at zero */
-    for(int i = 0; i < BG_SPECKLES; i++) {
-        int sx = (int)(bg_rand() % SCREEN_WIDTH);
-        int sy = bar_y + (int)(bg_rand() % bar_h);
-        if(sy < 0 || sy >= SCREEN_HEIGHT - 2) continue;
-        rdpq_set_prim_color(RGBA32(210, 190, 245, 190));
-        rdpq_fill_rectangle(sx, sy, (sx + 2 > SCREEN_WIDTH) ? SCREEN_WIDTH : sx + 2, sy + 2);
     }
 }
 
@@ -1337,10 +1321,16 @@ void draw(int cur_frame) {
         menu_draw();
 
         rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-        rdpq_text_print(NULL, FONT_TITLE, BOX_REGION_X_MIN, 104, "LIBRARY");
+        // A section label rather than a page title, so it sits at body size. The
+        // ribbon and the mark already carry the top of the screen.
+        rdpq_text_print(NULL, FONT_BODY, BOX_REGION_X_MIN, 104, "LIBRARY");
 
+        // The count carries the emphasis and the word stays secondary, which lifts
+        // the figure without turning the whole line into another heading. The old
+        // dim violet was chosen against black and lost most of its contrast once the
+        // ground became violet too.
         rdpq_text_printf(NULL, FONT_SMALL, BOX_REGION_X_MIN, HINT_Y + 12,
-            title_truncated ? "^02%d TITLES (LIMIT)" : "^02%d TITLES", title_count);
+            title_truncated ? "^00%d ^02TITLES (LIMIT)" : "^00%d ^02TITLES", title_count);
 
         // Circular M64-style caps. The letter is centred on the cap and drawn in
         // black, so it reads as printed on the button rather than floating over it.
@@ -1421,7 +1411,11 @@ int main(void)
 
     rdpq_fontstyle_t white  = { .color = RGBA32(255, 255, 255, 255) };
     rdpq_fontstyle_t yellow = { .color = RGBA32(255, 214, 0, 255) };
-    rdpq_fontstyle_t dim    = { .color = RGBA32(132, 116, 148, 255) };
+    // Secondary text. The old value was picked against black and sank once the ground
+    // became violet. It still has to sit clearly below white, or pairing the two
+    // conveys no hierarchy: grey against white measured 725 against 765, which is not
+    // a difference anyone can see.
+    rdpq_fontstyle_t dim    = { .color = RGBA32(178, 168, 198, 255) };
     rdpq_fontstyle_t grey   = { .color = RGBA32(206, 206, 216, 255) };
     // Shadows are a darkened tint of the tab they fall on, not black, so they
     // read as cast onto the surface instead of punched through it.
@@ -1439,6 +1433,7 @@ int main(void)
     rdpq_font_style(font_title, STYLE_YELLOW, &yellow);
     rdpq_font_style(font_small, STYLE_WHITE, &white);
     rdpq_font_style(font_small, STYLE_DIM, &dim);
+    rdpq_font_style(font_small, STYLE_GREY, &grey);
     rdpq_font_style(font_small, STYLE_OUTLINE, &keyline);
 
 
