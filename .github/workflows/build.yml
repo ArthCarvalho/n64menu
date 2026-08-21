@@ -1,9 +1,7 @@
 name: Build
 
-# Verification only: the ROM is uploaded as a build artifact and nothing is
-# published. Release artifacts would embed the M64 wordmark, which the MIT
-# licence does not cover, so that stays a deliberate decision rather than a
-# side effect of tagging.
+# Every run verifies the clean-machine build and uploads a workflow artifact.
+# Version tags additionally publish that exact artifact as a GitHub Release.
 
 on:
   push:
@@ -26,6 +24,8 @@ jobs:
       # the host tools compiled with Zig, and the generated sprites and fonts.
       # Building by hand cannot catch an asset that only exists locally.
       - name: Build menu
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: zig build menu
 
       - name: Report ROM hashes
@@ -51,3 +51,31 @@ jobs:
           name: sc64menu
           path: zig-out/bin/sc64menu.n64
           if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sc64menu
+          path: release
+
+      - name: Generate checksum
+        working-directory: release
+        run: sha256sum sc64menu.n64 > sc64menu.n64.sha256
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          release/sc64menu.n64
+          release/sc64menu.n64.sha256
+          --repo "${{ github.repository }}"
+          --title "m64menu ${{ github.ref_name }}"
+          --generate-notes
+          --verify-tag
