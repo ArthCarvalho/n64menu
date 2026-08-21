@@ -326,10 +326,28 @@ void logo_draw(sprite_t *logo, float x, float y) {
     };
 
     rdpq_set_mode_standard();
-    // Blitted one to one, so sampling must be point: bilinear averages neighbouring
-    // texels and erases single-pixel detail such as the counter inside the 6.
+    // Blitted at an exact scale, so sampling must be point: bilinear averages
+    // neighbouring texels and erases single-pixel detail such as the counter
+    // inside the 6.
     rdpq_mode_filter(FILTER_POINT);
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+    // Drop the uncovered texels rather than drawing them black. Without this the
+    // blit lays down an opaque quad, so offset copies square each other off and no
+    // outline survives. The sprites are decimated to a hard one-bit edge, so a
+    // threshold compare is enough and costs no blending.
+    rdpq_mode_alphacompare(1);
+
+    // Keyline first, one source pixel thick, so the bands land on top of it and
+    // leave only the outline showing. The reference carries one because its mark
+    // sits over game content, where an unoutlined shape loses its edges.
+    rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    rdpq_set_prim_color(RGBA32(0, 0, 0, 255));
+    static const float key_x[8] = { -1.0f, 1.0f,  0.0f, 0.0f, -1.0f, 1.0f, -1.0f, 1.0f };
+    static const float key_y[8] = {  0.0f, 0.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f };
+    for(int k = 0; k < 8; k++) {
+        rdpq_sprite_blit(logo, x + key_x[k] * LOGO_SCALE, y + key_y[k] * LOGO_SCALE,
+            &(rdpq_blitparms_t){ .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE });
+    }
 
     for(int i = 0; i < 3; i++) {
         // The splash slides the mark off-screen, so the band rect must be clamped
@@ -457,9 +475,34 @@ void ribbon_draw(void) {
     }
 }
 
+// Vertical ramp from deep violet to a warmer purple, laid down as bands. Kept dark
+// on purpose: box art sits on top of it, and anything brighter costs the covers
+// their contrast, especially the ones dimmed while unselected.
+#define BG_TOP_R 16
+#define BG_TOP_G 6
+#define BG_TOP_B 38
+#define BG_BOT_R 68
+#define BG_BOT_G 18
+#define BG_BOT_B 86
+#define BG_BANDS 32
+
+void background_draw(void) {
+    for(int i = 0; i < BG_BANDS; i++) {
+        float t = (float)i / (float)(BG_BANDS - 1);
+        uint8_t r = (uint8_t)(BG_TOP_R + (BG_BOT_R - BG_TOP_R) * t);
+        uint8_t g = (uint8_t)(BG_TOP_G + (BG_BOT_G - BG_TOP_G) * t);
+        uint8_t b = (uint8_t)(BG_TOP_B + (BG_BOT_B - BG_TOP_B) * t);
+        int y0 = (SCREEN_HEIGHT * i) / BG_BANDS;
+        // Derive the end from the next band rather than adding a height, so rounding
+        // cannot leave a seam of stale framebuffer between bands.
+        int y1 = (SCREEN_HEIGHT * (i + 1)) / BG_BANDS;
+        rdpq_set_mode_fill(RGBA32(r, g, b, 255));
+        rdpq_fill_rectangle(0, y0, SCREEN_WIDTH, y1);
+    }
+}
+
 void chrome_draw(void) {
-    rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
-    rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    background_draw();
 
     ribbon_draw();
 
@@ -1231,8 +1274,7 @@ void draw(int cur_frame) {
 
     if(main_state < 3) {
         rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-        rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
-        rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        background_draw();
 
         // Centred mark over a pink rule, matching the header treatment.
         float lw = logo_splash->width * LOGO_SCALE;
