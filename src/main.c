@@ -1341,14 +1341,14 @@ void draw(int cur_frame) {
 
         // Circular M64-style caps. The letter is centred on the cap and drawn in
         // black, so it reads as printed on the button rather than floating over it.
-        button_cap_draw(427, HINT_Y + 10,
+        button_cap_draw(427, HINT_Y + 9,
             RGBA32(0, 50, 150, 255), RGBA32(0, 104, 230, 255), RGBA32(62, 160, 255, 255));
-        button_letter_draw(427, HINT_Y + 10, "^05A");
+        button_letter_draw(427, HINT_Y + 9, "^05A");
         rdpq_text_print(NULL, FONT_SMALL, 446, HINT_Y + 14, "PLAY");
 
-        button_cap_draw(527, HINT_Y + 10,
+        button_cap_draw(527, HINT_Y + 9,
             RGBA32(0, 96, 40, 255), RGBA32(0, 183, 73, 255), RGBA32(55, 235, 120, 255));
-        button_letter_draw(527, HINT_Y + 10, "^05B");
+        button_letter_draw(527, HINT_Y + 9, "^05B");
         rdpq_text_print(NULL, FONT_SMALL, 546, HINT_Y + 14, "BACK");
     }
 
