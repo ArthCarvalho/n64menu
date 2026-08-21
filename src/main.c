@@ -1239,7 +1239,7 @@ int main(void)
     joypad_init();
     timer_init();
 
-    logo = sprite_load("rom:/m64_logo.sprite");
+    logo = sprite_load("rom:/sc64_logo.sprite");
 
     font_body = rdpq_font_load("rom:/m64_body.font64");
     font_title = rdpq_font_load("rom:/m64_title.font64");

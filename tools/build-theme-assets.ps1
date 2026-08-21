@@ -3,21 +3,13 @@ param([Parameter(Mandatory = $true)][string]$OutputDirectory)
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$logoUrl = "https://modretro.com/cdn/shop/files/M64_logo_white.png?v=1782256617&width=800"
-$cache = Join-Path ([System.IO.Path]::GetTempPath()) "m64menu-theme-assets"
-[System.IO.Directory]::CreateDirectory($cache) | Out-Null
-[System.IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
+# Vendored rather than downloaded. Fetching the mark at build time made the build
+# depend on a third-party CDN whose URL has already changed once, and it is not
+# something a build should reach out to the network for.
+$logo = Join-Path $PSScriptRoot "logo\sc64_logo.png"
+if (-not [System.IO.File]::Exists($logo)) { throw "Missing logo artwork: $logo" }
 
-function Save-Asset([string]$Uri, [string]$Destination) {
-    if (-not [System.IO.File]::Exists($Destination)) {
-        $temporary = "$Destination.$([System.Guid]::NewGuid().ToString('N')).download"
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $temporary
-            [System.IO.File]::Move($temporary, $Destination)
-        }
-        finally { if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) } }
-    }
-}
+[System.IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
 
 function Write-U16([byte[]]$Buffer, [int]$Offset, [int]$Value) {
     $Buffer[$Offset] = [byte](($Value -shr 8) -band 0xFF)
@@ -34,7 +26,10 @@ function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$
             $graphics.Clear([System.Drawing.Color]::Transparent)
             $graphics.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
             $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
-            $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            # Bilinear rather than bicubic: bicubic overshoots, and the ringing
+            # pushes edge alpha back and forth across the cutoff below, which
+            # scatters stray texels along the diagonals.
+            $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
             $graphics.DrawImage($sourceImage, 0, 0, $Width, $Height)
         }
         finally { $graphics.Dispose() }
@@ -50,6 +45,9 @@ function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$
         Write-U16 $sprite 0 $Width; Write-U16 $sprite 2 $Height
         $sprite[4] = 2; $sprite[5] = 0; $sprite[6] = 1; $sprite[7] = 1
         $output = 8
+        # Colour carries the coverage: the menu draws the mark with a texture by
+        # flat-colour combiner and no alpha blending, so the resampled RGB is what
+        # shades the edges. Forcing it to white fills the whole quad instead.
         for ($y = 0; $y -lt $Height; $y++) {
             for ($x = 0; $x -lt $Width; $x++) {
                 $p = ($y * $data.Stride) + ($x * 4)
@@ -67,6 +65,4 @@ function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$
     }
 }
 
-$logo = Join-Path $cache "m64-logo.png"
-Save-Asset $logoUrl $logo
-Convert-TransparentSprite $logo (Join-Path $OutputDirectory "m64_logo.sprite") 480 132
+Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo.sprite") 480 132

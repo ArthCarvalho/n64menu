@@ -36,9 +36,11 @@ Third-party material is tracked separately:
 
 - `tools/fonts/PressStart2P-Regular.ttf` is licensed under the SIL Open Font
   License 1.1, included as `tools/fonts/OFL.txt`.
-- The M64 wordmark rendered by the menu is a ModRetro trademark, used here for
-  identification only. No affiliation with or endorsement by ModRetro is claimed,
-  and the MIT License does not grant trademark rights.
+- `tools/logo/sc64_logo.png` is the mark rendered by the menu. It is vendored
+  rather than downloaded, so the build makes no network request for artwork.
+- The menu is styled after the ModRetro M64 interface but ships none of its
+  artwork. No affiliation with or endorsement by ModRetro or SummerCart64 is
+  claimed, and the MIT License does not grant trademark rights.
 - This fork generates every asset it ships. It contains no data extracted from
   commercial ROMs.
 
