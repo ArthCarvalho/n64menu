@@ -46,12 +46,19 @@ function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$
         $sprite[4] = 2; $sprite[5] = 0; $sprite[6] = 1; $sprite[7] = 1
         $output = 8
         # Colour carries the coverage: the menu draws the mark with a texture by
-        # flat-colour combiner and no alpha blending, so the resampled RGB is what
-        # shades the edges. Forcing it to white fills the whole quad instead.
+        # flat-colour combiner and no alpha blending, so whatever sits in RGB is
+        # what shades the edge.
+        #
+        # Decimate rather than resample into it. Taking the interpolated RGB left
+        # every edge texel a partial grey, which reads as a blurred mark however
+        # the console samples it. Resolving each texel to fully on or fully off
+        # against the coverage cutoff gives hard pixel edges, matching the pixel
+        # art the rest of the interface is built from.
         for ($y = 0; $y -lt $Height; $y++) {
             for ($x = 0; $x -lt $Width; $x++) {
                 $p = ($y * $data.Stride) + ($x * 4)
-                $value = (([int]$pixels[$p + 2] -shr 3) -shl 11) -bor (([int]$pixels[$p + 1] -shr 3) -shl 6) -bor (([int]$pixels[$p] -shr 3) -shl 1) -bor [int]($pixels[$p + 3] -ge 128)
+                $covered = $pixels[$p + 3] -ge 128
+                $value = if ($covered) { (31 -shl 11) -bor (31 -shl 6) -bor (31 -shl 1) -bor 1 } else { 0 }
                 $sprite[$output] = [byte](($value -shr 8) -band 0xFF)
                 $sprite[$output + 1] = [byte]($value -band 0xFF)
                 $output += 2
