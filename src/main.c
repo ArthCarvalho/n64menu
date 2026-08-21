@@ -65,6 +65,8 @@ float bezier_interp(float t, float x1, float y1, float x2, float y2) {
 
 sprite_t *logo_header;
 sprite_t *logo_splash;
+sprite_t *logo_header_inner;
+sprite_t *logo_splash_inner;
 
 rdpq_font_t *font_body;
 rdpq_font_t *font_title;
@@ -322,9 +324,10 @@ void focus_draw(float x, float y, float width, float height) {
 // console's own mark is. An integer factor keeps every block the same size.
 #define LOGO_SCALE 2.0f
 
-void logo_draw(sprite_t *logo, float x, float y) {
+void logo_draw(sprite_t *logo, sprite_t *inner, float x, float y) {
     if(logo == NULL || logo->width <= 0 || logo->width > 512 ||
-       logo->height <= 0 || logo->height > 256) return;
+       logo->height <= 0 || logo->height > 256 || inner == NULL ||
+       inner->width != logo->width || inner->height != logo->height) return;
 
     float w = logo->width * LOGO_SCALE;
     float h = logo->height * LOGO_SCALE;
@@ -335,6 +338,11 @@ void logo_draw(sprite_t *logo, float x, float y) {
         RGBA32(255, 214, 0, 255),
         RGBA32(255, 122, 0, 255),
         RGBA32(255, 35, 156, 255),
+    };
+    color_t edge_col[3] = {
+        RGBA32(206, 166, 0, 255),
+        RGBA32(208, 88, 0, 255),
+        RGBA32(205, 18, 116, 255),
     };
 
     rdpq_set_mode_standard();
@@ -376,8 +384,16 @@ void logo_draw(sprite_t *logo, float x, float y) {
         if(sx1 <= sx0 || sy1 <= sy0) continue;
 
         rdpq_set_scissor(sx0, sy0, sx1, sy1);
-        rdpq_set_prim_color(band_col[i]);
+        // The full silhouette goes down dark first. The eroded mask then replaces
+        // its interior with the normal colour, leaving one source texel of shading
+        // immediately inside the black keyline. Point sampling keeps that fringe
+        // as discrete squares instead of softening the whole mark.
+        rdpq_set_prim_color(edge_col[i]);
         rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){
+            .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE,
+        });
+        rdpq_set_prim_color(band_col[i]);
+        rdpq_sprite_blit(inner, x, y, &(rdpq_blitparms_t){
             .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE,
         });
     }
@@ -581,7 +597,7 @@ void chrome_draw(void) {
 
     ribbon_draw();
 
-    logo_draw(logo_header, BOX_REGION_X_MIN, 8);
+    logo_draw(logo_header, logo_header_inner, BOX_REGION_X_MIN, 8);
 }
 
 
@@ -1362,7 +1378,7 @@ void draw(int cur_frame) {
         float lh = logo_splash->height * LOGO_SCALE;
         float lx = (SCREEN_WIDTH - lw) * 0.5f - opening_card_offset_x;
         float ly = 176.0f;
-        logo_draw(logo_splash, lx, ly);
+        logo_draw(logo_splash, logo_splash_inner, lx, ly);
 
         rdpq_set_mode_fill(RGBA32(255, 35, 156, 255));
         float rx0 = lx < 0.0f ? 0.0f : lx;
@@ -1408,6 +1424,8 @@ int main(void)
 
     logo_header = sprite_load("rom:/sc64_logo_header.sprite");
     logo_splash = sprite_load("rom:/sc64_logo_splash.sprite");
+    logo_header_inner = sprite_load("rom:/sc64_logo_header_inner.sprite");
+    logo_splash_inner = sprite_load("rom:/sc64_logo_splash_inner.sprite");
 
     font_body = rdpq_font_load("rom:/m64_body.font64");
     font_title = rdpq_font_load("rom:/m64_title.font64");

@@ -16,7 +16,7 @@ function Write-U16([byte[]]$Buffer, [int]$Offset, [int]$Value) {
     $Buffer[$Offset + 1] = [byte]($Value -band 0xFF)
 }
 
-function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$Width, [int]$Height) {
+function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$Width, [int]$Height, [switch]$Erode) {
     Add-Type -AssemblyName System.Drawing
     $sourceImage = [System.Drawing.Image]::FromFile($Source)
     $canvas = [System.Drawing.Bitmap]::new($Width, $Height, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -58,6 +58,25 @@ function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$
             for ($x = 0; $x -lt $Width; $x++) {
                 $p = ($y * $data.Stride) + ($x * 4)
                 $covered = $pixels[$p + 3] -ge 128
+                if ($covered -and $Erode) {
+                    # Keep only texels whose full 3x3 neighbourhood is covered. Drawn
+                    # over the original silhouette, this leaves exactly one source
+                    # texel of the darker colour visible inside every keylined edge.
+                    # Out-of-bounds neighbours count as clear.
+                    for ($ny = $y - 1; $ny -le $y + 1 -and $covered; $ny++) {
+                        for ($nx = $x - 1; $nx -le $x + 1; $nx++) {
+                            if ($nx -lt 0 -or $nx -ge $Width -or $ny -lt 0 -or $ny -ge $Height) {
+                                $covered = $false
+                                break
+                            }
+                            $np = ($ny * $data.Stride) + ($nx * 4)
+                            if ($pixels[$np + 3] -lt 128) {
+                                $covered = $false
+                                break
+                            }
+                        }
+                    }
+                }
                 $value = if ($covered) { (31 -shl 11) -bor (31 -shl 6) -bor (31 -shl 1) -bor 1 } else { 0 }
                 $sprite[$output] = [byte](($value -shr 8) -band 0xFF)
                 $sprite[$output + 1] = [byte]($value -band 0xFF)
@@ -86,3 +105,5 @@ function Convert-TransparentSprite([string]$Source, [string]$Destination, [int]$
 # in solid; the band above the rule limits the height.
 Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo_header.sprite") 95 26
 Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo_splash.sprite") 168 46
+Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo_header_inner.sprite") 95 26 -Erode
+Convert-TransparentSprite $logo (Join-Path $OutputDirectory "sc64_logo_splash_inner.sprite") 168 46 -Erode
