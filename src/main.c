@@ -142,11 +142,6 @@ joypad_inputs_t p1_inputs;
 #define CURSOR_INTERVAL 25
 #define CURSOR_INTERVAL_SECOND (CURSOR_INTERVAL - 6)
 
-#define FADE_DURATION 60.0f
-#define OPENING_WAIT 60.0f * 2.0f
-#define OPENING_SOUND_PLAY (OPENING_WAIT - 10.0f)
-#define OPENING_OUT 20.0f
-
 #define SCR_REGION_X_MIN 16.0f
 #define BOX_REGION_X_MIN 64.0f
 #define BOX_REGION_X_MAX 608.0f
@@ -186,13 +181,8 @@ float viewport_y_target = BOX_REGION_Y_MIN;
 
 float box_region_scissor_left = 64.0f;
 
-int fade_state = 0;
-int fade_counter = FADE_DURATION;
-float fade_lvl = 1.0f;
-
 int main_state = 0;
-int opening_counter = OPENING_WAIT;
-float opening_card_offset_x = 0.0f;
+unsigned long long startup_start_ms = 0;
 
 // Sliding five-row library window reflected by the header ribbon.
 int library_position_segment = 0;
@@ -385,9 +375,9 @@ void logo_draw(sprite_t *logo, sprite_t *inner, float x, float y) {
 
         rdpq_set_scissor(sx0, sy0, sx1, sy1);
         // The full silhouette goes down slightly darker first. The inner mask then
-        // replaces almost all of it with normal colour, leaving sparse Bayer-selected
-        // squares on the one-texel boundary. Point sampling keeps those discrete
-        // instead of softening the whole mark.
+        // replaces almost all of it with normal colour, leaving only partial-coverage
+        // diagonal texels visible. Point sampling keeps those discrete instead of
+        // softening the whole mark.
         rdpq_set_prim_color(edge_col[i]);
         rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){
             .scale_x = LOGO_SCALE, .scale_y = LOGO_SCALE,
@@ -399,6 +389,71 @@ void logo_draw(sprite_t *logo, sprite_t *inner, float x, float y) {
     }
 
     rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+}
+
+static void startup_mask_draw(sprite_t *logo, float x, float y, float scale, color_t color) {
+    rdpq_set_mode_standard();
+    rdpq_mode_filter(FILTER_POINT);
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+    rdpq_mode_alphacompare(1);
+    rdpq_set_prim_color(color);
+    rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){
+        .scale_x = scale, .scale_y = scale,
+    });
+}
+
+static void startup_outline_draw(sprite_t *logo, float cx, float cy, float scale) {
+    float x = cx - logo->width * scale * 0.5f;
+    float y = cy - logo->height * scale * 0.5f;
+    float glow = scale * 1.5f;
+    static const float ox[8] = { -1, 1, 0, 0, -1, 1, -1, 1 };
+    static const float oy[8] = { 0, 0, -1, 1, -1, -1, 1, 1 };
+
+    rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    for(int i = 0; i < 8; i++) {
+        startup_mask_draw(logo, x + ox[i] * glow, y + oy[i] * glow, scale,
+            RGBA32(116, 0, 70, 255));
+    }
+    for(int i = 0; i < 8; i++) {
+        startup_mask_draw(logo, x + ox[i] * scale, y + oy[i] * scale, scale,
+            RGBA32(255, 35, 156, 255));
+    }
+    startup_mask_draw(logo, x, y, scale, RGBA32(0, 0, 0, 255));
+}
+
+static void startup_draw(void) {
+    unsigned long long elapsed = (unsigned long long)get_ticks_ms() - startup_start_ms;
+    const float cx = SCREEN_WIDTH * 0.5f;
+    const float cy = SCREEN_HEIGHT * 0.46f;
+
+    rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
+    rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+
+    if(elapsed < 1400) {
+        float t = (float)elapsed / 1400.0f;
+        float u = 1.0f - t;
+        startup_outline_draw(logo_splash, cx, cy, LOGO_SCALE + 6.0f * u * u);
+    } else if(elapsed < 2100) {
+        startup_outline_draw(logo_splash, cx, cy, LOGO_SCALE);
+    } else if(elapsed < 2350) {
+        float x = cx - logo_splash->width * LOGO_SCALE * 0.5f;
+        float y = cy - logo_splash->height * LOGO_SCALE * 0.5f;
+        startup_mask_draw(logo_splash, x, y, LOGO_SCALE, RGBA32(255, 255, 255, 255));
+    } else {
+        float lw = logo_splash->width * LOGO_SCALE;
+        float lh = logo_splash->height * LOGO_SCALE;
+        logo_draw(logo_splash, logo_splash_inner, cx - lw * 0.5f, cy - lh * 0.5f);
+
+        if(elapsed > 3900) {
+            float fade = (float)(elapsed - 3900) / 400.0f;
+            if(fade > 1.0f) fade = 1.0f;
+            rdpq_set_mode_standard();
+            rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
+            rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
+            rdpq_set_prim_color(RGBA32(0, 0, 0, (int)(fade * 255.0f)));
+            rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        }
+    }
 }
 
 // The tabs are the mark's slashes reused as navigation, so their lean is taken
@@ -1291,39 +1346,16 @@ void menu_draw() {
 }
 
 void update(int ovfl) {
-    switch(fade_state) {
-        case 0:
-        fade_lvl = fade_counter / FADE_DURATION;
-        fade_counter--;
-        if(fade_counter == 0) fade_state = 1;
-        break;
-        default:
-        break;
-    }
-
-    if(fade_state == 1 && main_state == 0) {
-        main_state = 1;
-    }
-    switch(main_state) {
-        default: case 0: break; // Wait Fade
-        case 1: // Wait logo
-            opening_counter--;
-            if(opening_counter == OPENING_SOUND_PLAY) {
-                
-            }
-            if(opening_counter == 0) {
-                main_state = 2;
-                load_titles();
-                opening_counter = OPENING_OUT;
-            }
-        break;
-        case 2: // exit logo out of the screen
-            opening_card_offset_x = ((1.0f - opening_counter / OPENING_OUT) * 640.0f);
-            opening_counter--;
-            if(opening_counter == 0) {
-                main_state = 3;
-            }
-            break;
+    if(main_state < 3) {
+        unsigned long long elapsed = (unsigned long long)get_ticks_ms() - startup_start_ms;
+        if(elapsed >= 4400) {
+            main_state = 3;
+        } else if(elapsed >= 4300) {
+            if(main_state < 2) load_titles();
+            main_state = 2;
+        } else {
+            main_state = 1;
+        }
     }
 
     if(main_state >= 2) menu_update();
@@ -1369,36 +1401,8 @@ void draw(int cur_frame) {
     }
 
 
-    if(main_state < 3) {
-        rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-        background_draw();
+    if(main_state < 3) startup_draw();
 
-        // Centred mark over a pink rule, matching the header treatment.
-        float lw = logo_splash->width * LOGO_SCALE;
-        float lh = logo_splash->height * LOGO_SCALE;
-        float lx = (SCREEN_WIDTH - lw) * 0.5f - opening_card_offset_x;
-        float ly = 176.0f;
-        logo_draw(logo_splash, logo_splash_inner, lx, ly);
-
-        rdpq_set_mode_fill(RGBA32(255, 35, 156, 255));
-        float rx0 = lx < 0.0f ? 0.0f : lx;
-        float rx1 = lx + lw > SCREEN_WIDTH ? SCREEN_WIDTH : lx + lw;
-        if(rx1 > rx0) {
-            rdpq_fill_rectangle(rx0, ly + lh + 14, rx1, ly + lh + 17);
-        }
-    }
-
-
-     // Draw Fade
-    if(fade_state != 1) {
-        rdpq_set_mode_standard();
-        rdpq_mode_dithering(DITHER_NOISE_NOISE);
-        rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
-        rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
-        rdpq_set_prim_color(RGBA32(0, 0, 0, fade_lvl * 255));
-        rdpq_triangle(&TRIFMT_FILL, fade_v1, fade_v2, fade_v3);
-        rdpq_triangle(&TRIFMT_FILL, fade_v1, fade_v4, fade_v2);
-    }
 
     // For measuring performance
     /*float fps = display_get_fps();
@@ -1421,6 +1425,7 @@ int main(void)
     rdpq_init();
     joypad_init();
     timer_init();
+    startup_start_ms = (unsigned long long)get_ticks_ms();
 
     logo_header = sprite_load("rom:/sc64_logo_header.sprite");
     logo_splash = sprite_load("rom:/sc64_logo_splash.sprite");
