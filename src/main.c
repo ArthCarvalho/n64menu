@@ -63,7 +63,8 @@ float bezier_interp(float t, float x1, float y1, float x2, float y2) {
     return 3.0f * pow(1.0f - refinedT, 2.0f) * refinedT * y1 + 3.0f * (1.0f - refinedT) * pow(refinedT, 2.0f) * y2 + pow(refinedT, 3.0f);
 }
 
-sprite_t *logo;
+sprite_t *logo_header;
+sprite_t *logo_splash;
 
 rdpq_font_t *font_body;
 rdpq_font_t *font_title;
@@ -256,11 +257,32 @@ void quad_draw(float x1, float y1, float x2, float y2, float skew, color_t color
         (float[]){ x2, y1 }, (float[]){ x2 - skew, y2 }, (float[]){ x1, y2 });
 }
 
-// Rounded "button" blob used for the A/B legend glyphs.
-void pill_draw(float x, float y, float w, float h, color_t color) {
+void disc_draw(float cx, float cy, int radius, color_t color) {
     rdpq_set_mode_fill(color);
-    rdpq_fill_rectangle(x + 2, y, x + w - 2, y + h);
-    rdpq_fill_rectangle(x, y + 2, x + w, y + h - 2);
+    for(int y = -radius; y <= radius; y++) {
+        int half_width = sqrt(radius * radius - y * y);
+        rdpq_fill_rectangle(cx - half_width, cy + y, cx + half_width + 1, cy + y + 1);
+    }
+}
+
+// Layered circular button cap: shadow, body, and a small top-left highlight.
+// Unlike the old two-rectangle octagon, the silhouette stays round at this size.
+void button_cap_draw(float cx, float cy, color_t dark, color_t color, color_t light) {
+    disc_draw(cx + 1, cy + 2, 11, RGBA32(0, 0, 0, 255));
+    disc_draw(cx, cy, 11, dark);
+    disc_draw(cx, cy - 1, 9, color);
+    disc_draw(cx - 3, cy - 5, 3, light);
+}
+
+// Centred through the layout engine rather than by hand, then nudged by the
+// residual measured off a capture: the glyph box centres the advance width, which
+// leaves the inked shape slightly high and left of the cap.
+void button_letter_draw(float cx, float cy, const char *label) {
+    const float box = 24.0f;
+    rdpq_text_print(&(rdpq_textparms_t){
+        .width = box, .height = box,
+        .align = ALIGN_CENTER, .valign = VALIGN_CENTER,
+    }, FONT_BODY, cx - box * 0.5f + 1.0f, cy - box * 0.5f + 2.0f, label);
 }
 
 // M64 marks the active row with a solid yellow triangle, not a highlighted card.
@@ -278,12 +300,12 @@ void focus_draw(float x, float y, float width, float height) {
 
 // The M64 mark is layered yellow -> orange -> pink rather than a flat tint. The
 // sprite is a white mask, so we blit it once per horizontal band, clipped by scissor.
-void logo_draw(float x, float y, float scale) {
+void logo_draw(sprite_t *logo, float x, float y) {
     if(logo == NULL || logo->width <= 0 || logo->width > 512 ||
        logo->height <= 0 || logo->height > 256) return;
 
-    float w = logo->width * scale;
-    float h = logo->height * scale;
+    float w = logo->width;
+    float h = logo->height;
 
     const float band_top[3] = { 0.00f, 0.44f, 0.74f };
     const float band_bot[3] = { 0.44f, 0.74f, 1.00f };
@@ -313,7 +335,7 @@ void logo_draw(float x, float y, float scale) {
 
         rdpq_set_scissor(sx0, sy0, sx1, sy1);
         rdpq_set_prim_color(band_col[i]);
-        rdpq_sprite_blit(logo, x, y, &(rdpq_blitparms_t){ .scale_x = scale, .scale_y = scale });
+        rdpq_sprite_blit(logo, x, y, NULL);
     }
 
     rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -424,7 +446,7 @@ void chrome_draw(void) {
 
     ribbon_draw();
 
-    logo_draw(BOX_REGION_X_MIN, 18, 0.32f);
+    logo_draw(logo_header, BOX_REGION_X_MIN, 8);
 }
 
 
@@ -1176,14 +1198,17 @@ void draw(int cur_frame) {
         rdpq_text_printf(NULL, FONT_BODY, BOX_REGION_X_MIN, HINT_Y + 12,
             title_truncated ? "^02%d TITLES (LIMIT)" : "^02%d TITLES", title_count);
 
-        // A/B legend, right-aligned. Press Start 2P is monospace at ~16px/char.
-        pill_draw(416, HINT_Y, 20, 20, RGBA32(41, 121, 255, 255));
-        rdpq_text_print(NULL, FONT_BODY, 418, HINT_Y + 16, "A");
-        rdpq_text_print(NULL, FONT_BODY, 444, HINT_Y + 16, "PLAY");
+        // Circular M64-style caps. The letter is centred on the cap and drawn in
+        // black, so it reads as printed on the button rather than floating over it.
+        button_cap_draw(427, HINT_Y + 10,
+            RGBA32(0, 50, 150, 255), RGBA32(0, 104, 230, 255), RGBA32(62, 160, 255, 255));
+        button_letter_draw(427, HINT_Y + 10, "^05A");
+        rdpq_text_print(NULL, FONT_BODY, 446, HINT_Y + 16, "PLAY");
 
-        pill_draw(520, HINT_Y, 20, 20, RGBA32(0, 200, 83, 255));
-        rdpq_text_print(NULL, FONT_BODY, 522, HINT_Y + 16, "B");
-        rdpq_text_print(NULL, FONT_BODY, 548, HINT_Y + 16, "BACK");
+        button_cap_draw(527, HINT_Y + 10,
+            RGBA32(0, 96, 40, 255), RGBA32(0, 183, 73, 255), RGBA32(55, 235, 120, 255));
+        button_letter_draw(527, HINT_Y + 10, "^05B");
+        rdpq_text_print(NULL, FONT_BODY, 546, HINT_Y + 16, "BACK");
     }
 
 
@@ -1193,17 +1218,16 @@ void draw(int cur_frame) {
         rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 
         // Centred mark over a pink rule, matching the header treatment.
-        float scale = 0.70f;
-        float lw = logo->width * scale;
+        float lw = logo_splash->width;
         float lx = (SCREEN_WIDTH - lw) * 0.5f - opening_card_offset_x;
         float ly = 176.0f;
-        logo_draw(lx, ly, scale);
+        logo_draw(logo_splash, lx, ly);
 
         rdpq_set_mode_fill(RGBA32(255, 35, 156, 255));
         float rx0 = lx < 0.0f ? 0.0f : lx;
         float rx1 = lx + lw > SCREEN_WIDTH ? SCREEN_WIDTH : lx + lw;
         if(rx1 > rx0) {
-            rdpq_fill_rectangle(rx0, ly + logo->height * scale + 14, rx1, ly + logo->height * scale + 17);
+            rdpq_fill_rectangle(rx0, ly + logo_splash->height + 14, rx1, ly + logo_splash->height + 17);
         }
     }
 
@@ -1239,7 +1263,8 @@ int main(void)
     joypad_init();
     timer_init();
 
-    logo = sprite_load("rom:/sc64_logo.sprite");
+    logo_header = sprite_load("rom:/sc64_logo_header.sprite");
+    logo_splash = sprite_load("rom:/sc64_logo_splash.sprite");
 
     font_body = rdpq_font_load("rom:/m64_body.font64");
     font_title = rdpq_font_load("rom:/m64_title.font64");
