@@ -46,7 +46,16 @@ function Save-VerifiedDownload([string]$Uri, [string]$Destination, [string]$Sha2
 
     $temporary = "$Destination.$([System.Guid]::NewGuid().ToString('N')).download"
     try {
-        Invoke-WebRequest -UseBasicParsing -Headers $Headers -Uri $Uri -OutFile $temporary
+        $requestHeaders = @{}
+        foreach ($key in $Headers.Keys) { $requestHeaders[$key] = $Headers[$key] }
+
+        $parsedUri = [System.Uri]::new($Uri)
+        if ($parsedUri.Host -eq "api.github.com" -and -not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+            $requestHeaders["Authorization"] = "Bearer $env:GITHUB_TOKEN"
+            $requestHeaders["X-GitHub-Api-Version"] = "2022-11-28"
+        }
+
+        Invoke-WebRequest -UseBasicParsing -Headers $requestHeaders -Uri $Uri -OutFile $temporary
         $actual = Get-Sha256 $temporary
         if ($actual -ne $Sha256) { throw "Unexpected download checksum: $actual" }
         [System.IO.File]::Move($temporary, $Destination)

@@ -24,6 +24,8 @@ jobs:
       # the host tools compiled with Zig, and the generated sprites and fonts.
       # Building by hand cannot catch an asset that only exists locally.
       - name: Build menu
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: zig build menu
 
       - name: Report ROM hashes
