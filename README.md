@@ -86,3 +86,9 @@ writeback.
 ## Building
 
 See [BUILDING.md](BUILDING.md).
+
+## Releases
+
+Push a version tag such as `v0.1.0` to build and publish a GitHub Release. The
+release contains `sc64menu.n64` and `sc64menu.n64.sha256`, built by the same
+clean-machine workflow used for pull requests. Non-version tags do not publish.
