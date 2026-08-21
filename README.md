@@ -53,8 +53,13 @@ menu/
   title/<id>/<id>_e.z64
   title/<id>/<id>_e.sprite
   title/<id>/<id>_e.save
+  title/<id>/<id>_e.name
   save/<id>.sav
 ```
+
+The optional `.name` sidecar stores the display name used by the header's
+five-row navigator. Existing libraries without it fall back to the internal ROM
+title. The importer writes `.name` automatically.
 
 The optional `.save` sidecar configures cartridge saving. Its contents must be one
 of:

@@ -1,9 +1,11 @@
 #include <stdio.h>
 
+#include <libcart/cart.h>
 #include <libdragon.h>
 
 #include "boot/boot.h"
 #include "flashcart/flashcart.h"
+#include "flashcart/sc64/sc64_ll.h"
 #include "utils/fs.h"
 
 #define PI 3.141592653f
@@ -14,6 +16,27 @@
 int menu_active;
 boot_params_t boot_params;
 char rom_path[1024];
+
+// sc64_init() leaves the boot mode at BOOT_MODE_MENU and nothing in the menu
+// changes it, so a switch to BOOT_MODE_ROM means sc64deployer has just written a
+// ROM into cartridge SDRAM over USB. Booting it here removes the manual reset
+// from the development loop; the SD card stays locked to the console throughout.
+void usb_upload_poll(void) {
+    static int countdown = 30;
+    uint32_t mode;
+
+    if(cart_type != CART_SC) return;
+    if(--countdown > 0) return;
+    countdown = 30;
+
+    if(sc64_ll_get_config(CFG_ID_BOOT_MODE, &mode) != SC64_OK) return;
+    if(mode != BOOT_MODE_ROM) return;
+
+    boot_params.device_type = BOOT_DEVICE_TYPE_ROM;
+    boot_params.tv_type = BOOT_TV_TYPE_PASSTHROUGH;
+    boot_params.detect_cic_seed = true;
+    menu_active = false;
+}
 
 float lerp(float t, float a, float b) {
     return a + (b - a) * t;
@@ -48,9 +71,13 @@ rdpq_font_t *font_title;
 #define FONT_BODY    1
 #define FONT_TITLE   2
 
-#define STYLE_WHITE  0
-#define STYLE_YELLOW 1
-#define STYLE_DIM    2
+#define STYLE_WHITE      0
+#define STYLE_YELLOW     1
+#define STYLE_DIM        2
+#define STYLE_GREY       3
+#define STYLE_SHADOW     4
+#define STYLE_OUTLINE    5
+#define STYLE_SHADOW_SEL 6
 
 int spinner_fade_counter = 0;
 float spinner_fade = 0.0f;
@@ -160,6 +187,55 @@ int main_state = 0;
 int opening_counter = OPENING_WAIT;
 float opening_card_offset_x = 0.0f;
 
+// Sliding five-row library window reflected by the header ribbon.
+int library_position_segment = 0;
+int library_row_window_start = 0;
+int library_populated_rows = 0;
+char library_row_initial[50] = {0};
+
+char title_initial_normalize(char c) {
+    if(c >= 'a' && c <= 'z') return c - ('a' - 'A');
+    if((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+    return 0;
+}
+
+char title_initial_load(char * id) {
+    char path[128];
+    char c;
+
+    // New imports preserve the filename as display metadata.
+    snprintf(path, sizeof(path), "sd:/menu/title/%s/%s_e.name", id, id);
+    FILE * f = fopen(path, "r");
+    if(f != NULL) {
+        while(fread(&c, 1, 1, f) == 1) {
+            char initial = title_initial_normalize(c);
+            if(initial != 0) {
+                fclose(f);
+                return initial;
+            }
+        }
+        fclose(f);
+    }
+
+    // Existing cards have no name sidecar, so use the internal ROM title.
+    snprintf(path, sizeof(path), "sd:/menu/title/%s/%s_e.z64", id, id);
+    f = fopen(path, "rb");
+    if(f != NULL) {
+        if(fseek(f, 0x20, SEEK_SET) == 0) {
+            for(int i = 0; i < 20 && fread(&c, 1, 1, f) == 1; i++) {
+                char initial = title_initial_normalize(c);
+                if(initial != 0) {
+                    fclose(f);
+                    return initial;
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    return title_initial_normalize(id[0]);
+}
+
 void outline_draw(float x, float y, float width, float height, int size, color_t color) {
     x = round(x);
     y = round(y);
@@ -243,21 +319,102 @@ void logo_draw(float x, float y, float scale) {
     rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 }
 
+// The tabs are the mark's slashes reused as navigation, so their lean is taken
+// from the logo artwork (dx/dy = 0.875, measured from the asset). Slant is applied
+// per height rather than as a fixed offset, otherwise tabs of different depths
+// would end up at different angles.
+#define RIBBON_SLANT     0.875f
+#define RIBBON_Y0        14.0f
+#define RIBBON_LEAD_H    44.0f          // tabs before the selection
+#define RIBBON_FULL_H    50.0f          // selection and the tabs behind it
+#define RIBBON_GLYPH_W   40.0f
+#define RIBBON_GAP       4.0f
+#define RIBBON_STEP      (RIBBON_GLYPH_W + RIBBON_GAP)
+#define RIBBON_T0        404.0f         // top-left of the first tab
+#define RIBBON_RULE_TOP  61.0f
+#define RIBBON_RULE_BOT  64.0f
+
+// Anchored on the tab's top-left corner so every tab tiles from the same edge
+// regardless of how deep it runs.
+void ribbon_tab(float top_x, float height, color_t color) {
+    float skew = height * RIBBON_SLANT;
+    quad_draw(top_x - skew, RIBBON_Y0, top_x + RIBBON_GLYPH_W,
+        RIBBON_Y0 + height, skew, color);
+}
+
 void ribbon_draw(void) {
-    const float y0 = 16.0f, y1 = 58.0f, skew = 16.0f;
-    color_t stripes[5] = {
+    color_t inactive[2] = {
         RGBA32(74, 32, 122, 255),
         RGBA32(113, 48, 183, 255),
-        RGBA32(255, 35, 156, 255),   // active tab
-        RGBA32(113, 48, 183, 255),
-        RGBA32(74, 32, 122, 255),
     };
-    // Adjacent parallelograms separated by thin black diagonals, so the band reads
-    // as one ribbon instead of five floating bars.
-    float x = 340.0f;
-    for(int i = 0; i < 5; i++) {
-        quad_draw(x, y0, x + 50.0f, y1, skew, stripes[i]);
-        x += 56.0f;
+    color_t pink = RGBA32(255, 35, 156, 255);
+
+    int tab_count = library_populated_rows < 5 ? library_populated_rows : 5;
+    if(tab_count < 1) tab_count = 1;
+
+    float selected_x = RIBBON_T0 + library_position_segment * RIBBON_STEP;
+    float skew_full = RIBBON_FULL_H * RIBBON_SLANT;
+    float skew_rule = (RIBBON_RULE_BOT - RIBBON_RULE_TOP) * RIBBON_SLANT;
+
+    // The baseline is the ribbon's lower edge. Its right end is slanted so it
+    // meets the selection's edge instead of protruding past it.
+    float rule_end = selected_x + RIBBON_GLYPH_W - skew_full;
+    quad_draw(BOX_REGION_X_MIN - skew_rule, RIBBON_RULE_TOP,
+        rule_end + skew_rule, RIBBON_RULE_BOT, skew_rule, pink);
+
+    // Tabs ahead of the selection stop short of the baseline, leaving a gap.
+    // Tabs behind it run down to the baseline's underside, so the ribbon reads
+    // as one continuous edge from the rule through the selection.
+    for(int i = 0; i < tab_count; i++) {
+        if(i == library_position_segment) continue;
+        float top_x = RIBBON_T0 + i * RIBBON_STEP;
+        float height = i < library_position_segment ? RIBBON_LEAD_H : RIBBON_FULL_H;
+        ribbon_tab(top_x, height, inactive[i & 1]);
+    }
+
+    ribbon_tab(selected_x, RIBBON_FULL_H, pink);
+
+    // Each tab names its row by the first letter of that row's first title. The
+    // reference icons carry a keyline and a shadow cast along the tab, which is
+    // what makes them read as standing on the plane rather than printed on it.
+    for(int i = 0; i < tab_count; i++) {
+        int row = library_row_window_start + i;
+        char initial = library_row_initial[row] != 0 ? library_row_initial[row] : '?';
+
+        // Sit the letter low and left on the tab. Descending the slant already
+        // carries it left, so the offset is measured from the tab's midline at
+        // the letter's own height rather than from its top corner.
+        float x = RIBBON_T0 + i * RIBBON_STEP - 13.0f;
+        float y = 47.0f;
+
+        // A uniform offset reads as the letter hovering, or as extrusion. A real
+        // shadow is anchored at the base and sweeps further the higher up the
+        // glyph it is cast from, so shear it: each horizontal slice is displaced
+        // in proportion to its height above the letter's feet. The throw is taken
+        // from the reference icons, whose shadows reach about 0.45 of their height.
+        const int bands = 8;
+        const float band_h = 16.0f / bands;
+        for(int b = 0; b < bands; b++) {
+            float band_top = y - 16.0f + b * band_h;
+            float lift = 1.0f - (float)b / (float)(bands - 1);
+            float ox = 1.0f + lift * 9.0f;
+            float oy = lift * 4.0f;
+
+            rdpq_set_scissor(0, band_top + oy, SCREEN_WIDTH, band_top + band_h + oy);
+            rdpq_text_printf(NULL, FONT_BODY, x + ox, y + oy,
+                i == library_position_segment ? "^06%c" : "^04%c", initial);
+        }
+        rdpq_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+
+        static const float outline_x[4] = { -1.0f, 1.0f,  0.0f, 0.0f };
+        static const float outline_y[4] = {  0.0f, 0.0f, -1.0f, 1.0f };
+        for(int o = 0; o < 4; o++) {
+            rdpq_text_printf(NULL, FONT_BODY, x + outline_x[o], y + outline_y[o],
+                "^05%c", initial);
+        }
+
+        rdpq_text_printf(NULL, FONT_BODY, x, y,
+            i == library_position_segment ? "^01%c" : "^03%c", initial);
     }
 }
 
@@ -266,10 +423,6 @@ void chrome_draw(void) {
     rdpq_fill_rectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 
     ribbon_draw();
-
-    // Pink rule anchoring the header, as on the M64's own pages.
-    rdpq_set_mode_fill(RGBA32(255, 35, 156, 255));
-    rdpq_fill_rectangle(BOX_REGION_X_MIN, CHROME_RULE_Y, 620, CHROME_RULE_Y + 3);
 
     logo_draw(BOX_REGION_X_MIN, 18, 0.32f);
 }
@@ -611,6 +764,9 @@ void load_titles() {
 
                     sprite_t * image = sprite_load(filename);
                     TitleBox_create2(&title_list[title_count], image, flbuf);
+                    if((title_count % row_max) == 0) {
+                        library_row_initial[title_count / row_max] = title_initial_load(flbuf);
+                    }
                     title_row[title_count / row_max][title_count % row_max] = &title_list[title_count];
                     title_count++;
                 }
@@ -628,6 +784,8 @@ void load_titles() {
             if(c == 0) break;
         }
     }
+
+    library_populated_rows = (title_count + row_max - 1) / row_max;
 
     for(int y = 0; y < TITLE_ROWS; y++) { 
         int row_count = 0;
@@ -825,6 +983,18 @@ void menu_update() {
         selectedTitle = NULL;
     }
 
+    int populated_rows = (title_count + TITLE_COLUMNS - 1) / TITLE_COLUMNS;
+    int visible_rows = populated_rows < 5 ? populated_rows : 5;
+    if(cursor_y < library_row_window_start) {
+        library_row_window_start = cursor_y;
+    } else if(cursor_y >= library_row_window_start + visible_rows) {
+        library_row_window_start = cursor_y - visible_rows + 1;
+    }
+    int max_window_start = populated_rows - visible_rows;
+    if(library_row_window_start > max_window_start) library_row_window_start = max_window_start;
+    if(library_row_window_start < 0) library_row_window_start = 0;
+    library_position_segment = cursor_y - library_row_window_start;
+
     if(cursor_x >= 0 && selectedTitle && main_state == 3) {
         if(p1_buttons_press.a) {
             main_state = 4;
@@ -984,6 +1154,9 @@ void update(int ovfl) {
     }
 
     if(main_state >= 2) menu_update();
+
+    // Only while browsing: launching a game already owns the boot path.
+    if(main_state == 3) usb_upload_poll();
 }
 
 void draw(int cur_frame) {
@@ -1076,9 +1249,19 @@ int main(void)
     rdpq_fontstyle_t white  = { .color = RGBA32(255, 255, 255, 255) };
     rdpq_fontstyle_t yellow = { .color = RGBA32(255, 214, 0, 255) };
     rdpq_fontstyle_t dim    = { .color = RGBA32(132, 116, 148, 255) };
+    rdpq_fontstyle_t grey   = { .color = RGBA32(206, 206, 216, 255) };
+    // Shadows are a darkened tint of the tab they fall on, not black, so they
+    // read as cast onto the surface instead of punched through it.
+    rdpq_fontstyle_t shadow = { .color = RGBA32(44, 18, 78, 255) };
+    rdpq_fontstyle_t shadowsel = { .color = RGBA32(170, 16, 82, 255) };
+    rdpq_fontstyle_t keyline= { .color = RGBA32(0, 0, 0, 255) };
     rdpq_font_style(font_body,  STYLE_WHITE,  &white);
     rdpq_font_style(font_body,  STYLE_YELLOW, &yellow);
     rdpq_font_style(font_body,  STYLE_DIM,    &dim);
+    rdpq_font_style(font_body,  STYLE_GREY,   &grey);
+    rdpq_font_style(font_body,  STYLE_SHADOW, &shadow);
+    rdpq_font_style(font_body,  STYLE_OUTLINE,&keyline);
+    rdpq_font_style(font_body,  STYLE_SHADOW_SEL, &shadowsel);
     rdpq_font_style(font_title, STYLE_WHITE,  &white);
     rdpq_font_style(font_title, STYLE_YELLOW, &yellow);
 
