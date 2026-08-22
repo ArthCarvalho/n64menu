@@ -3,6 +3,7 @@ const sokol = @import("sokol");
 const importer = @import("importer");
 const deployer = @import("deployer");
 const sdcard = @import("sdcard");
+const startup = @import("startup");
 const ui_scale = @import("ui_scale");
 
 const sg = sokol.gfx;
@@ -29,6 +30,8 @@ const colors = struct {
     const dim = Color{ .r = 178, .g = 168, .b = 198 };
     const good = Color{ .r = 76, .g = 220, .b = 130 };
     const bad = Color{ .r = 255, .g = 90, .b = 112 };
+    const black = Color{ .r = 0, .g = 0, .b = 0 };
+    const logo_glow = Color{ .r = 116, .g = 0, .b = 70 };
 };
 
 const FixedText = struct {
@@ -155,6 +158,7 @@ const state = struct {
     var worker_result: ?WorkerResult = null;
     var shutting_down = false;
     var preview_destination: SyncDestination = .usb;
+    var startup_elapsed: f64 = 0;
 };
 
 const layout = struct {
@@ -215,6 +219,7 @@ export fn cleanup() void {
 
 export fn frame() void {
     harvestWorker();
+    state.startup_elapsed += sapp.frameDuration();
     const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
     const width = metrics.width;
     const height = metrics.height;
@@ -223,26 +228,104 @@ export fn frame() void {
     sgl.ortho(0, width, height, 0, -1, 1);
     sgl.matrixModeModelview();
 
-    drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = height - 48 }, colors.panel);
-    drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 6 }, colors.pink);
-    drawText(44, 50, colors.yellow, "M64 RETROARCH SYNC", .{});
-    drawText(44, 78, colors.dim, "Automatic RetroArch -> SummerCart workflow", .{});
+    if (startup.frameAt(state.startup_elapsed).stage != .done) {
+        drawStartup(width, height);
+    } else {
+        drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = height - 48 }, colors.panel);
+        drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 6 }, colors.pink);
+        drawText(44, 50, colors.yellow, "M64 RETROARCH SYNC", .{});
+        drawText(44, 78, colors.dim, "Automatic RetroArch -> SummerCart workflow", .{});
 
-    const busy = isBusy();
-    drawButton(layout.refresh(width), if (busy) colors.border else colors.orange, "REFRESH");
-    drawButton(layout.sdSync(width), if (canSyncSd() and !busy) colors.yellow else colors.border, "SYNC TO SD (FAST)");
-    drawButton(layout.usbSync(width), if (canSyncUsb() and !busy) colors.orange else colors.border, "SYNC OVER USB (SLOW)");
+        const busy = isBusy();
+        drawButton(layout.refresh(width), if (busy) colors.border else colors.orange, "REFRESH");
+        drawButton(layout.sdSync(width), if (canSyncSd() and !busy) colors.yellow else colors.border, "SYNC TO SD (FAST)");
+        drawButton(layout.usbSync(width), if (canSyncUsb() and !busy) colors.orange else colors.border, "SYNC OVER USB (SLOW)");
 
-    drawRetroArchPanel(width);
-    drawDestinationPanels(width);
-    drawStatus();
-    drawTitles(width, height);
+        drawRetroArchPanel(width);
+        drawDestinationPanels(width);
+        drawStatus();
+        drawTitles(width, height);
+    }
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
     sgl.draw();
     sdtx.draw();
     sg.endPass();
     sg.commit();
+}
+
+fn drawStartup(width: f32, height: f32) void {
+    const current = startup.frameAt(state.startup_elapsed);
+    drawRect(.{ .x = 0, .y = 0, .w = width, .h = height }, colors.black);
+    if (current.stage == .black) return;
+
+    const screen_scale = @min(width / 640.0, height / 480.0);
+    const scale = current.scale * screen_scale;
+    const center_x = width * 0.5;
+    const center_y = height * 0.46;
+    const x = center_x - startup.logo_width * scale * 0.5;
+    const y = center_y - startup.logo_height * scale * 0.5;
+
+    switch (current.stage) {
+        .outline => {
+            drawStartupOutline(x, y, scale, scale * 1.5, colors.logo_glow);
+            drawStartupOutline(x, y, scale, scale, colors.pink);
+            drawLogoRuns(&startup.outer_runs, x, y, scale, 0, startup.logo_height, colors.black);
+        },
+        .white => drawLogoRuns(&startup.outer_runs, x, y, scale, 0, startup.logo_height, colors.white),
+        .color => drawStartupLogo(x, y, scale, current.intensity),
+        .black, .done => {},
+    }
+}
+
+fn drawStartupOutline(x: f32, y: f32, scale: f32, offset: f32, color: Color) void {
+    const directions = [_][2]f32{
+        .{ -1, 0 },  .{ 1, 0 },  .{ 0, -1 }, .{ 0, 1 },
+        .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, 1 },
+    };
+    for (directions) |direction| {
+        drawLogoRuns(&startup.outer_runs, x + direction[0] * offset, y + direction[1] * offset, scale, 0, startup.logo_height, color);
+    }
+}
+
+fn drawStartupLogo(x: f32, y: f32, scale: f32, intensity: f32) void {
+    drawStartupOutline(x, y, scale, scale, colors.black);
+    const bands = [_]struct { top: f32, bottom: f32, edge: Color, fill: Color }{
+        .{ .top = 0, .bottom = startup.logo_height * 0.44, .edge = .{ .r = 235, .g = 190, .b = 0 }, .fill = colors.yellow },
+        .{ .top = startup.logo_height * 0.44, .bottom = startup.logo_height * 0.74, .edge = .{ .r = 235, .g = 104, .b = 0 }, .fill = colors.orange },
+        .{ .top = startup.logo_height * 0.74, .bottom = startup.logo_height, .edge = .{ .r = 230, .g = 25, .b = 137 }, .fill = colors.pink },
+    };
+    for (bands) |band| {
+        drawLogoRuns(&startup.outer_runs, x, y, scale, band.top, band.bottom, dimColor(band.edge, intensity));
+        drawLogoRuns(&startup.inner_runs, x, y, scale, band.top, band.bottom, dimColor(band.fill, intensity));
+    }
+}
+
+fn drawLogoRuns(runs: []const startup.Run, x: f32, y: f32, scale: f32, top: f32, bottom: f32, color: Color) void {
+    sgl.beginQuads();
+    sgl.c3b(color.r, color.g, color.b);
+    for (runs) |run| {
+        const run_top = @max(top, @as(f32, @floatFromInt(run.y)));
+        const run_bottom = @min(bottom, @as(f32, @floatFromInt(run.y)) + 1.0);
+        if (run_top >= run_bottom) continue;
+        const left = x + @as(f32, @floatFromInt(run.x)) * scale;
+        const right = left + @as(f32, @floatFromInt(run.width)) * scale;
+        const draw_top = y + run_top * scale;
+        const draw_bottom = y + run_bottom * scale;
+        sgl.v2f(left, draw_top);
+        sgl.v2f(right, draw_top);
+        sgl.v2f(right, draw_bottom);
+        sgl.v2f(left, draw_bottom);
+    }
+    sgl.end();
+}
+
+fn dimColor(color: Color, intensity: f32) Color {
+    return .{
+        .r = @intFromFloat(@round(@as(f32, @floatFromInt(color.r)) * intensity)),
+        .g = @intFromFloat(@round(@as(f32, @floatFromInt(color.g)) * intensity)),
+        .b = @intFromFloat(@round(@as(f32, @floatFromInt(color.b)) * intensity)),
+    };
 }
 
 fn drawRetroArchPanel(width: f32) void {
@@ -372,6 +455,7 @@ fn drawTitles(width: f32, height: f32) void {
 
 export fn event(event_ptr: [*c]const sapp.Event) void {
     const input = event_ptr.*;
+    if (startup.frameAt(state.startup_elapsed).stage != .done) return;
     const scale = ui_scale.metrics(sapp.widthf(), sapp.heightf()).scale;
     switch (input.type) {
         .MOUSE_DOWN => if (input.mouse_button == .LEFT) handleClick(input.mouse_x / scale, input.mouse_y / scale),
