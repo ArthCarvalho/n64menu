@@ -1,5 +1,5 @@
 diff --git a/sw/deployer/src/main.rs b/sw/deployer/src/main.rs
-index bacd5c9..8b6eff0 100644
+index bacd5c9..f3c3464 100644
 --- a/sw/deployer/src/main.rs
 +++ b/sw/deployer/src/main.rs
 @@ -298,6 +298,17 @@ enum SDCommands {
@@ -20,7 +20,7 @@ index bacd5c9..8b6eff0 100644
      /// Format the SD card
      #[command(name = "mkfs")]
      Format,
-@@ -1028,6 +1039,57 @@ fn handle_sd_command(connection: Connection, command: &SDCommands) -> Result<(),
+@@ -1028,6 +1039,61 @@ fn handle_sd_command(connection: Connection, command: &SDCommands) -> Result<(),
                  },
              )?;
          }
@@ -28,7 +28,11 @@ index bacd5c9..8b6eff0 100644
 +            if !src.is_dir() {
 +                return Err(sc64::Error::new("Sync source is not a directory"));
 +            }
-+            let mut directories = vec![];
++            let mut directories = if dst == std::path::Path::new("/") {
++                vec![]
++            } else {
++                vec![dst.clone()]
++            };
 +            let mut files = vec![];
 +            collect_sync_entries(src, src, dst, &mut directories, &mut files)?;
 +            directories.sort_by_key(|path| path.components().count());
@@ -78,7 +82,7 @@ index bacd5c9..8b6eff0 100644
          SDCommands::Format => {
              let answer = prompt(format!(
                  "{}",
-@@ -1044,6 +1106,75 @@ fn handle_sd_command(connection: Connection, command: &SDCommands) -> Result<(),
+@@ -1044,6 +1110,86 @@ fn handle_sd_command(connection: Connection, command: &SDCommands) -> Result<(),
      Ok(())
  }
  
@@ -133,6 +137,17 @@ index bacd5c9..8b6eff0 100644
 +                std::path::Path::new("menu\\title.csv")
 +            ),
 +            PathBuf::from("/menu/title.csv")
++        );
++    }
++
++    #[test]
++    fn non_root_destination_is_preserved() {
++        assert_eq!(
++            sync_destination(
++                std::path::Path::new("/m64-batch-test"),
++                std::path::Path::new("alpha.txt")
++            ),
++            PathBuf::from("/m64-batch-test/alpha.txt")
 +        );
 +    }
 +
