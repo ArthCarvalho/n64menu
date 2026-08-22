@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/core.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSafe,
     });
     tests_mod.addImport("zigimg", zigimg.module("zigimg"));
     const tests = b.addTest(.{ .root_module = tests_mod });
@@ -53,10 +53,13 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/deployer.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .ReleaseSafe,
         }),
     });
     const run_deployer_tests = b.addRunArtifact(deployer_tests);
+    // Zig 0.16 can otherwise compile both large test artifacts concurrently;
+    // serializing them avoids a Linux compiler crash under constrained CI memory.
+    run_deployer_tests.step.dependOn(&run_tests.step);
     test_step.dependOn(&run_deployer_tests.step);
 
     const inspect_mod = b.createModule(.{
