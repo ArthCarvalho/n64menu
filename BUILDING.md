@@ -4,14 +4,14 @@ Windows builds are self-contained and do not require WSL.
 
 ## Requirements
 
-- Zig 0.14 or newer, optionally installed through mise
+- Zig 0.16.0, installed through mise
 - Git for Windows
 - Internet access for the first build
 
 Clone the repository to a local path containing only letters, numbers, dots, underscores, and hyphens; the historical libdragon Makefiles do not safely quote tool paths.
 
 ```powershell
-mise use zig@0.14
+mise install
 mise run menu
 ```
 

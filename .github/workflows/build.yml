@@ -11,14 +11,89 @@ permissions:
   contents: read
 
 jobs:
+  importer:
+    needs: windows
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: m64importer-windows
+            package: tools/library-importer/zig-out/m64importer-windows.zip
+          - os: ubuntu-latest
+            artifact: m64importer-linux
+            package: tools/library-importer/zig-out/m64importer-linux.tar.gz
+          - os: macos-latest
+            artifact: m64importer-macos
+            package: tools/library-importer/zig-out/m64importer-macos.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: jdx/mise-action@5ac50f778e26fac95da98d50503682459e86d566 # v2
+        with:
+          install: true
+          cache: true
+
+      - name: Install Linux desktop libraries
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libasound2-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev
+
+      - name: Test importer
+        run: mise run importer-test
+
+      - name: Build importer
+        run: mise run importer-build
+
+      - name: Bundle SummerCart deployer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item -LiteralPath (mise which sc64deployer) -Destination tools/library-importer/zig-out/bin/sc64deployer.exe
+
+      - name: Bundle SummerCart deployer (Unix)
+        if: runner.os != 'Windows'
+        run: cp "$(mise which sc64deployer)" tools/library-importer/zig-out/bin/sc64deployer
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sc64menu
+          path: tools/library-importer/zig-out/bin
+
+      - name: Bundle deployer notices
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath tools/library-importer/THIRD_PARTY.md -Destination tools/library-importer/zig-out/bin/THIRD_PARTY.md
+          Invoke-WebRequest -Uri https://raw.githubusercontent.com/Polprzewodnikowy/SummerCart64/v2.20.2/LICENSE -OutFile tools/library-importer/zig-out/bin/SC64DEPLOYER_LICENSE.txt
+
+      - name: Package importer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path tools/library-importer/zig-out/bin/* -DestinationPath ${{ matrix.package }}
+
+      - name: Package importer (Unix)
+        if: runner.os != 'Windows'
+        working-directory: tools/library-importer/zig-out/bin
+        run: >-
+          tar -czf ../${{ matrix.artifact }}.tar.gz
+          m64importer sc64deployer sc64menu.n64 THIRD_PARTY.md SC64DEPLOYER_LICENSE.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.package }}
+          if-no-files-found: error
+
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - uses: jdx/mise-action@5ac50f778e26fac95da98d50503682459e86d566 # v2
         with:
-          version: 0.14.0
+          install: true
+          cache: true
 
       # Exercises the whole bootstrap on a clean machine: the pinned toolchain,
       # the host tools compiled with Zig, and the generated sprites and fonts.
@@ -26,7 +101,7 @@ jobs:
       - name: Build menu
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: zig build menu
+        run: mise run menu
 
       - name: Report ROM hashes
         shell: pwsh

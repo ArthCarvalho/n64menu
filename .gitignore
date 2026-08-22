@@ -4,6 +4,7 @@ build/
 .n64/
 zig-out/
 .zig-cache/
+zig-pkg/
 
 .libdragon
 

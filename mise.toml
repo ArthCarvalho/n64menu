@@ -1,6 +1,19 @@
 [tools]
-zig = "0.14.0"
+"github:Polprzewodnikowy/SummerCart64" = { version = "2.20.2", exe = "sc64deployer" }
+zig = "0.16.0"
 
 [tasks.menu]
 description = "Build sc64menu.n64"
 run = "zig build menu"
+
+[tasks.importer-build]
+description = "Build the cross-platform Sokol library importer"
+run = "mise --cd tools/library-importer run build"
+
+[tasks.importer-test]
+description = "Test the cross-platform library importer"
+run = "mise --cd tools/library-importer run test"
+
+[tasks.importer-run]
+description = "Run the cross-platform Sokol library importer"
+run = "mise --cd tools/library-importer run run"

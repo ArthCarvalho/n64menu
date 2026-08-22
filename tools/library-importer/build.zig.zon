@@ -1,0 +1,21 @@
+.{
+    .name = .m64importer,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xe73d55f311900f34,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{
+        .sokol = .{
+            .url = "git+https://github.com/floooh/sokol-zig.git#9bbabc13207ca6259d171f4c22e7d88a1f7030e9",
+            .hash = "sokol-0.1.0-pb1HK2HlNwCWJkvotHqrVhf8Z_Vb-T8kViYbqeVM61tp",
+        },
+        .zigimg = .{
+            .url = "git+https://github.com/zigimg/zigimg.git#a7440df3fc41cde7df078b1c5829646c13056d49",
+            .hash = "zigimg-0.1.0-8_eo2sPVFwAm8y-DVfaCHNKQIpv9oHl_mbcKbGQZRLrK",
+        },
+    },
+}

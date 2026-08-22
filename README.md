@@ -17,7 +17,9 @@ What this fork adds:
   ribbon and a typographic header;
 - cartridge save support driven by a per-title sidecar (see below);
 - a Windows-native build that needs no WSL or Docker;
-- `tools/import-library.ps1`, which prepares ROMs and box art for the SD card.
+- `m64importer`, a cross-platform Sokol desktop tool that prepares ROMs and box art
+  for the SD card. The original PowerShell importer remains available for scripted
+  Windows workflows.
 
 ### Naming
 
@@ -86,6 +88,44 @@ writeback.
 ## Building
 
 See [BUILDING.md](BUILDING.md).
+
+## Library importer
+
+`m64importer` is a native Zig/Sokol application for Windows, Linux and macOS. It
+automatically finds RetroArch's Nintendo 64 playlist, resolves playlist ROM paths,
+reuses RetroArch's `Named_Boxarts` or `Named_Snaps`, and synchronizes the generated
+library directly to a powered-off SummerCart64 over USB.
+
+The importer reads the playlist rather than scanning arbitrary folders. Playlist
+labels become menu names, Android `/storage/<volume>/...` paths are remapped to
+mounted desktop drives when possible, and `.n64`, `.v64` and `.z64` entries are
+normalized before stable IDs are generated. Unsupported playlist formats are shown
+in the UI instead of silently imported.
+
+On refresh, the importer also reads the existing SummerCart `title.csv` and name
+sidecars. The UI shows the current installed library and a sync plan containing
+add, keep, update and hide counts. Hidden titles are removed only from the visible
+catalog; existing save files are never deleted.
+
+Install all prerequisites and launch it through mise:
+
+```console
+mise install
+mise run importer-run
+```
+
+The app detects RetroArch and the SummerCart automatically. Use **Refresh** to repeat
+detection and **Sync to SummerCart** to stage and upload the visible library. Sync is
+blocked unless the cart reports that the console is powered off. An `.lpl` file may
+be dropped onto the window only as a fallback when automatic playlist discovery
+cannot find the intended installation.
+
+Development commands:
+
+```console
+mise run importer-test
+mise run importer-build
+```
 
 ## Releases
 
