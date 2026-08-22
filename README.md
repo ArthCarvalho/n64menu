@@ -91,18 +91,21 @@ See [BUILDING.md](BUILDING.md).
 
 ## Library importer
 
-`m64importer` replaces the PowerShell library-preparation workflow with a native
-Zig/Sokol application for Windows, Linux and macOS. It scans N64 ROM folders,
-normalizes `.n64`, `.v64` and `.z64` byte order, generates stable IDs, converts box
-art to the menu's RGB5551 sprite format and writes the exact `menu/title` layout.
+`m64importer` is a native Zig/Sokol application for Windows, Linux and macOS. It
+automatically finds RetroArch's Nintendo 64 playlist, resolves playlist ROM paths,
+reuses RetroArch's `Named_Boxarts` or `Named_Snaps`, and synchronizes the generated
+library directly to a powered-off SummerCart64 over USB.
 
-Artwork is resolved in this order:
+The importer reads the playlist rather than scanning arbitrary folders. Playlist
+labels become menu names, Android `/storage/<volume>/...` paths are remapped to
+mounted desktop drives when possible, and `.n64`, `.v64` and `.z64` entries are
+normalized before stable IDs are generated. Unsupported playlist formats are shown
+in the UI instead of silently imported.
 
-1. an image beside the ROM with the same filename;
-2. the only image beside the ROM;
-3. exact or normalized matches in an optional artwork folder;
-4. exact or normalized matches in RetroArch's `Named_Boxarts` folder;
-5. a generated fallback card.
+On refresh, the importer also reads the existing SummerCart `title.csv` and name
+sidecars. The UI shows the current installed library and a sync plan containing
+add, keep, update and hide counts. Hidden titles are removed only from the visible
+catalog; existing save files are never deleted.
 
 Install all prerequisites and launch it through mise:
 
@@ -111,10 +114,11 @@ mise install
 mise run importer-run
 ```
 
-The importer accepts typed or pasted paths and drag-and-drop. Select the field first,
-then drop a folder onto the window. Use **Scan** to preview titles and artwork matches,
-then **Import to SD** to write the library. The output path must be an existing
-directory, normally the root of the SummerCart64 SD card.
+The app detects RetroArch and the SummerCart automatically. Use **Refresh** to repeat
+detection and **Sync to SummerCart** to stage and upload the visible library. Sync is
+blocked unless the cart reports that the console is powered off. An `.lpl` file may
+be dropped onto the window only as a fallback when automatic playlist discovery
+cannot find the intended installation.
 
 Development commands:
 

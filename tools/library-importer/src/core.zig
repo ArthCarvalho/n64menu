@@ -1,5 +1,6 @@
 const std = @import("std");
 const zigimg = @import("zigimg");
+const builtin = @import("builtin");
 
 pub const maximum_titles = 40;
 pub const maximum_rom_size = 78 * 1024 * 1024;
@@ -8,6 +9,8 @@ pub const sprite_height = 179;
 
 const rom_extensions = [_][]const u8{ ".n64", ".v64", ".z64" };
 const image_extensions = [_][]const u8{ ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff" };
+const n64_playlist_name = "Nintendo - Nintendo 64.lpl";
+const maximum_playlist_size = 8 * 1024 * 1024;
 
 pub const Config = struct {
     output_root: []const u8,
@@ -50,6 +53,63 @@ pub const ScanResult = struct {
         allocator.free(self.titles);
         self.* = undefined;
     }
+};
+
+pub const RetroArchPlaylistEntry = struct {
+    path: []u8,
+    label: []u8,
+    db_name: []u8,
+
+    fn deinit(self: *RetroArchPlaylistEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.label);
+        allocator.free(self.db_name);
+    }
+};
+
+pub const RetroArchPlaylist = struct {
+    entries: []RetroArchPlaylistEntry,
+
+    pub fn deinit(self: *RetroArchPlaylist, allocator: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(allocator);
+        allocator.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+pub const RetroArchSource = struct {
+    playlist_path: []u8,
+    system_name: []u8,
+    retroarch_root: ?[]u8,
+    playlist_entries: usize,
+    resolved_entries: usize,
+    unsupported_entries: usize,
+
+    pub fn deinit(self: *RetroArchSource, allocator: std.mem.Allocator) void {
+        allocator.free(self.playlist_path);
+        allocator.free(self.system_name);
+        if (self.retroarch_root) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+pub const RetroArchScanResult = struct {
+    source: RetroArchSource,
+    preview: ScanResult,
+
+    pub fn deinit(self: *RetroArchScanResult, allocator: std.mem.Allocator) void {
+        self.source.deinit(allocator);
+        self.preview.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const RetroArchDiscoveryOptions = struct {
+    /// Overrides automatic platform locations when non-empty.
+    search_roots: []const []const u8 = &.{},
+    /// Overrides automatically detected Windows drive roots when non-empty.
+    mounted_roots: []const []const u8 = &.{},
+    maximum_search_depth: usize = 7,
 };
 
 pub const ProgressEvent = struct {
@@ -139,12 +199,97 @@ pub fn importLibrary(
     var result = try scanLibrary(allocator, io, config);
     errdefer result.deinit(allocator);
 
+    try stageTitles(allocator, io, config.output_root, result.titles, progress);
+    return result;
+}
+
+/// Finds the best usable RetroArch N64 playlist and returns its source details and title preview.
+pub fn scanRetroArchLibrary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: RetroArchDiscoveryOptions,
+) !RetroArchScanResult {
+    var owned_roots: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &owned_roots);
+    const search_roots = if (options.search_roots.len != 0)
+        options.search_roots
+    else blk: {
+        try appendDefaultSearchRoots(allocator, io, &owned_roots);
+        break :blk owned_roots.items;
+    };
+
+    var owned_mounts: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &owned_mounts);
+    const mounted_roots = if (options.mounted_roots.len != 0)
+        options.mounted_roots
+    else blk: {
+        try appendMountedRoots(allocator, io, &owned_mounts);
+        break :blk owned_mounts.items;
+    };
+
+    var candidates: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &candidates);
+    for (search_roots) |root| {
+        collectPlaylistCandidates(allocator, io, root, options.maximum_search_depth, &candidates) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.AccessDenied, error.PermissionDenied, error.NetworkNotFound => continue,
+            else => return err,
+        };
+    }
+    deduplicateAndSortPaths(allocator, &candidates);
+    if (candidates.items.len == 0) return error.NoRetroArchPlaylistFound;
+
+    var best: ?RetroArchSource = null;
+    errdefer if (best) |*source| source.deinit(allocator);
+    var best_score: CandidateScore = undefined;
+    for (candidates.items) |playlist_path| {
+        var candidate = inspectPlaylistCandidate(allocator, io, playlist_path, mounted_roots) catch |err| switch (err) {
+            error.InvalidPlaylist, error.NoRomsFound, error.FileNotFound, error.NotDir, error.AccessDenied, error.PermissionDenied => continue,
+            else => return err,
+        };
+        const score = candidateScore(candidate);
+        if (best == null or candidateBetter(score, best_score)) {
+            if (best) |*previous| previous.deinit(allocator);
+            best = candidate;
+            best_score = score;
+        } else candidate.deinit(allocator);
+    }
+    var source = best orelse return error.NoUsableRetroArchPlaylist;
+    best = null;
+    errdefer source.deinit(allocator);
+    return .{
+        .source = source,
+        .preview = try scanRetroArchPlaylist(allocator, io, source, mounted_roots),
+    };
+}
+
+/// Stages the detected RetroArch playlist preview without rescanning arbitrary ROM folders.
+pub fn importRetroArchLibrary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output_root: []const u8,
+    options: RetroArchDiscoveryOptions,
+    progress: ?Progress,
+) !RetroArchScanResult {
+    try validateDirectory(io, output_root);
+    var result = try scanRetroArchLibrary(allocator, io, options);
+    errdefer result.deinit(allocator);
+    try stageTitles(allocator, io, output_root, result.preview.titles, progress);
+    return result;
+}
+
+fn stageTitles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output_root: []const u8,
+    titles: []Title,
+    progress: ?Progress,
+) !void {
     const cwd = std.Io.Dir.cwd();
-    const title_root = try std.fs.path.join(allocator, &.{ config.output_root, "menu", "title" });
+    const title_root = try std.fs.path.join(allocator, &.{ output_root, "menu", "title" });
     defer allocator.free(title_root);
     try cwd.createDirPath(io, title_root);
 
-    for (result.titles, 0..) |*title, index| {
+    for (titles, 0..) |*title, index| {
         const destination = try std.fs.path.join(allocator, &.{ title_root, &title.id });
         defer allocator.free(destination);
         try cwd.createDirPath(io, destination);
@@ -170,17 +315,16 @@ pub fn importLibrary(
         }
         if (progress) |reporter| reporter.callback(reporter.context, .{
             .completed = index + 1,
-            .total = result.titles.len,
+            .total = titles.len,
             .title = title,
         });
     }
 
-    const csv = try titleCsvBytes(allocator, result.titles);
+    const csv = try titleCsvBytes(allocator, titles);
     defer allocator.free(csv);
-    const csv_path = try std.fs.path.join(allocator, &.{ config.output_root, "menu", "title.csv" });
+    const csv_path = try std.fs.path.join(allocator, &.{ output_root, "menu", "title.csv" });
     defer allocator.free(csv_path);
     try cwd.writeFile(io, .{ .sub_path = csv_path, .data = csv });
-    return result;
 }
 
 fn validateDirectory(io: std.Io, path: []const u8) !void {
@@ -197,6 +341,459 @@ fn resolveRetroRoot(allocator: std.mem.Allocator, io: std.Io, root: []const u8) 
     errdefer allocator.free(path);
     try validateDirectory(io, path);
     return path;
+}
+
+const CandidateScore = struct {
+    duplicate_components: usize,
+    resolved_entries: usize,
+    playlist_entries: usize,
+    path_depth: usize,
+    path_length: usize,
+};
+
+fn candidateScore(source: RetroArchSource) CandidateScore {
+    return .{
+        .duplicate_components = duplicatePathComponents(source.playlist_path),
+        .resolved_entries = source.resolved_entries,
+        .playlist_entries = source.playlist_entries,
+        .path_depth = pathDepth(source.playlist_path),
+        .path_length = source.playlist_path.len,
+    };
+}
+
+fn candidateBetter(a: CandidateScore, b: CandidateScore) bool {
+    if (a.duplicate_components != b.duplicate_components) return a.duplicate_components < b.duplicate_components;
+    if (a.resolved_entries != b.resolved_entries) return a.resolved_entries > b.resolved_entries;
+    if (a.playlist_entries != b.playlist_entries) return a.playlist_entries > b.playlist_entries;
+    if (a.path_depth != b.path_depth) return a.path_depth < b.path_depth;
+    return a.path_length < b.path_length;
+}
+
+fn duplicatePathComponents(path: []const u8) usize {
+    var count: usize = 0;
+    var previous: ?[]const u8 = null;
+    var iterator = std.mem.tokenizeAny(u8, path, "/\\");
+    while (iterator.next()) |component| {
+        if (previous) |last| if (std.ascii.eqlIgnoreCase(last, component)) {
+            count += 1;
+        };
+        previous = component;
+    }
+    return count;
+}
+
+fn pathDepth(path: []const u8) usize {
+    var count: usize = 0;
+    for (path) |byte| if (byte == '/' or byte == '\\') {
+        count += 1;
+    };
+    return count;
+}
+
+fn appendDefaultSearchRoots(allocator: std.mem.Allocator, io: std.Io, roots: *std.ArrayList([]u8)) !void {
+    const environ = std.process.Environ{ .block = .global };
+    switch (builtin.os.tag) {
+        .windows => {
+            const names = [_][]const u8{ "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "USERPROFILE" };
+            for (names) |name| {
+                const value = std.process.Environ.getAlloc(environ, allocator, name) catch continue;
+                defer allocator.free(value);
+                const suffixes: []const []const u8 = if (std.ascii.eqlIgnoreCase(name, "APPDATA"))
+                    &.{ "RetroArch", "retroarch" }
+                else if (std.ascii.eqlIgnoreCase(name, "USERPROFILE"))
+                    &.{ "RetroArch", ".config\\retroarch" }
+                else
+                    &.{ "RetroArch", "retroarch" };
+                for (suffixes) |suffix| try appendDirectoryIfPresent(allocator, io, roots, value, suffix);
+            }
+        },
+        .macos => {
+            const home = std.process.Environ.getAlloc(environ, allocator, "HOME") catch return;
+            defer allocator.free(home);
+            try appendDirectoryIfPresent(allocator, io, roots, home, "Library/Application Support/RetroArch");
+            try appendDirectoryIfPresent(allocator, io, roots, home, ".config/retroarch");
+        },
+        else => {
+            const home = std.process.Environ.getAlloc(environ, allocator, "HOME") catch return;
+            defer allocator.free(home);
+            try appendDirectoryIfPresent(allocator, io, roots, home, ".config/retroarch");
+            try appendDirectoryIfPresent(allocator, io, roots, home, ".var/app/org.libretro.RetroArch/config/retroarch");
+        },
+    }
+    try appendMountedRoots(allocator, io, roots);
+}
+
+fn appendDirectoryIfPresent(allocator: std.mem.Allocator, io: std.Io, roots: *std.ArrayList([]u8), parent: []const u8, child: []const u8) !void {
+    const path = try std.fs.path.join(allocator, &.{ parent, child });
+    if (directoryExists(io, path)) try roots.append(allocator, path) else allocator.free(path);
+}
+
+fn appendMountedRoots(allocator: std.mem.Allocator, io: std.Io, roots: *std.ArrayList([]u8)) !void {
+    if (builtin.os.tag == .windows) {
+        for ('A'..'Z' + 1) |letter| {
+            const path = try std.fmt.allocPrint(allocator, "{c}:\\", .{@as(u8, @intCast(letter))});
+            if (directoryExists(io, path)) try roots.append(allocator, path) else allocator.free(path);
+        }
+        return;
+    }
+    const candidates: []const []const u8 = if (builtin.os.tag == .macos)
+        &.{"/Volumes"}
+    else
+        &.{ "/media", "/mnt", "/run/media" };
+    for (candidates) |path| {
+        if (!directoryExists(io, path)) continue;
+        try roots.append(allocator, try allocator.dupe(u8, path));
+        try appendChildDirectories(allocator, io, roots, path, 2);
+    }
+}
+
+fn appendChildDirectories(allocator: std.mem.Allocator, io: std.Io, roots: *std.ArrayList([]u8), parent: []const u8, depth: usize) !void {
+    if (depth == 0) return;
+    var dir = std.Io.Dir.cwd().openDir(io, parent, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const path = try std.fs.path.join(allocator, &.{ parent, entry.name });
+        errdefer allocator.free(path);
+        try roots.append(allocator, path);
+        try appendChildDirectories(allocator, io, roots, path, depth - 1);
+    }
+}
+
+fn directoryExists(io: std.Io, path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
+}
+
+fn fileExists(io: std.Io, path: []const u8) bool {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    file.close(io);
+    return true;
+}
+
+fn collectPlaylistCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    remaining_depth: usize,
+    candidates: *std.ArrayList([]u8),
+) anyerror!void {
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind == .file and std.ascii.eqlIgnoreCase(entry.name, n64_playlist_name)) {
+            try candidates.append(allocator, try std.fs.path.join(allocator, &.{ root, entry.name }));
+        } else if (entry.kind == .directory and remaining_depth != 0 and shouldSearchDirectory(entry.name)) {
+            const path = try std.fs.path.join(allocator, &.{ root, entry.name });
+            defer allocator.free(path);
+            collectPlaylistCandidates(allocator, io, path, remaining_depth - 1, candidates) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir, error.AccessDenied, error.PermissionDenied, error.NetworkNotFound => {},
+                else => return err,
+            };
+        }
+    }
+}
+
+fn shouldSearchDirectory(name: []const u8) bool {
+    const names = [_][]const u8{
+        "RetroArch",               "retroarch", "playlists", "config",        "configs",               "backup", "backups",
+        "RetroArch_config_backup", "Android",   "data",      "com.retroarch", "com.retroarch.aarch64", "files",
+    };
+    for (names) |candidate| if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    return false;
+}
+
+fn deduplicateAndSortPaths(allocator: std.mem.Allocator, paths: *std.ArrayList([]u8)) void {
+    std.mem.sort([]u8, paths.items, {}, pathLessThan);
+    var write: usize = 0;
+    for (paths.items) |path| {
+        if (write != 0 and std.ascii.eqlIgnoreCase(paths.items[write - 1], path)) {
+            allocator.free(path);
+            continue;
+        }
+        paths.items[write] = path;
+        write += 1;
+    }
+    paths.shrinkRetainingCapacity(write);
+}
+
+fn inspectPlaylistCandidate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    playlist_path: []const u8,
+    mounted_roots: []const []const u8,
+) !RetroArchSource {
+    var playlist = try readRetroArchPlaylist(allocator, io, playlist_path);
+    defer playlist.deinit(allocator);
+    if (playlist.entries.len == 0) return error.InvalidPlaylist;
+    var resolved: usize = 0;
+    var unsupported: usize = 0;
+    for (playlist.entries) |entry| {
+        if (!isSupportedPlaylistRom(entry.path)) {
+            unsupported += 1;
+            continue;
+        }
+        const path = resolvePlaylistRomPath(allocator, io, entry.path, mounted_roots) catch continue;
+        allocator.free(path);
+        resolved += 1;
+    }
+    if (resolved == 0) return error.NoRomsFound;
+    const system_name = try playlistSystemName(allocator, playlist_path, playlist.entries);
+    errdefer allocator.free(system_name);
+    return .{
+        .playlist_path = try allocator.dupe(u8, playlist_path),
+        .system_name = system_name,
+        .retroarch_root = try findNearbyRetroArchRoot(allocator, io, playlist_path, system_name),
+        .playlist_entries = playlist.entries.len,
+        .resolved_entries = resolved,
+        .unsupported_entries = unsupported,
+    };
+}
+
+fn scanRetroArchPlaylist(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: RetroArchSource,
+    mounted_roots: []const []const u8,
+) !ScanResult {
+    var playlist = try readRetroArchPlaylist(allocator, io, source.playlist_path);
+    defer playlist.deinit(allocator);
+    var boxarts: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &boxarts);
+    var snaps: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &snaps);
+    if (source.retroarch_root) |root| {
+        try collectThumbnailKind(allocator, io, root, source.system_name, "Named_Boxarts", &boxarts);
+        try collectThumbnailKind(allocator, io, root, source.system_name, "Named_Snaps", &snaps);
+    }
+
+    var titles: std.ArrayList(Title) = .empty;
+    errdefer {
+        for (titles.items) |*title| title.deinit(allocator);
+        titles.deinit(allocator);
+    }
+    for (playlist.entries) |entry| {
+        if (titles.items.len == maximum_titles) break;
+        if (!isSupportedPlaylistRom(entry.path)) continue;
+        const rom_path = resolvePlaylistRomPath(allocator, io, entry.path, mounted_roots) catch continue;
+        errdefer allocator.free(rom_path);
+        const normalized = try readNormalizedRom(allocator, io, rom_path);
+        defer allocator.free(normalized);
+        const id = normalizedId(normalized);
+        for (titles.items) |title| if (std.mem.eql(u8, &title.id, &id)) return error.IdCollision;
+        const artwork = try findRetroArchPlaylistArtwork(allocator, entry, rom_path, boxarts.items, snaps.items);
+        errdefer if (artwork) |match| allocator.free(match.path);
+        try titles.append(allocator, .{
+            .rom_path = rom_path,
+            .display_name = try allocator.dupe(u8, if (entry.label.len != 0) entry.label else basenameWithoutExtension(rom_path)),
+            .id = id,
+            .artwork_path = if (artwork) |match| @constCast(match.path) else null,
+            .artwork_status = if (artwork) |match| match.status else .generated,
+        });
+    }
+    if (titles.items.len == 0) return error.NoRomsFound;
+    return .{ .titles = try titles.toOwnedSlice(allocator) };
+}
+
+fn isSupportedPlaylistRom(path: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, path, '#') != null) return false;
+    return hasExtension(path, &rom_extensions);
+}
+
+fn collectThumbnailKind(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    retroarch_root: []const u8,
+    system_name: []const u8,
+    kind: []const u8,
+    images: *std.ArrayList([]u8),
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ retroarch_root, "thumbnails", system_name, kind });
+    defer allocator.free(path);
+    collectFiles(allocator, io, path, false, &image_extensions, images) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    std.mem.sort([]u8, images.items, {}, pathLessThan);
+}
+
+fn findNearbyRetroArchRoot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    playlist_path: []const u8,
+    system_name: []const u8,
+) !?[]u8 {
+    var current = std.fs.path.dirname(playlist_path) orelse return null;
+    var levels: usize = 0;
+    while (levels < 5) : (levels += 1) {
+        const boxarts = try std.fs.path.join(allocator, &.{ current, "thumbnails", system_name, "Named_Boxarts" });
+        const has_boxarts = directoryExists(io, boxarts);
+        allocator.free(boxarts);
+        const snaps = try std.fs.path.join(allocator, &.{ current, "thumbnails", system_name, "Named_Snaps" });
+        const has_snaps = directoryExists(io, snaps);
+        allocator.free(snaps);
+        if (has_boxarts or has_snaps) return @as(?[]u8, try allocator.dupe(u8, current));
+        current = std.fs.path.dirname(current) orelse break;
+    }
+    return null;
+}
+
+fn playlistSystemName(allocator: std.mem.Allocator, playlist_path: []const u8, entries: []const RetroArchPlaylistEntry) ![]u8 {
+    for (entries) |entry| if (entry.db_name.len != 0) return allocator.dupe(u8, basenameWithoutExtension(entry.db_name));
+    return allocator.dupe(u8, basenameWithoutExtension(playlist_path));
+}
+
+const JsonPlaylist = struct {
+    items: []const JsonPlaylistEntry = &.{},
+};
+
+const JsonPlaylistEntry = struct {
+    path: []const u8 = "",
+    label: []const u8 = "",
+    db_name: []const u8 = "",
+};
+
+pub fn parseRetroArchPlaylist(allocator: std.mem.Allocator, bytes: []const u8) !RetroArchPlaylist {
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPlaylist;
+    var entries: std.ArrayList(RetroArchPlaylistEntry) = .empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(allocator);
+        entries.deinit(allocator);
+    }
+    if (trimmed[0] == '{') {
+        var parsed = std.json.parseFromSlice(JsonPlaylist, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch return error.InvalidPlaylist;
+        defer parsed.deinit();
+        for (parsed.value.items) |item| {
+            if (item.path.len == 0) continue;
+            try entries.append(allocator, .{
+                .path = try allocator.dupe(u8, item.path),
+                .label = try allocator.dupe(u8, item.label),
+                .db_name = try allocator.dupe(u8, item.db_name),
+            });
+        }
+    } else {
+        var lines: std.ArrayList([]const u8) = .empty;
+        defer lines.deinit(allocator);
+        var iterator = std.mem.splitScalar(u8, bytes, '\n');
+        while (iterator.next()) |line| {
+            const clean = std.mem.trimEnd(u8, line, "\r");
+            try lines.append(allocator, clean);
+        }
+        while (lines.items.len != 0 and lines.items[lines.items.len - 1].len == 0) _ = lines.pop();
+        if (lines.items.len == 0 or lines.items.len % 6 != 0) return error.InvalidPlaylist;
+        var index: usize = 0;
+        while (index < lines.items.len) : (index += 6) {
+            try entries.append(allocator, .{
+                .path = try allocator.dupe(u8, lines.items[index]),
+                .label = try allocator.dupe(u8, lines.items[index + 1]),
+                .db_name = try allocator.dupe(u8, lines.items[index + 5]),
+            });
+        }
+    }
+    if (entries.items.len == 0) return error.InvalidPlaylist;
+    return .{ .entries = try entries.toOwnedSlice(allocator) };
+}
+
+fn readRetroArchPlaylist(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !RetroArchPlaylist {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io, &buffer);
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(maximum_playlist_size));
+    defer allocator.free(bytes);
+    return parseRetroArchPlaylist(allocator, bytes);
+}
+
+pub fn resolvePlaylistRomPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    playlist_path: []const u8,
+    mounted_roots: []const []const u8,
+) ![]u8 {
+    if (fileExists(io, playlist_path)) return allocator.dupe(u8, playlist_path);
+    if (!std.mem.startsWith(u8, playlist_path, "/storage/")) return error.FileNotFound;
+
+    const after_storage = playlist_path["/storage/".len..];
+    const volume_end = std.mem.indexOfScalar(u8, after_storage, '/') orelse return error.FileNotFound;
+    var suffix = after_storage[volume_end + 1 ..];
+    while (suffix.len != 0) {
+        for (mounted_roots) |root| {
+            const native_suffix = try allocator.dupe(u8, suffix);
+            defer allocator.free(native_suffix);
+            for (native_suffix) |*byte| if (byte.* == '/') {
+                byte.* = std.fs.path.sep;
+            };
+            const candidate = try std.fs.path.join(allocator, &.{ root, native_suffix });
+            if (fileExists(io, candidate)) return candidate;
+            allocator.free(candidate);
+        }
+        const separator = std.mem.indexOfScalar(u8, suffix, '/') orelse break;
+        suffix = suffix[separator + 1 ..];
+    }
+    return error.FileNotFound;
+}
+
+fn findRetroArchPlaylistArtwork(
+    allocator: std.mem.Allocator,
+    entry: RetroArchPlaylistEntry,
+    rom_path: []const u8,
+    boxarts: []const []u8,
+    snaps: []const []u8,
+) !?Match {
+    var names: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &names);
+    try appendThumbnailName(allocator, &names, entry.label);
+    try appendThumbnailName(allocator, &names, basenameWithoutExtension(rom_path));
+    try appendThumbnailName(allocator, &names, parentName(rom_path));
+    const original_count = names.items.len;
+    for (names.items[0..original_count]) |name| {
+        const revisionless = try withoutRevision(allocator, name);
+        if (!std.mem.eql(u8, revisionless, name)) try names.append(allocator, revisionless) else allocator.free(revisionless);
+        const short = try shortTitleName(allocator, name);
+        if (!std.mem.eql(u8, short, name)) try names.append(allocator, short) else allocator.free(short);
+    }
+    if (try thumbnailMatch(allocator, names.items, boxarts)) |match| return match;
+    return thumbnailMatch(allocator, names.items, snaps);
+}
+
+fn appendThumbnailName(allocator: std.mem.Allocator, names: *std.ArrayList([]u8), name: []const u8) !void {
+    if (name.len == 0) return;
+    for (names.items) |existing| if (std.mem.eql(u8, existing, name)) return;
+    try names.append(allocator, try allocator.dupe(u8, name));
+    const sanitized = try retroArchThumbnailName(allocator, name);
+    if (!std.mem.eql(u8, sanitized, name)) try names.append(allocator, sanitized) else allocator.free(sanitized);
+}
+
+fn thumbnailMatch(allocator: std.mem.Allocator, names: []const []u8, images: []const []u8) !?Match {
+    for (names) |name| if (uniqueExact(name, images)) |path| return .{
+        .path = try allocator.dupe(u8, path),
+        .status = .retroarch_exact,
+    };
+    if (try indexedMatch(allocator, names, images, .retroarch_exact, .retroarch_normalized)) |match| return match;
+    return null;
+}
+
+pub fn retroArchThumbnailName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const result = try allocator.dupe(u8, name);
+    for (result) |*byte| if (std.mem.indexOfScalar(u8, "&*/:`<>?\\|", byte.*) != null) {
+        byte.* = '_';
+    };
+    return result;
+}
+
+fn shortTitleName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    var end = name.len;
+    while (end != 0) {
+        while (end != 0 and std.ascii.isWhitespace(name[end - 1])) end -= 1;
+        if (end == 0 or name[end - 1] != ')') break;
+        const open = std.mem.lastIndexOfScalar(u8, name[0 .. end - 1], '(') orelse break;
+        end = open;
+    }
+    return allocator.dupe(u8, std.mem.trimEnd(u8, name[0..end], " \t"));
 }
 
 fn collectFiles(
@@ -563,6 +1160,101 @@ test "normalized name matching" {
     const revisionless = try withoutRevision(allocator, "Game (Rev A) (USA)");
     defer allocator.free(revisionless);
     try std.testing.expectEqualStrings("Game (USA)", revisionless);
+}
+
+test "modern RetroArch playlist parsing uses labels" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"version":"1.5","items":[
+        \\  {"path":"C:\\\\Roms\\\\Mario.z64","label":"Super Mario 64 (USA)","db_name":"Nintendo - Nintendo 64.lpl","crc32":"ignored"}
+        \\]}
+    ;
+    var playlist = try parseRetroArchPlaylist(allocator, json);
+    defer playlist.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), playlist.entries.len);
+    try std.testing.expectEqualStrings("Super Mario 64 (USA)", playlist.entries[0].label);
+    try std.testing.expectEqualStrings("Nintendo - Nintendo 64.lpl", playlist.entries[0].db_name);
+}
+
+test "legacy RetroArch six-line playlist parsing" {
+    const allocator = std.testing.allocator;
+    const legacy =
+        "G:\\Roms\\Game.z64\r\n" ++
+        "Playlist Label\r\n" ++
+        "DETECT\r\n" ++
+        "DETECT\r\n" ++
+        "00000000|crc\r\n" ++
+        "Nintendo - Nintendo 64.lpl\r\n";
+    var playlist = try parseRetroArchPlaylist(allocator, legacy);
+    defer playlist.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), playlist.entries.len);
+    try std.testing.expectEqualStrings("G:\\Roms\\Game.z64", playlist.entries[0].path);
+    try std.testing.expectEqualStrings("Playlist Label", playlist.entries[0].label);
+}
+
+test "Android playlist path remaps to mounted Windows drive suffix" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "Nintendo - Nintendo 64 (BigEndian)/Game");
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "Nintendo - Nintendo 64 (BigEndian)/Game/Game.z64", .data = "rom" });
+    const root = try tempPath(allocator, temp, "");
+    defer allocator.free(root);
+    const resolved = try resolvePlaylistRomPath(
+        allocator,
+        std.testing.io,
+        "/storage/38F0-494C/Nintendo - Nintendo 64 (BigEndian)/Game/Game.z64",
+        &.{root},
+    );
+    defer allocator.free(resolved);
+    const expected = try std.fs.path.join(allocator, &.{ root, "Nintendo - Nintendo 64 (BigEndian)", "Game", "Game.z64" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+}
+
+test "RetroArch invalid thumbnail filename mapping" {
+    const mapped = try retroArchThumbnailName(std.testing.allocator, "Command & Conquer: Red Alert? (USA)");
+    defer std.testing.allocator.free(mapped);
+    try std.testing.expectEqualStrings("Command _ Conquer_ Red Alert_ (USA)", mapped);
+}
+
+test "candidate selection favors more resolved entries then nearby playlist" {
+    const many = CandidateScore{ .duplicate_components = 0, .resolved_entries = 2, .playlist_entries = 2, .path_depth = 9, .path_length = 100 };
+    const nearby = CandidateScore{ .duplicate_components = 0, .resolved_entries = 1, .playlist_entries = 20, .path_depth = 2, .path_length = 20 };
+    try std.testing.expect(candidateBetter(many, nearby));
+    const direct = CandidateScore{ .duplicate_components = 0, .resolved_entries = 2, .playlist_entries = 2, .path_depth = 3, .path_length = 40 };
+    try std.testing.expect(candidateBetter(direct, many));
+    const duplicated = CandidateScore{ .duplicate_components = 1, .resolved_entries = 100, .playlist_entries = 100, .path_depth = 3, .path_length = 40 };
+    try std.testing.expect(candidateBetter(direct, duplicated));
+}
+
+test "candidate discovery selects direct usable RetroArch playlist" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "RetroArch/playlists");
+    try temp.dir.createDirPath(std.testing.io, "RetroArch/RetroArch/playlists");
+    try temp.dir.createDirPath(std.testing.io, "roms");
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "roms/Game.z64", .data = &.{ 0x80, 0x37, 0x12, 0x40, 1, 2, 3, 4 } });
+    const root = try tempPath(allocator, temp, "");
+    defer allocator.free(root);
+    const rom_path = try std.fs.path.join(allocator, &.{ root, "roms", "Game.z64" });
+    defer allocator.free(rom_path);
+    const legacy = try std.fmt.allocPrint(allocator, "{s}\nChosen Label\nDETECT\nDETECT\n00000000|crc\nNintendo - Nintendo 64.lpl\n", .{rom_path});
+    defer allocator.free(legacy);
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "RetroArch/playlists/Nintendo - Nintendo 64.lpl", .data = legacy });
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "RetroArch/RetroArch/playlists/Nintendo - Nintendo 64.lpl", .data = legacy });
+
+    var result = try scanRetroArchLibrary(allocator, std.testing.io, .{
+        .search_roots = &.{root},
+        .mounted_roots = &.{root},
+    });
+    defer result.deinit(allocator);
+    const expected_playlist = try std.fs.path.join(allocator, &.{ root, "RetroArch", "playlists", n64_playlist_name });
+    defer allocator.free(expected_playlist);
+    try std.testing.expectEqualStrings(expected_playlist, result.source.playlist_path);
+    try std.testing.expectEqual(@as(usize, 1), result.source.resolved_entries);
+    try std.testing.expectEqualStrings("Chosen Label", result.preview.titles[0].display_name);
 }
 
 test "title CSV bytes" {
