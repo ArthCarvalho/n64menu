@@ -77,66 +77,10 @@ pub const Progress = struct {
     callback: *const fn (?*anyopaque, ProgressEvent) void,
 };
 
-pub const Command = struct {
-    kind: Kind,
-    local_path: ?[]u8,
-    sd_path: []u8,
-
-    pub const Kind = enum { mkdir, upload };
-
-    pub const Argv = struct {
-        values: [7][]const u8,
-        len: usize,
-
-        pub fn slice(self: *const Argv) []const []const u8 {
-            return self.values[0..self.len];
-        }
-    };
-
-    pub fn argv(self: Command, deployer_path: []const u8, port: []const u8) Argv {
-        var result: Argv = .{ .values = undefined, .len = 0 };
-        result.values[0] = deployer_path;
-        result.values[1] = "--port";
-        result.values[2] = port;
-        result.values[3] = "sd";
-        switch (self.kind) {
-            .mkdir => {
-                result.values[4] = "mkdir";
-                result.values[5] = self.sd_path;
-                result.len = 6;
-            },
-            .upload => {
-                result.values[4] = "upload";
-                result.values[5] = self.local_path.?;
-                result.values[6] = self.sd_path;
-                result.len = 7;
-            },
-        }
-        return result;
-    }
-
-    fn deinit(self: *Command, allocator: std.mem.Allocator) void {
-        if (self.local_path) |path| allocator.free(path);
-        allocator.free(self.sd_path);
-        self.* = undefined;
-    }
-};
-
-pub const Plan = struct {
-    commands: []Command,
-
-    pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
-        for (self.commands) |*command| command.deinit(allocator);
-        allocator.free(self.commands);
-        self.* = undefined;
-    }
-};
-
 pub const SyncOptions = struct {
     deployer_path: []const u8,
     port: []const u8,
-    menu_root: []const u8,
-    sc64menu_path: ?[]const u8 = null,
+    staging_root: []const u8,
 };
 
 /// Finds a deployer bundled beside the running application, then one on PATH,
@@ -371,49 +315,6 @@ fn storedNameEqual(installed: []const u8, desired: []const u8) bool {
     return true;
 }
 
-/// Produces a deterministic set of mkdir/upload commands without contacting hardware.
-pub fn planSync(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    menu_root: []const u8,
-    sc64menu_path: ?[]const u8,
-) !Plan {
-    var commands: std.ArrayList(Command) = .empty;
-    errdefer {
-        for (commands.items) |*command| command.deinit(allocator);
-        commands.deinit(allocator);
-    }
-
-    try appendCommand(allocator, &commands, .mkdir, null, "/menu");
-    var menu_dir = try std.Io.Dir.cwd().openDir(io, menu_root, .{ .iterate = true });
-    defer menu_dir.close(io);
-    var walker = try menu_dir.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        switch (entry.kind) {
-            .directory => {
-                const destination = try menuDestination(allocator, entry.path);
-                defer allocator.free(destination);
-                try appendCommand(allocator, &commands, .mkdir, null, destination);
-            },
-            .file => {
-                const source = try std.fs.path.join(allocator, &.{ menu_root, entry.path });
-                defer allocator.free(source);
-                const destination = try menuDestination(allocator, entry.path);
-                defer allocator.free(destination);
-                try appendCommand(allocator, &commands, .upload, source, destination);
-            },
-            else => {},
-        }
-    }
-    if (sc64menu_path) |source| {
-        if (!isFile(io, source)) return error.Sc64MenuNotFound;
-        try appendCommand(allocator, &commands, .upload, source, "/sc64menu.n64");
-    }
-    std.mem.sort(Command, commands.items, {}, commandLessThan);
-    return .{ .commands = try commands.toOwnedSlice(allocator) };
-}
-
 /// Verifies that the console is powered off, then executes the planned SD sync.
 pub fn sync(
     allocator: std.mem.Allocator,
@@ -425,45 +326,28 @@ pub fn sync(
     defer info.deinit(allocator);
     if (info.console_powered_on) return error.ConsolePoweredOn;
 
-    var plan = try planSync(allocator, io, options.menu_root, options.sc64menu_path);
-    defer plan.deinit(allocator);
-    for (plan.commands, 0..) |command, index| {
-        const args = command.argv(options.deployer_path, options.port);
-        const result = try run(allocator, io, args.slice());
-        defer freeRunResult(allocator, result);
-        if (isPoweredOnRefusal(result.stdout) or isPoweredOnRefusal(result.stderr)) return error.ConsolePoweredOn;
-        if (!termSucceeded(result.term)) {
-            if (command.kind != .mkdir or
-                (!isExistingDirectoryError(result.stdout) and !isExistingDirectoryError(result.stderr)))
-            {
-                return error.DeployerCommandFailed;
-            }
-        }
-        if (progress) |reporter| reporter.callback(reporter.context, .{
-            .current = index + 1,
-            .total = plan.commands.len,
-            .path = command.sd_path,
-        });
+    if (!directoryExists(io, options.staging_root)) return error.StagingRootNotFound;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
+            options.deployer_path,
+            "--port",
+            options.port,
+            "sd",
+            "sync",
+            options.staging_root,
+            "/",
+        },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .inherit,
+        .create_no_window = true,
+    });
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+    while (try stdout_reader.interface.takeDelimiter('\n')) |line| {
+        if (progress) |reporter| reportBatchProgressLine(reporter, line);
     }
-}
-
-fn isExistingDirectoryError(output: []const u8) bool {
-    return containsIgnoreCase(output, "exist") or
-        containsIgnoreCase(output, "access denied due to prohibited access");
-}
-
-fn appendCommand(
-    allocator: std.mem.Allocator,
-    commands: *std.ArrayList(Command),
-    kind: Command.Kind,
-    local_path: ?[]const u8,
-    sd_path: []const u8,
-) !void {
-    const owned_local = if (local_path) |path| try allocator.dupe(u8, path) else null;
-    errdefer if (owned_local) |path| allocator.free(path);
-    const owned_sd = try allocator.dupe(u8, sd_path);
-    errdefer allocator.free(owned_sd);
-    try commands.append(allocator, .{ .kind = kind, .local_path = owned_local, .sd_path = owned_sd });
+    if (!termSucceeded(try child.wait(io))) return error.DeployerCommandFailed;
 }
 
 fn download(
@@ -500,21 +384,21 @@ fn findTitle(titles: []const InstalledTitle, id: [5]u8) ?*const InstalledTitle {
     return null;
 }
 
-fn menuDestination(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const result = try allocator.alloc(u8, "/menu/".len + relative_path.len);
-    @memcpy(result[0.."/menu/".len], "/menu/");
-    for (relative_path, 0..) |byte, index| {
-        result["/menu/".len + index] = if (byte == '\\') '/' else byte;
-    }
-    return result;
+fn reportBatchProgressLine(reporter: Progress, raw: []const u8) void {
+    const line = std.mem.trim(u8, raw, " \t\r");
+    if (!std.mem.startsWith(u8, line, "SYNC ")) return;
+    const first_space = std.mem.indexOfScalarPos(u8, line, 5, ' ') orelse return;
+    const fraction = line[5..first_space];
+    const slash = std.mem.indexOfScalar(u8, fraction, '/') orelse return;
+    const current = std.fmt.parseUnsigned(usize, fraction[0..slash], 10) catch return;
+    const total = std.fmt.parseUnsigned(usize, fraction[slash + 1 ..], 10) catch return;
+    reporter.callback(reporter.context, .{ .current = current, .total = total, .path = line[first_space + 1 ..] });
 }
 
-fn commandLessThan(_: void, a: Command, b: Command) bool {
-    if (a.kind != b.kind) return a.kind == .mkdir;
-    const a_catalog = std.mem.eql(u8, a.sd_path, "/menu/title.csv");
-    const b_catalog = std.mem.eql(u8, b.sd_path, "/menu/title.csv");
-    if (a_catalog != b_catalog) return !a_catalog;
-    return std.mem.order(u8, a.sd_path, b.sd_path) == .lt;
+fn directoryExists(io: std.Io, path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
 }
 
 fn executableWorks(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
@@ -669,55 +553,28 @@ test "powered-on deployer prompt is recognized without interaction" {
     try std.testing.expect(!isPoweredOnRefusal("Successfully uploaded /menu/title.csv"));
     try std.testing.expect(isMissingRemoteFile("Could not find the file"));
     try std.testing.expect(!isMissingRemoteFile("The physical drive does not work"));
-    try std.testing.expect(isExistingDirectoryError("FatFs error: Access denied due to prohibited access"));
 }
 
-test "sync command plan recursively creates directories and uploads files" {
-    const allocator = std.testing.allocator;
-    var temp = std.testing.tmpDir(.{ .iterate = true });
-    defer temp.cleanup();
-    try temp.dir.createDirPath(std.testing.io, "menu/title/ABCDE");
-    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "menu/title.csv", .data = "ABCDE,\x00" });
-    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "menu/title/ABCDE/ABCDE_e.name", .data = "Game" });
-    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "sc64menu.n64", .data = "rom" });
+test "batched deployer progress is parsed" {
+    const Capture = struct {
+        var events: [3]ProgressEvent = undefined;
+        var count: usize = 0;
 
-    const root = try tempPath(allocator, temp, "menu");
-    defer allocator.free(root);
-    const rom = try tempPath(allocator, temp, "sc64menu.n64");
-    defer allocator.free(rom);
-    var plan = try planSync(allocator, std.testing.io, root, rom);
-    defer plan.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 6), plan.commands.len);
-    try expectCommand(plan.commands[0], .mkdir, null, "/menu");
-    try expectCommand(plan.commands[1], .mkdir, null, "/menu/title");
-    try expectCommand(plan.commands[2], .mkdir, null, "/menu/title/ABCDE");
-    try expectCommand(plan.commands[3], .upload, null, "/menu/title/ABCDE/ABCDE_e.name");
-    try expectCommand(plan.commands[4], .upload, rom, "/sc64menu.n64");
-    // Publish the catalog only after every referenced title asset and the boot ROM exist.
-    try expectCommand(plan.commands[5], .upload, null, "/menu/title.csv");
-
-    const mkdir_args = plan.commands[1].argv("C:\\app\\sc64deployer.exe", "serial://COM5");
-    try expectArgs(&.{ "C:\\app\\sc64deployer.exe", "--port", "serial://COM5", "sd", "mkdir", "/menu/title" }, mkdir_args.slice());
-    const upload_args = plan.commands[4].argv("sc64deployer.exe", "serial://COM5");
-    try expectArgs(&.{ "sc64deployer.exe", "--port", "serial://COM5", "sd", "upload", rom, "/sc64menu.n64" }, upload_args.slice());
-}
-
-fn expectCommand(command: Command, kind: Command.Kind, local_suffix: ?[]const u8, sd_path: []const u8) !void {
-    try std.testing.expectEqual(kind, command.kind);
-    try std.testing.expectEqualStrings(sd_path, command.sd_path);
-    if (local_suffix) |suffix| {
-        try std.testing.expect(std.mem.endsWith(u8, command.local_path.?, suffix));
-    } else if (kind == .mkdir) {
-        try std.testing.expect(command.local_path == null);
-    } else {
-        try std.testing.expect(command.local_path != null);
-    }
-}
-
-fn expectArgs(expected: []const []const u8, actual: []const []const u8) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |expected_arg, actual_arg| try std.testing.expectEqualStrings(expected_arg, actual_arg);
+        fn callback(_: ?*anyopaque, event: ProgressEvent) void {
+            events[count] = event;
+            count += 1;
+        }
+    };
+    Capture.count = 0;
+    const reporter = Progress{ .callback = Capture.callback };
+    reportBatchProgressLine(reporter, "noise");
+    reportBatchProgressLine(reporter, "SYNC 1/3 /menu/title/A/A_e.sprite");
+    reportBatchProgressLine(reporter, "SYNC 2/3 /sc64menu.n64");
+    reportBatchProgressLine(reporter, "SYNC 3/3 /menu/title.csv");
+    try std.testing.expectEqual(@as(usize, 3), Capture.count);
+    try std.testing.expectEqual(@as(usize, 1), Capture.events[0].current);
+    try std.testing.expectEqual(@as(usize, 3), Capture.events[2].total);
+    try std.testing.expectEqualStrings("/menu/title.csv", Capture.events[2].path);
 }
 
 fn tempPath(allocator: std.mem.Allocator, temp: std.testing.TmpDir, child: []const u8) ![]u8 {

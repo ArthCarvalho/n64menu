@@ -39,7 +39,7 @@ jobs:
         if: runner.os == 'Linux'
         run: >-
           sudo apt-get update && sudo apt-get install -y
-          libasound2-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev
+          libasound2-dev libgl1-mesa-dev libudev-dev libx11-dev libxcursor-dev libxi-dev
 
       - name: Test importer
         run: mise run importer-test
@@ -47,14 +47,9 @@ jobs:
       - name: Build importer
         run: mise run importer-build
 
-      - name: Bundle SummerCart deployer (Windows)
-        if: runner.os == 'Windows'
+      - name: Build batched SummerCart deployer
         shell: pwsh
-        run: Copy-Item -LiteralPath (mise which sc64deployer) -Destination tools/library-importer/zig-out/bin/sc64deployer.exe
-
-      - name: Bundle SummerCart deployer (Unix)
-        if: runner.os != 'Windows'
-        run: cp "$(mise which sc64deployer)" tools/library-importer/zig-out/bin/sc64deployer
+        run: ./tools/library-importer/build-deployer.ps1 -OutputDirectory tools/library-importer/zig-out/bin
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -65,7 +60,7 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item -LiteralPath tools/library-importer/THIRD_PARTY.md -Destination tools/library-importer/zig-out/bin/THIRD_PARTY.md
-          Invoke-WebRequest -Uri https://raw.githubusercontent.com/Polprzewodnikowy/SummerCart64/v2.20.2/LICENSE -OutFile tools/library-importer/zig-out/bin/SC64DEPLOYER_LICENSE.txt
+          Copy-Item -LiteralPath tools/library-importer/sc64deployer-batch-sync.patch -Destination tools/library-importer/zig-out/bin/sc64deployer-batch-sync.patch
 
       - name: Package importer (Windows)
         if: runner.os == 'Windows'
@@ -78,6 +73,7 @@ jobs:
         run: >-
           tar -czf ../${{ matrix.artifact }}.tar.gz
           m64importer sc64deployer sc64menu.n64 THIRD_PARTY.md SC64DEPLOYER_LICENSE.txt
+          sc64deployer-batch-sync.patch
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

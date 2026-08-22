@@ -107,6 +107,11 @@ sidecars. The UI shows the current installed library and a sync plan containing
 add, keep, update and hide counts. Hidden titles are removed only from the visible
 catalog; existing save files are never deleted.
 
+USB updates use a patched `sc64deployer sd sync` command that uploads the entire
+staged tree through one device and FatFs session. This avoids reconnecting and
+reinitializing the SD card for every ROM, sprite and sidecar. The catalog is still
+published last so a failed transfer cannot reference incomplete title assets.
+
 Install all prerequisites and launch it through mise:
 
 ```console

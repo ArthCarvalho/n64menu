@@ -548,16 +548,16 @@ fn syncFromStaging(
     defer imported.deinit(allocator);
     if (!std.ascii.eqlIgnoreCase(imported.source.playlist_path, playlist_path)) return error.PlaylistChanged;
 
-    const menu_root = try std.fs.path.join(allocator, &.{ staging, "menu" });
-    defer allocator.free(menu_root);
     const menu_rom = (try findMenuRom(allocator, io)) orelse return error.Sc64MenuNotFound;
     defer allocator.free(menu_rom);
+    const staged_rom = try std.fs.path.join(allocator, &.{ staging, "sc64menu.n64" });
+    defer allocator.free(staged_rom);
+    try std.Io.Dir.copyFileAbsolute(menu_rom, staged_rom, io, .{});
     setStatus(true, "Staging complete; syncing to SummerCart...", .{});
     try deployer.sync(allocator, io, .{
         .deployer_path = config.deployer_path.slice(),
         .port = config.port.slice(),
-        .menu_root = menu_root,
-        .sc64menu_path = menu_rom,
+        .staging_root = staging,
     }, .{ .context = null, .callback = deployProgress });
 }
 
