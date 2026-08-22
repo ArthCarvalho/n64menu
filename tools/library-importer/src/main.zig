@@ -3,6 +3,7 @@ const sokol = @import("sokol");
 const importer = @import("importer");
 const deployer = @import("deployer");
 const sdcard = @import("sdcard");
+const ui_scale = @import("ui_scale");
 
 const sg = sokol.gfx;
 const sapp = sokol.app;
@@ -214,8 +215,9 @@ export fn cleanup() void {
 
 export fn frame() void {
     harvestWorker();
-    const width = sapp.widthf();
-    const height = sapp.heightf();
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    const width = metrics.width;
+    const height = metrics.height;
     sgl.defaults();
     sgl.matrixModeProjection();
     sgl.ortho(0, width, height, 0, -1, 1);
@@ -370,8 +372,9 @@ fn drawTitles(width: f32, height: f32) void {
 
 export fn event(event_ptr: [*c]const sapp.Event) void {
     const input = event_ptr.*;
+    const scale = ui_scale.metrics(sapp.widthf(), sapp.heightf()).scale;
     switch (input.type) {
-        .MOUSE_DOWN => if (input.mouse_button == .LEFT) handleClick(input.mouse_x, input.mouse_y),
+        .MOUSE_DOWN => if (input.mouse_button == .LEFT) handleClick(input.mouse_x / scale, input.mouse_y / scale),
         .MOUSE_SCROLL => scrollTitles(input.scroll_y),
         .KEY_DOWN => if (!input.key_repeat) switch (input.key_code) {
             .F5 => runRefresh(),
@@ -386,7 +389,7 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
 
 fn handleClick(x: f32, y: f32) void {
     if (isBusy()) return;
-    const width = sapp.widthf();
+    const width = ui_scale.metrics(sapp.widthf(), sapp.heightf()).width;
     if (contains(layout.refresh(width), x, y)) {
         runRefresh();
     } else if (contains(layout.sdSync(width), x, y)) {
@@ -1041,7 +1044,8 @@ fn drawButton(rect: Rect, color: Color, label: []const u8) void {
 }
 
 fn drawText(x: f32, y: f32, color: Color, comptime format: []const u8, args: anytype) void {
-    sdtx.canvas(sapp.widthf(), sapp.heightf());
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    sdtx.canvas(metrics.width, metrics.height);
     sdtx.font(0);
     sdtx.color3b(color.r, color.g, color.b);
     sdtx.pos(x / 8.0, y / 8.0);
