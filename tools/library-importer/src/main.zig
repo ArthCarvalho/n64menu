@@ -2,6 +2,7 @@ const std = @import("std");
 const sokol = @import("sokol");
 const importer = @import("importer");
 const deployer = @import("deployer");
+const icon = @import("icon.zig");
 
 const sg = sokol.gfx;
 const sapp = sokol.app;
@@ -886,7 +887,7 @@ pub fn main() void {
         .enable_dragndrop = true,
         .max_dropped_files = 1,
         .max_dropped_file_path_length = 4096,
-        .icon = .{ .sokol_default = true },
+        .icon = icon.desc(),
         .window_title = "m64menu RetroArch Sync",
         .logger = .{ .func = slog.func },
         .win32 = .{ .console_attach = true },
