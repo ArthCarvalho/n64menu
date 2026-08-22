@@ -110,6 +110,7 @@ pub const RetroArchDiscoveryOptions = struct {
     /// Overrides automatically detected Windows drive roots when non-empty.
     mounted_roots: []const []const u8 = &.{},
     maximum_search_depth: usize = 7,
+    environ: std.process.Environ = .empty,
 };
 
 pub const ProgressEvent = struct {
@@ -214,7 +215,7 @@ pub fn scanRetroArchLibrary(
     const search_roots = if (options.search_roots.len != 0)
         options.search_roots
     else blk: {
-        try appendDefaultSearchRoots(allocator, io, &owned_roots);
+        try appendDefaultSearchRoots(allocator, io, options.environ, &owned_roots);
         break :blk owned_roots.items;
     };
 
@@ -390,8 +391,7 @@ fn pathDepth(path: []const u8) usize {
     return count;
 }
 
-fn appendDefaultSearchRoots(allocator: std.mem.Allocator, io: std.Io, roots: *std.ArrayList([]u8)) !void {
-    const environ = std.process.Environ{ .block = .global };
+fn appendDefaultSearchRoots(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, roots: *std.ArrayList([]u8)) !void {
     switch (builtin.os.tag) {
         .windows => {
             const names = [_][]const u8{ "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "USERPROFILE" };

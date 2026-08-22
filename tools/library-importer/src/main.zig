@@ -136,7 +136,7 @@ const layout = struct {
 };
 
 export fn init() void {
-    state.threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
+    state.threaded = std.Io.Threaded.init(std.heap.c_allocator, .{ .environ = currentProcessEnviron() });
     state.io_ready = true;
     sg.setup(.{ .environment = sglue.environment(), .logger = .{ .func = slog.func } });
     sgl.setup(.{ .max_vertices = 131_072, .max_commands = 16_384, .logger = .{ .func = slog.func } });
@@ -151,6 +151,14 @@ export fn init() void {
     state.pass_action.colors[0] = .{ .load_action = .CLEAR, .clear_value = .{ .r = 0.047, .g = 0.020, .b = 0.110, .a = 1 } };
     setStatus(true, "Detecting RetroArch and SummerCart...", .{});
     runRefresh();
+}
+
+fn currentProcessEnviron() std.process.Environ {
+    if (@import("builtin").os.tag == .windows) return .{ .block = .global };
+    const c_environ = std.c.environ;
+    var count: usize = 0;
+    while (c_environ[count] != null) : (count += 1) {}
+    return .{ .block = .{ .slice = c_environ[0..count :null] } };
 }
 
 export fn cleanup() void {
@@ -399,7 +407,7 @@ fn refreshWorker(config: DiscoveryConfig) void {
     const io = state.threaded.io();
     var result = RefreshResult{};
 
-    result.scan = importer.scanRetroArchLibrary(allocator, io, .{}) catch |auto_err| fallback: {
+    result.scan = importer.scanRetroArchLibrary(allocator, io, .{ .environ = state.threaded.environ.process_environ }) catch |auto_err| fallback: {
         if (config.playlist_override.len == 0) {
             result.scan_error = @errorName(auto_err);
             break :fallback null;
@@ -413,6 +421,7 @@ fn refreshWorker(config: DiscoveryConfig) void {
         var fallback_result = importer.scanRetroArchLibrary(allocator, io, .{
             .search_roots = &roots,
             .maximum_search_depth = 0,
+            .environ = state.threaded.environ.process_environ,
         }) catch |fallback_err| {
             result.scan_error = @errorName(fallback_err);
             result.override_target_blocked = !std.ascii.eqlIgnoreCase(std.fs.path.basename(override_path), expected_playlist_name);
@@ -480,6 +489,7 @@ fn discoverDevice(allocator: std.mem.Allocator, io: std.Io) DeviceOutcome {
         var cleanup_error: ?anyerror = null;
         snapshot.library = deployer.readInstalledLibraryOptions(allocator, io, snapshot.deployer_path, snapshot.port, .{
             .cleanup_error = &cleanup_error,
+            .environ = state.threaded.environ.process_environ,
         }) catch |err| {
             return .{ .device = snapshot, .err = @errorName(err) };
         };
@@ -533,6 +543,7 @@ fn syncFromStaging(
     var imported = try importer.importRetroArchLibrary(allocator, io, staging, .{
         .search_roots = &roots,
         .maximum_search_depth = 0,
+        .environ = state.threaded.environ.process_environ,
     }, .{ .context = null, .callback = importProgress });
     defer imported.deinit(allocator);
     if (!std.ascii.eqlIgnoreCase(imported.source.playlist_path, playlist_path)) return error.PlaylistChanged;
@@ -572,7 +583,7 @@ fn fileExists(io: std.Io, path: []const u8) bool {
 }
 
 fn createStagingDirectory(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    const environ = std.process.Environ{ .block = .global };
+    const environ = state.threaded.environ.process_environ;
     const temp_root = std.process.Environ.getAlloc(environ, allocator, "TMPDIR") catch
         std.process.Environ.getAlloc(environ, allocator, "TEMP") catch
         std.process.Environ.getAlloc(environ, allocator, "TMP") catch

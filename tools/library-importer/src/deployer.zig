@@ -13,6 +13,7 @@ pub const InstalledTitle = struct {
 
 pub const ReadInstalledOptions = struct {
     cleanup_error: ?*?anyerror = null,
+    environ: std.process.Environ = .empty,
 };
 
 pub const InstalledLibrary = struct {
@@ -289,10 +290,9 @@ pub fn readInstalledLibraryOptions(
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
     const temp_name = "m64menu-library-" ++ std.fmt.bytesToHex(random_bytes, .lower);
-    const environ = std.process.Environ{ .block = .global };
-    const system_temp = std.process.Environ.getAlloc(environ, allocator, "TMPDIR") catch
-        std.process.Environ.getAlloc(environ, allocator, "TEMP") catch
-        std.process.Environ.getAlloc(environ, allocator, "TMP") catch
+    const system_temp = std.process.Environ.getAlloc(options.environ, allocator, "TMPDIR") catch
+        std.process.Environ.getAlloc(options.environ, allocator, "TEMP") catch
+        std.process.Environ.getAlloc(options.environ, allocator, "TMP") catch
         try allocator.dupe(u8, if (builtin.os.tag == .windows) "." else "/tmp");
     defer allocator.free(system_temp);
     const temp_root = try std.fs.path.join(allocator, &.{ system_temp, temp_name });
