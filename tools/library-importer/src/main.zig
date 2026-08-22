@@ -2,6 +2,7 @@ const std = @import("std");
 const sokol = @import("sokol");
 const importer = @import("importer");
 const deployer = @import("deployer");
+const sdcard = @import("sdcard");
 
 const sg = sokol.gfx;
 const sapp = sokol.app;
@@ -47,8 +48,24 @@ const FixedText = struct {
 };
 
 const PowerState = enum { unknown, off, on };
+const SyncDestination = enum { direct_sd, usb };
 const TitleSyncState = enum { ADD, KEEP, UPDATE };
 const UiLibraryDiff = struct { add: usize = 0, keep: usize = 0, update: usize = 0, remove: usize = 0 };
+
+const CardSnapshot = struct {
+    root: []u8,
+    has_menu_rom: bool,
+    has_library: bool,
+    detected_count: usize,
+    library: ?sdcard.InstalledLibrary = null,
+
+    fn deinit(self: *CardSnapshot) void {
+        const allocator = std.heap.c_allocator;
+        allocator.free(self.root);
+        if (self.library) |*library| library.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 const DeviceSnapshot = struct {
     deployer_path: []u8,
@@ -75,9 +92,16 @@ const DiscoveryConfig = struct {
 };
 
 const SyncConfig = struct {
+    destination: SyncDestination,
     playlist_path: FixedText,
+    card_root: FixedText,
     deployer_path: FixedText,
     port: FixedText,
+};
+
+const CardOutcome = struct {
+    card: ?CardSnapshot = null,
+    err: ?[]const u8 = null,
 };
 
 const DeviceOutcome = struct {
@@ -87,14 +111,17 @@ const DeviceOutcome = struct {
 
 const RefreshResult = struct {
     scan: ?importer.RetroArchScanResult = null,
+    card: ?CardSnapshot = null,
     device: ?DeviceSnapshot = null,
     scan_error: ?[]const u8 = null,
+    card_error: ?[]const u8 = null,
     device_error: ?[]const u8 = null,
     used_override: bool = false,
     override_target_blocked: bool = false,
 };
 
 const SyncResult = struct {
+    destination: SyncDestination,
     err: ?[]const u8 = null,
     cleanup_error: ?[]const u8 = null,
 };
@@ -109,10 +136,12 @@ const state = struct {
     var io_ready = false;
     var pass_action: sg.PassAction = .{};
     var scan: ?importer.RetroArchScanResult = null;
+    var card: ?CardSnapshot = null;
     var device: ?DeviceSnapshot = null;
     var playlist_override = FixedText{};
     var source_is_override = false;
     var scan_error: ?[]const u8 = null;
+    var card_error: ?[]const u8 = null;
     var device_error: ?[]const u8 = null;
     var status: [768]u8 = @splat(0);
     var status_len: usize = 0;
@@ -123,15 +152,21 @@ const state = struct {
     var worker_busy = false;
     var worker_done = false;
     var worker_result: ?WorkerResult = null;
+    var shutting_down = false;
+    var preview_destination: SyncDestination = .usb;
 };
 
 const layout = struct {
     fn refresh(width: f32) Rect {
-        return .{ .x = width - 424, .y = 50, .w = 132, .h = 38 };
+        return .{ .x = width - 552, .y = 50, .w = 104, .h = 38 };
     }
 
-    fn syncButton(width: f32) Rect {
-        return .{ .x = width - 276, .y = 50, .w = 232, .h = 38 };
+    fn sdSync(width: f32) Rect {
+        return .{ .x = width - 436, .y = 50, .w = 190, .h = 38 };
+    }
+
+    fn usbSync(width: f32) Rect {
+        return .{ .x = width - 234, .y = 50, .w = 190, .h = 38 };
     }
 };
 
@@ -162,12 +197,14 @@ fn currentProcessEnviron() std.process.Environ {
 }
 
 export fn cleanup() void {
+    state.shutting_down = true;
     if (state.worker) |worker| {
         worker.join();
         state.worker = null;
     }
     harvestWorker();
     clearScan();
+    clearCard();
     clearDevice();
     sdtx.shutdown();
     sgl.shutdown();
@@ -191,10 +228,11 @@ export fn frame() void {
 
     const busy = isBusy();
     drawButton(layout.refresh(width), if (busy) colors.border else colors.orange, "REFRESH");
-    drawButton(layout.syncButton(width), if (canSync() and !busy) colors.yellow else colors.border, "SYNC TO SUMMERCART");
+    drawButton(layout.sdSync(width), if (canSyncSd() and !busy) colors.yellow else colors.border, "SYNC TO SD (FAST)");
+    drawButton(layout.usbSync(width), if (canSyncUsb() and !busy) colors.orange else colors.border, "SYNC OVER USB (SLOW)");
 
     drawRetroArchPanel(width);
-    drawDevicePanel(width);
+    drawDestinationPanels(width);
     drawStatus();
     drawTitles(width, height);
 
@@ -239,41 +277,71 @@ fn drawRetroArchPanel(width: f32) void {
     }
 }
 
-fn drawDevicePanel(width: f32) void {
-    const panel = Rect{ .x = 44, .y = 298, .w = width - 88, .h = 144 };
+fn drawDestinationPanels(width: f32) void {
+    const gap: f32 = 12;
+    const panel_width = (width - 88 - gap) / 2;
+    drawCardPanel(.{ .x = 44, .y = 298, .w = panel_width, .h = 144 });
+    drawUsbPanel(.{ .x = 44 + panel_width + gap, .y = 298, .w = panel_width, .h = 144 });
+}
+
+fn drawCardPanel(panel: Rect) void {
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
-    drawText(60, 314, colors.pink, "SUMMERCART", .{});
+    drawText(panel.x + 16, 314, colors.pink, "MOUNTED SD CARD (PREFERRED)", .{});
+    if (state.card) |card| {
+        drawLabelValue(panel.x + 16, 344, "ROOT", tail(card.root, 42), colors.white);
+        drawText(panel.x + 16, 370, colors.dim, "MENU ROM", .{});
+        drawText(panel.x + 184, 370, if (card.has_menu_rom) colors.good else colors.orange, "{s}", .{if (card.has_menu_rom) "PRESENT" else "MISSING"});
+        drawText(panel.x + 16, 396, colors.dim, "INSTALLED", .{});
+        if (card.library) |library| {
+            drawText(panel.x + 184, 396, colors.white, "{d}", .{library.titles.len});
+            drawDiff(panel.x + 16, 420, library.titles.len, libraryDiffFor(library.titles));
+        } else {
+            drawText(panel.x + 184, 396, colors.orange, "UNAVAILABLE", .{});
+        }
+        if (card.detected_count > 1) drawText(panel.x + panel.w - 146, 314, colors.orange, "USING 1 OF {d}", .{card.detected_count});
+    } else {
+        drawText(panel.x + 16, 346, colors.dim, "ROOT       NOT DETECTED", .{});
+        drawText(panel.x + 16, 372, colors.dim, "MENU ROM   UNAVAILABLE", .{});
+        drawText(panel.x + 16, 398, colors.dim, "INSTALLED  0", .{});
+        drawText(panel.x + 16, 420, colors.orange, "INSERT OR MOUNT A SUMMERCART SD CARD", .{});
+    }
+}
+
+fn drawUsbPanel(panel: Rect) void {
+    drawRect(panel, colors.inset);
+    drawOutline(panel, colors.border, 2);
+    drawText(panel.x + 16, 314, colors.pink, "USB SUMMERCART", .{});
     if (state.device) |device| {
-        drawLabelValue(60, 344, "SERIAL", device.serial, colors.white);
-        drawLabelValue(60, 370, "PORT", tail(device.port, 108), colors.white);
-        drawText(60, 396, colors.dim, "POWER", .{});
+        drawLabelValue(panel.x + 16, 344, "SERIAL", device.serial, colors.white);
+        drawLabelValue(panel.x + 16, 370, "PORT", tail(device.port, 42), colors.white);
+        drawText(panel.x + 16, 396, colors.dim, "POWER", .{});
         const power_color = switch (device.power) {
             .off => colors.good,
             .on => colors.bad,
             .unknown => colors.orange,
         };
-        drawText(156, 396, power_color, "{s}", .{powerLabel(device.power)});
-        drawText(330, 396, colors.dim, "BACKEND", .{});
-        drawText(426, 396, colors.white, "{s}", .{device.backend});
+        drawText(panel.x + 184, 396, power_color, "{s}", .{powerLabel(device.power)});
         if (device.library) |library| {
-            const diff = libraryDiff();
-            drawText(60, 420, colors.dim, "INSTALLED", .{});
-            drawText(156, 420, colors.white, "{d}", .{library.titles.len});
-            drawText(250, 420, colors.good, "+{d} ADD", .{diff.add});
-            drawText(370, 420, colors.white, "{d} KEEP", .{diff.keep});
-            drawText(498, 420, colors.orange, "{d} UPDATE", .{diff.update});
-            drawText(650, 420, colors.bad, "-{d} HIDE", .{diff.remove});
+            drawDiff(panel.x + 16, 420, library.titles.len, libraryDiffFor(library.titles));
         } else {
-            drawText(60, 420, colors.orange, "INSTALLED LIBRARY UNAVAILABLE", .{});
+            drawText(panel.x + 16, 420, colors.orange, "INSTALLED LIBRARY UNAVAILABLE", .{});
         }
-        if (device.detected_count > 1) drawText(width - 238, 314, colors.orange, "USING 1 OF {d} CARTS", .{device.detected_count});
+        if (device.detected_count > 1) drawText(panel.x + panel.w - 146, 314, colors.orange, "USING 1 OF {d}", .{device.detected_count});
     } else {
-        drawText(60, 346, colors.dim, "SERIAL   NOT DETECTED", .{});
-        drawText(60, 372, colors.dim, "PORT     UNAVAILABLE", .{});
-        drawText(60, 398, colors.bad, "POWER    UNAVAILABLE (NO CART)", .{});
-        drawText(60, 420, colors.dim, "INSTALLED 0", .{});
+        drawText(panel.x + 16, 346, colors.dim, "SERIAL     NOT DETECTED", .{});
+        drawText(panel.x + 16, 372, colors.dim, "PORT       UNAVAILABLE", .{});
+        drawText(panel.x + 16, 398, colors.bad, "POWER      UNAVAILABLE", .{});
+        drawText(panel.x + 16, 420, colors.dim, "INSTALLED  0", .{});
     }
+}
+
+fn drawDiff(x: f32, y: f32, installed: usize, diff: UiLibraryDiff) void {
+    drawText(x, y, colors.dim, "{d} INST", .{installed});
+    drawText(x + 80, y, colors.good, "+{d} ADD", .{diff.add});
+    drawText(x + 176, y, colors.white, "{d} KEEP", .{diff.keep});
+    drawText(x + 272, y, colors.orange, "{d} UPDATE", .{diff.update});
+    drawText(x + 384, y, colors.bad, "-{d} HIDE", .{diff.remove});
 }
 
 fn drawTitles(width: f32, height: f32) void {
@@ -307,7 +375,7 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
         .MOUSE_SCROLL => scrollTitles(input.scroll_y),
         .KEY_DOWN => if (!input.key_repeat) switch (input.key_code) {
             .F5 => runRefresh(),
-            .ENTER => runSync(),
+            .ENTER => runPreferredSync(),
             .ESCAPE => sapp.requestQuit(),
             else => {},
         },
@@ -321,8 +389,12 @@ fn handleClick(x: f32, y: f32) void {
     const width = sapp.widthf();
     if (contains(layout.refresh(width), x, y)) {
         runRefresh();
-    } else if (contains(layout.syncButton(width), x, y)) {
-        runSync();
+    } else if (contains(layout.sdSync(width), x, y)) {
+        state.preview_destination = .direct_sd;
+        runSync(.direct_sd);
+    } else if (contains(layout.usbSync(width), x, y)) {
+        state.preview_destination = .usb;
+        runSync(.usb);
     }
 }
 
@@ -359,39 +431,64 @@ fn runRefresh() void {
     setStatus(true, "Detecting RetroArch and SummerCart...", .{});
 }
 
-fn runSync() void {
+fn runPreferredSync() void {
+    if (state.card != null) {
+        runSync(.direct_sd);
+    } else {
+        runSync(.usb);
+    }
+}
+
+fn runSync(destination: SyncDestination) void {
     if (isBusy()) return;
     const scan = state.scan orelse {
         setStatus(false, "Sync refused: no RetroArch N64 playlist is ready.", .{});
         return;
     };
-    const device = state.device orelse {
-        setStatus(false, "Sync refused: no SummerCart is detected.", .{});
-        return;
-    };
-    switch (device.power) {
-        .on => {
-            setStatus(false, "Sync refused: console is powered on. Power it off, then Refresh.", .{});
-            return;
-        },
-        .unknown => {
-            setStatus(false, "Sync refused: SummerCart power state is unknown. Refresh and retry.", .{});
-            return;
-        },
-        .off => {},
-    }
 
     var config = SyncConfig{
+        .destination = destination,
         .playlist_path = .{},
+        .card_root = .{},
         .deployer_path = .{},
         .port = .{},
     };
-    if (!config.playlist_path.set(scan.source.playlist_path) or
-        !config.deployer_path.set(device.deployer_path) or
-        !config.port.set(device.port))
-    {
+    if (!config.playlist_path.set(scan.source.playlist_path)) {
         setStatus(false, "Sync refused: a detected path exceeds the supported path length.", .{});
         return;
+    }
+    switch (destination) {
+        .direct_sd => {
+            const card = state.card orelse {
+                setStatus(false, "Sync refused: no mounted SummerCart SD card is detected.", .{});
+                return;
+            };
+            if (!config.card_root.set(card.root)) {
+                setStatus(false, "Sync refused: the mounted card path is too long.", .{});
+                return;
+            }
+        },
+        .usb => {
+            const device = state.device orelse {
+                setStatus(false, "Sync refused: no USB SummerCart is detected.", .{});
+                return;
+            };
+            switch (device.power) {
+                .on => {
+                    setStatus(false, "Sync refused: console is powered on. Power it off, then Refresh.", .{});
+                    return;
+                },
+                .unknown => {
+                    setStatus(false, "Sync refused: SummerCart power state is unknown. Refresh and retry.", .{});
+                    return;
+                },
+                .off => {},
+            }
+            if (!config.deployer_path.set(device.deployer_path) or !config.port.set(device.port)) {
+                setStatus(false, "Sync refused: a detected USB path exceeds the supported path length.", .{});
+                return;
+            }
+        },
     }
     if (!beginWorker()) return;
     state.worker = std.Thread.spawn(.{}, syncWorker, .{config}) catch |err| {
@@ -399,7 +496,10 @@ fn runSync() void {
         setStatus(false, "Could not start sync: {s}", .{@errorName(err)});
         return;
     };
-    setStatus(true, "Checking SummerCart power state...", .{});
+    switch (destination) {
+        .direct_sd => setStatus(true, "Preparing fast direct SD sync...", .{}),
+        .usb => setStatus(true, "Checking SummerCart power state...", .{}),
+    }
 }
 
 fn refreshWorker(config: DiscoveryConfig) void {
@@ -437,11 +537,34 @@ fn refreshWorker(config: DiscoveryConfig) void {
         break :fallback fallback_result;
     };
 
+    var card_outcome = discoverCard(allocator, io);
+    result.card = card_outcome.card;
+    result.card_error = card_outcome.err;
+    card_outcome.card = null;
     var device_outcome = discoverDevice(allocator, io);
     result.device = device_outcome.device;
     result.device_error = device_outcome.err;
     device_outcome.device = null;
     finishWorker(.{ .refresh = result });
+}
+
+fn discoverCard(allocator: std.mem.Allocator, io: std.Io) CardOutcome {
+    var cards = sdcard.detectCards(allocator, io) catch |err| return .{ .err = @errorName(err) };
+    defer cards.deinit(allocator);
+    if (cards.cards.len == 0) return .{ .err = "NoMountedCardFound" };
+    if (cards.cards.len != 1) return .{ .err = "MultipleMountedCardsFound" };
+
+    const detected = cards.cards[0];
+    var snapshot = CardSnapshot{
+        .root = allocator.dupe(u8, detected.root) catch return .{ .err = "OutOfMemory" },
+        .has_menu_rom = detected.has_menu_rom,
+        .has_library = detected.has_library,
+        .detected_count = cards.cards.len,
+    };
+    snapshot.library = sdcard.readInstalledLibrary(allocator, io, snapshot.root) catch |err| {
+        return .{ .card = snapshot, .err = @errorName(err) };
+    };
+    return .{ .card = snapshot };
 }
 
 fn discoverDevice(allocator: std.mem.Allocator, io: std.Io) DeviceOutcome {
@@ -501,19 +624,21 @@ fn discoverDevice(allocator: std.mem.Allocator, io: std.Io) DeviceOutcome {
 fn syncWorker(config: SyncConfig) void {
     const allocator = std.heap.c_allocator;
     const io = state.threaded.io();
-    var result = SyncResult{};
+    var result = SyncResult{ .destination = config.destination };
 
-    var info = deployer.probeDevice(allocator, io, config.deployer_path.slice(), config.port.slice()) catch |err| {
-        result.err = @errorName(err);
-        finishWorker(.{ .sync = result });
-        return;
-    };
-    const powered_on = info.console_powered_on;
-    info.deinit(allocator);
-    if (powered_on) {
-        result.err = "ConsolePoweredOn";
-        finishWorker(.{ .sync = result });
-        return;
+    if (config.destination == .usb) {
+        var info = deployer.probeDevice(allocator, io, config.deployer_path.slice(), config.port.slice()) catch |err| {
+            result.err = @errorName(err);
+            finishWorker(.{ .sync = result });
+            return;
+        };
+        const powered_on = info.console_powered_on;
+        info.deinit(allocator);
+        if (powered_on) {
+            result.err = "ConsolePoweredOn";
+            finishWorker(.{ .sync = result });
+            return;
+        }
     }
 
     const staging = createStagingDirectory(allocator, io) catch |err| {
@@ -553,12 +678,23 @@ fn syncFromStaging(
     const staged_rom = try std.fs.path.join(allocator, &.{ staging, "sc64menu.n64" });
     defer allocator.free(staged_rom);
     try std.Io.Dir.copyFileAbsolute(menu_rom, staged_rom, io, .{});
-    setStatus(true, "Staging complete; syncing to SummerCart...", .{});
-    try deployer.sync(allocator, io, .{
-        .deployer_path = config.deployer_path.slice(),
-        .port = config.port.slice(),
-        .staging_root = staging,
-    }, .{ .context = null, .callback = deployProgress });
+    switch (config.destination) {
+        .direct_sd => {
+            setStatus(true, "Staging complete; copying directly to mounted SD...", .{});
+            try sdcard.syncFromStaging(allocator, io, staging, config.card_root.slice(), .{
+                .context = null,
+                .callback = sdProgress,
+            });
+        },
+        .usb => {
+            setStatus(true, "Staging complete; syncing over USB...", .{});
+            try deployer.sync(allocator, io, .{
+                .deployer_path = config.deployer_path.slice(),
+                .port = config.port.slice(),
+                .staging_root = staging,
+            }, .{ .context = null, .callback = deployProgress });
+        },
+    }
 }
 
 fn findMenuRom(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
@@ -621,6 +757,10 @@ fn deployProgress(_: ?*anyopaque, progress_event: deployer.ProgressEvent) void {
     setStatus(true, "Syncing {d}/{d}: {s}", .{ progress_event.current, progress_event.total, progress_event.path });
 }
 
+fn sdProgress(_: ?*anyopaque, progress_event: sdcard.ProgressEvent) void {
+    setStatus(true, "Copying {d}/{d}: {s}", .{ progress_event.current, progress_event.total, progress_event.path });
+}
+
 fn beginWorker() bool {
     lockWorker();
     defer unlockWorker();
@@ -668,49 +808,71 @@ fn harvestWorker() void {
 
 fn harvestRefresh(result: *RefreshResult) void {
     clearScan();
+    clearCard();
     clearDevice();
     state.scan = result.scan;
     result.scan = null;
+    state.card = result.card;
+    result.card = null;
     state.device = result.device;
     result.device = null;
     state.scan_error = result.scan_error;
+    state.card_error = result.card_error;
     state.device_error = result.device_error;
     state.source_is_override = result.used_override;
     state.preview_scroll = 0;
+    state.preview_destination = if (state.card != null) .direct_sd else .usb;
 
     if (result.override_target_blocked) {
         setStatus(false, "Playlist fallback failed: core can only target {s}; exact arbitrary .lpl targeting is unavailable.", .{expected_playlist_name});
     } else if (state.scan == null) {
-        setStatus(false, "RetroArch detection failed: {s}. SummerCart: {s}.", .{ state.scan_error orelse "UnknownError", deviceSummary() });
+        setStatus(false, "RetroArch detection failed: {s}. SD: {s}; USB: {s}.", .{ state.scan_error orelse "UnknownError", cardSummary(), deviceSummary() });
+    } else if (state.card != null) {
+        if (state.card_error) |name| {
+            setStatus(false, "Mounted SD detected, but its installed library could not be read: {s}.", .{name});
+        } else {
+            setStatus(true, "Ready for fast direct SD sync of {d} title(s).", .{state.scan.?.preview.titles.len});
+        }
     } else if (state.device == null) {
-        setStatus(false, "RetroArch library ready; SummerCart detection failed: {s}.", .{state.device_error orelse "UnknownError"});
+        setStatus(false, "RetroArch library ready; no mounted SD or USB SummerCart detected.", .{});
     } else if (state.device.?.power == .on) {
-        setStatus(false, "Library and SummerCart detected, but sync is blocked while the console is powered on.", .{});
+        setStatus(false, "USB SummerCart detected, but sync is blocked while the console is powered on.", .{});
     } else if (state.device.?.power == .unknown) {
-        setStatus(false, "Library and SummerCart detected, but power probe failed: {s}.", .{state.device_error orelse "UnknownError"});
+        setStatus(false, "USB SummerCart detected, but power probe failed: {s}.", .{state.device_error orelse "UnknownError"});
     } else if (state.device_error != null) {
-        setStatus(false, "Ready to sync, but temporary metadata cleanup failed: {s}.", .{state.device_error.?});
+        setStatus(false, "USB is available, but its installed library could not be read: {s}.", .{state.device_error.?});
     } else {
-        setStatus(true, "Ready to sync {d} title(s) to SummerCart.", .{state.scan.?.preview.titles.len});
+        setStatus(true, "Ready to sync {d} title(s) over USB.", .{state.scan.?.preview.titles.len});
     }
 }
 
 fn harvestSync(result: SyncResult) void {
+    const destination = switch (result.destination) {
+        .direct_sd => "Direct SD sync",
+        .usb => "USB sync",
+    };
     if (result.err) |name| {
         if (std.mem.eql(u8, name, "ConsolePoweredOn")) {
             if (state.device) |*device| device.power = .on;
-            setStatus(false, "Sync refused: console is powered on.", .{});
+            setStatus(false, "USB sync refused: console is powered on.", .{});
         } else if (result.cleanup_error) |cleanup_name| {
-            setStatus(false, "Sync failed: {s}; staging cleanup also failed: {s}.", .{ name, cleanup_name });
+            setStatus(false, "{s} failed: {s}; staging cleanup also failed: {s}.", .{ destination, name, cleanup_name });
         } else {
-            setStatus(false, "Sync failed: {s}.", .{name});
+            setStatus(false, "{s} failed: {s}.", .{ destination, name });
         }
     } else if (result.cleanup_error) |name| {
-        setStatus(false, "Sync completed, but private staging cleanup failed: {s}.", .{name});
+        setStatus(false, "{s} completed, but private staging cleanup failed: {s}.", .{ destination, name });
     } else {
-        setStatus(true, "Sync completed; refreshing installed library...", .{});
-        runRefresh();
+        if (!state.shutting_down) {
+            setStatus(true, "{s} completed; refreshing installed libraries...", .{destination});
+            runRefresh();
+        }
     }
+}
+
+fn cardSummary() []const u8 {
+    if (state.card) |card| return card.root;
+    return state.card_error orelse "not detected";
 }
 
 fn deviceSummary() []const u8 {
@@ -718,14 +880,28 @@ fn deviceSummary() []const u8 {
     return state.device_error orelse "not detected";
 }
 
-fn canSync() bool {
+fn canSyncSd() bool {
+    return state.scan != null and state.card != null;
+}
+
+fn canSyncUsb() bool {
     return state.scan != null and state.device != null and state.device.?.power == .off;
 }
 
 fn titleSyncState(title: importer.Title) TitleSyncState {
-    const device = state.device orelse return .ADD;
-    const library = device.library orelse return .ADD;
-    for (library.titles) |installed| {
+    switch (state.preview_destination) {
+        .direct_sd => if (state.card) |card| {
+            if (card.library) |library| return titleSyncStateFor(title, library.titles);
+        },
+        .usb => if (state.device) |device| {
+            if (device.library) |library| return titleSyncStateFor(title, library.titles);
+        },
+    }
+    return .ADD;
+}
+
+fn titleSyncStateFor(title: importer.Title, installed_titles: anytype) TitleSyncState {
+    for (installed_titles) |installed| {
         if (!std.mem.eql(u8, &installed.id, &title.id)) continue;
         // Legacy libraries did not have name sidecars, so the deployer falls back
         // to the ID. Matching IDs still mean the ROM is already installed.
@@ -735,17 +911,15 @@ fn titleSyncState(title: importer.Title) TitleSyncState {
     return .ADD;
 }
 
-fn libraryDiff() UiLibraryDiff {
+fn libraryDiffFor(installed_titles: anytype) UiLibraryDiff {
     var result = UiLibraryDiff{};
     const scan = state.scan orelse return result;
-    const device = state.device orelse return result;
-    const library = device.library orelse return result;
-    for (scan.preview.titles) |title| switch (titleSyncState(title)) {
+    for (scan.preview.titles) |title| switch (titleSyncStateFor(title, installed_titles)) {
         .ADD => result.add += 1,
         .KEEP => result.keep += 1,
         .UPDATE => result.update += 1,
     };
-    for (library.titles) |installed| {
+    for (installed_titles) |installed| {
         var found = false;
         for (scan.preview.titles) |title| if (std.mem.eql(u8, &installed.id, &title.id)) {
             found = true;
@@ -791,6 +965,11 @@ fn artworkCoverage(scan: importer.ScanResult) usize {
 fn clearScan() void {
     if (state.scan) |*scan| scan.deinit(std.heap.c_allocator);
     state.scan = null;
+}
+
+fn clearCard() void {
+    if (state.card) |*card| card.deinit();
+    state.card = null;
 }
 
 fn clearDevice() void {

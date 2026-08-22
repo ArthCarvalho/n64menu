@@ -344,10 +344,16 @@ pub fn sync(
     });
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
-    while (try stdout_reader.interface.takeDelimiter('\n')) |line| {
+    var powered_on_refusal = false;
+    while (stdout_reader.interface.takeDelimiter('\n') catch |err| {
+        child.kill(io);
+        return err;
+    }) |line| {
+        if (isPoweredOnRefusal(line)) powered_on_refusal = true;
         if (progress) |reporter| reportBatchProgressLine(reporter, line);
     }
     if (!termSucceeded(try child.wait(io))) return error.DeployerCommandFailed;
+    if (powered_on_refusal) return error.ConsolePoweredOn;
 }
 
 fn download(
@@ -553,6 +559,11 @@ test "powered-on deployer prompt is recognized without interaction" {
     try std.testing.expect(!isPoweredOnRefusal("Successfully uploaded /menu/title.csv"));
     try std.testing.expect(isMissingRemoteFile("Could not find the file"));
     try std.testing.expect(!isMissingRemoteFile("The physical drive does not work"));
+}
+
+test "batched stdout detects late powered-on refusal" {
+    try std.testing.expect(isPoweredOnRefusal("SD card access aborted"));
+    try std.testing.expect(!isPoweredOnRefusal("SYNC 1/3 /sc64menu.n64"));
 }
 
 test "batched deployer progress is parsed" {

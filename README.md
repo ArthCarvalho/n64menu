@@ -107,7 +107,14 @@ sidecars. The UI shows the current installed library and a sync plan containing
 add, keep, update and hide counts. Hidden titles are removed only from the visible
 catalog; existing save files are never deleted.
 
-USB updates use a patched `sc64deployer sd sync` command that uploads the entire
+For the fastest update, remove the SummerCart SD card and connect it to the computer.
+The importer detects an existing card by `sc64menu.n64` plus `menu/title.csv`, copies
+the staged tree directly, preserves `menu/save` and unrelated files, and publishes
+the synchronized catalog last. Automatic direct writes are enabled only for exactly
+one removable Windows drive with both markers.
+
+USB remains available as a slower fallback. It uses a patched `sc64deployer sd sync`
+command that uploads the entire
 staged tree through one device and FatFs session. This avoids reconnecting and
 reinitializing the SD card for every ROM, sprite and sidecar. The catalog is still
 published last so a failed transfer cannot reference incomplete title assets.
@@ -119,8 +126,9 @@ mise install
 mise run importer-run
 ```
 
-The app detects RetroArch and the SummerCart automatically. Use **Refresh** to repeat
-detection and **Sync to SummerCart** to stage and upload the visible library. Sync is
+The app detects RetroArch, mounted SummerCart SD cards and USB carts automatically.
+Use **Refresh** to repeat detection, **Sync to SD (Fast)** for the recommended direct
+copy, or **Sync over USB (Slow)** when removing the card is inconvenient. USB sync is
 blocked unless the cart reports that the console is powered off. An `.lpl` file may
 be dropped onto the window only as a fallback when automatic playlist discovery
 cannot find the intended installation.
