@@ -153,3 +153,4 @@ index bacd5c9..8b6eff0 100644
 +
  fn handle_info_command(connection: Connection) -> Result<(), sc64::Error> {
      let mut sc64 = init_sc64(connection, true)?;
+ 
