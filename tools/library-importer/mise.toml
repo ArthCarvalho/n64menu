@@ -1,0 +1,18 @@
+[tools]
+zig = "0.16.0"
+
+[tasks.build]
+description = "Build m64importer"
+run = "zig build -Doptimize=ReleaseSafe"
+
+[tasks.test]
+description = "Run importer core tests"
+run = "zig build test"
+
+[tasks.run]
+description = "Run m64importer"
+run = "zig build run"
+
+[tasks.check]
+description = "Compile without installing"
+run = "zig build check"

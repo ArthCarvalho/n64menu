@@ -17,7 +17,9 @@ What this fork adds:
   ribbon and a typographic header;
 - cartridge save support driven by a per-title sidecar (see below);
 - a Windows-native build that needs no WSL or Docker;
-- `tools/import-library.ps1`, which prepares ROMs and box art for the SD card.
+- `m64importer`, a cross-platform Sokol desktop tool that prepares ROMs and box art
+  for the SD card. The original PowerShell importer remains available for scripted
+  Windows workflows.
 
 ### Naming
 
@@ -86,6 +88,40 @@ writeback.
 ## Building
 
 See [BUILDING.md](BUILDING.md).
+
+## Library importer
+
+`m64importer` replaces the PowerShell library-preparation workflow with a native
+Zig/Sokol application for Windows, Linux and macOS. It scans N64 ROM folders,
+normalizes `.n64`, `.v64` and `.z64` byte order, generates stable IDs, converts box
+art to the menu's RGB5551 sprite format and writes the exact `menu/title` layout.
+
+Artwork is resolved in this order:
+
+1. an image beside the ROM with the same filename;
+2. the only image beside the ROM;
+3. exact or normalized matches in an optional artwork folder;
+4. exact or normalized matches in RetroArch's `Named_Boxarts` folder;
+5. a generated fallback card.
+
+Install all prerequisites and launch it through mise:
+
+```console
+mise install
+mise run importer-run
+```
+
+The importer accepts typed or pasted paths and drag-and-drop. Select the field first,
+then drop a folder onto the window. Use **Scan** to preview titles and artwork matches,
+then **Import to SD** to write the library. The output path must be an existing
+directory, normally the root of the SummerCart64 SD card.
+
+Development commands:
+
+```console
+mise run importer-test
+mise run importer-build
+```
 
 ## Releases
 
