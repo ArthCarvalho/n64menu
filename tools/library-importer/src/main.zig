@@ -68,12 +68,26 @@ const page_layout = struct {
     const status_y: f32 = 226;
     const library_top: f32 = 252;
     const grid_y: f32 = library_top + 38;
-    const detail_x: f32 = 616;
-    const detail_content_x: f32 = detail_x + 16;
+    const grid_x: f32 = 44;
+    const detail_width: f32 = 392;
+    const detail_gap: f32 = 20;
+    const right_margin: f32 = 44;
     const mod_first_y: f32 = grid_y + 118;
     const mod_row_height: f32 = 18;
     const mod_button_y: f32 = grid_y + 166;
     const artwork_button_y: f32 = grid_y + 136;
+
+    fn detailX(width: f32) f32 {
+        return @max(616, width - right_margin - detail_width);
+    }
+
+    fn detailContentX(width: f32) f32 {
+        return detailX(width) + 16;
+    }
+
+    fn gridWidth(width: f32) f32 {
+        return @max(544, detailX(width) - detail_gap - grid_x);
+    }
 };
 
 const ArtworkTexture = struct {
@@ -221,7 +235,7 @@ const state = struct {
     var io_ready = false;
     var pass_action: sg.PassAction = .{};
     var artwork_sampler: sg.Sampler = .{};
-    var artwork_textures: [16]ArtworkTexture = @splat(.{});
+    var artwork_textures: [grid.maximum_visible_cards]ArtworkTexture = @splat(.{});
     var mod_registry: ?registry.Registry = null;
     var registry_is_demo = true;
     var drop_mode: DropMode = .games;
@@ -577,14 +591,14 @@ fn drawTitles(width: f32, height: f32) void {
     if (titles.len == 0) return;
     state.preview_scroll = @min(state.preview_scroll, titles.len - 1);
 
-    const area_x: f32 = 44;
+    const area_x: f32 = page_layout.grid_x;
     const area_y = page_layout.grid_y;
-    const area_width: f32 = @min(544, width - 88);
+    const area_width = page_layout.gridWidth(width);
     const area_height = height - area_y - bottom_margin;
     const metrics = grid.layout(area_width, area_height);
-    const first_row = grid.firstVisibleRow(state.preview_scroll, titles.len, metrics.visible_rows);
-    const first_index = first_row * grid.columns;
-    const end_index = @min(titles.len, (first_row + metrics.visible_rows) * grid.columns);
+    const first_row = grid.firstVisibleRow(state.preview_scroll, titles.len, metrics);
+    const first_index = first_row * metrics.columns;
+    const end_index = @min(titles.len, (first_row + metrics.visible_rows) * metrics.columns);
     syncArtworkTextures(titles, first_index, end_index);
 
     for (titles[first_index..end_index], first_index..) |_, index| {
@@ -612,7 +626,7 @@ fn drawTitles(width: f32, height: f32) void {
 fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
     const mod_count = compatibleModCount(title);
     const panel_height: f32 = if (mod_count != 0) 208 else if (title.artwork_path == null) 174 else 112;
-    const panel = Rect{ .x = page_layout.detail_x, .y = top, .w = @min(392, @max(0, width - 660)), .h = panel_height };
+    const panel = Rect{ .x = page_layout.detailX(width), .y = top, .w = @min(page_layout.detail_width, @max(0, width - page_layout.detailX(width) - page_layout.right_margin)), .h = panel_height };
     if (panel.w < 180) return;
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
@@ -803,8 +817,8 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
             .ENTER => runPreferredSync(),
             .LEFT => moveTitleSelection(-1),
             .RIGHT => moveTitleSelection(1),
-            .UP => moveTitleSelection(-@as(isize, @intCast(grid.columns))),
-            .DOWN => moveTitleSelection(@intCast(grid.columns)),
+            .UP => moveTitleSelection(-@as(isize, @intCast(currentGridLayout().columns))),
+            .DOWN => moveTitleSelection(@intCast(currentGridLayout().columns)),
             .ESCAPE => sapp.requestQuit(),
             else => {},
         },
@@ -839,7 +853,7 @@ fn handleClick(x: f32, y: f32) void {
 }
 
 fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
-    if (width < 840 or x < page_layout.detail_content_x or x > width - 44) return false;
+    if (width < 840 or x < page_layout.detailContentX(width) or x > width - page_layout.right_margin) return false;
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
@@ -858,7 +872,7 @@ fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
 }
 
 fn downloadSelectedMod(width: f32, x: f32, y: f32) bool {
-    if (width < 840 or !contains(.{ .x = page_layout.detail_content_x, .y = page_layout.mod_button_y, .w = 196, .h = 30 }, x, y)) return false;
+    if (width < 840 or !contains(.{ .x = page_layout.detailContentX(width), .y = page_layout.mod_button_y, .w = 196, .h = 30 }, x, y)) return false;
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
@@ -885,7 +899,7 @@ fn searchMissingArtwork(width: f32, x: f32, y: f32) bool {
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
     const title = titles[state.preview_scroll];
     if (title.artwork_path != null) return false;
-    const button = Rect{ .x = page_layout.detail_content_x, .y = page_layout.artwork_button_y, .w = 196, .h = 30 };
+    const button = Rect{ .x = page_layout.detailContentX(width), .y = page_layout.artwork_button_y, .w = 196, .h = 30 };
     if (width < 840 or !contains(button, x, y)) return false;
     launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, title.display_name) catch |err| {
         setStatus(false, "Could not open LaunchBox search: {s}.", .{@errorName(err)});
@@ -899,14 +913,14 @@ fn selectGridTitle(width: f32, height: f32, x: f32, y: f32) bool {
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
     if (titles.len == 0 or height <= 610) return false;
-    const area_x: f32 = 44;
+    const area_x: f32 = page_layout.grid_x;
     const area_y: f32 = page_layout.grid_y;
-    const area_width: f32 = @min(544, width - 88);
+    const area_width = page_layout.gridWidth(width);
     const area_height = height - area_y - 36;
     const metrics = grid.layout(area_width, area_height);
-    const first_row = grid.firstVisibleRow(state.preview_scroll, titles.len, metrics.visible_rows);
-    const first_index = first_row * grid.columns;
-    const end_index = @min(titles.len, (first_row + metrics.visible_rows) * grid.columns);
+    const first_row = grid.firstVisibleRow(state.preview_scroll, titles.len, metrics);
+    const first_index = first_row * metrics.columns;
+    const end_index = @min(titles.len, (first_row + metrics.visible_rows) * metrics.columns);
     for (first_index..end_index) |index| {
         if (contains(fromGridRect(grid.cardRect(area_x, area_y, metrics, first_row, index)), x, y)) {
             state.preview_scroll = index;
@@ -969,8 +983,9 @@ fn scrollTitles(delta: f32) void {
     const scan = state.scan orelse return;
     const titles = scan.preview().titles;
     if (titles.len == 0) return;
-    if (delta < 0) state.preview_scroll = @min(titles.len - 1, state.preview_scroll + grid.columns);
-    if (delta > 0) state.preview_scroll -|= @min(state.preview_scroll, grid.columns);
+    const metrics = currentGridLayout();
+    if (delta < 0) state.preview_scroll = @min(titles.len - 1, state.preview_scroll + metrics.columns);
+    if (delta > 0) state.preview_scroll -|= @min(state.preview_scroll, metrics.columns);
 }
 
 fn moveTitleSelection(delta: isize) void {
@@ -980,6 +995,11 @@ fn moveTitleSelection(delta: isize) void {
     const current: isize = @intCast(state.preview_scroll);
     state.preview_scroll = @intCast(std.math.clamp(current + delta, 0, @as(isize, @intCast(titles.len - 1))));
     state.selected_mod = 0;
+}
+
+fn currentGridLayout() grid.Layout {
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    return grid.layout(page_layout.gridWidth(metrics.width), metrics.height - page_layout.grid_y - 36);
 }
 
 fn runRefresh() void {
