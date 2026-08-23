@@ -7,13 +7,18 @@ name: Build
 on:
   workflow_dispatch:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled]
   push:
     tags:
       - "v*"
 
 permissions:
   contents: read
+  issues: write
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   approval:
@@ -25,6 +30,13 @@ jobs:
         run: |
           echo "Add the run-ci label to approve the build matrix."
           exit 1
+      - name: Consume run-ci approval
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method DELETE
+          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/run-ci"
 
   importer:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
