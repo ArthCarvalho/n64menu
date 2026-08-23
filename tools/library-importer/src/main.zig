@@ -58,6 +58,7 @@ const FixedText = struct {
 const PowerState = enum { unknown, off, on };
 const SyncDestination = enum { direct_sd, usb };
 const SourceKind = enum { automatic, playlist, directory };
+const DropMode = enum { games, registry };
 const TitleSyncState = enum { ADD, KEEP, UPDATE };
 const UiLibraryDiff = struct { add: usize = 0, keep: usize = 0, update: usize = 0, remove: usize = 0 };
 
@@ -222,6 +223,8 @@ const state = struct {
     var artwork_sampler: sg.Sampler = .{};
     var artwork_textures: [16]ArtworkTexture = @splat(.{});
     var mod_registry: ?registry.Registry = null;
+    var registry_is_demo = true;
+    var drop_mode: DropMode = .games;
     var selected_mod: usize = 0;
     var scan: ?LibraryScan = null;
     var card: ?CardSnapshot = null;
@@ -257,6 +260,17 @@ const layout = struct {
 
     fn usbSync(width: f32) Rect {
         return .{ .x = width - 234, .y = 50, .w = 190, .h = 38 };
+    }
+
+    fn addGames() Rect {
+        return .{ .x = 188, .y = page_layout.workflow_y + 34, .w = 104, .h = 24 };
+    }
+
+    fn loadCatalog(width: f32) Rect {
+        const panel_width = width - 88;
+        const column_width = (panel_width - 32 - 12 * 3) / 4;
+        const catalog_x = 60 + column_width + 12;
+        return .{ .x = catalog_x + 112, .y = page_layout.workflow_y + 34, .w = 120, .h = 24 };
     }
 };
 
@@ -468,11 +482,13 @@ fn drawWorkflowStrip(width: f32) void {
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
     const gap: f32 = 12;
-    const column_width = (panel.w - 32 - gap * 2) / 3;
+    const column_width = (panel.w - 32 - gap * 3) / 4;
     const library_x = panel.x + 16;
-    const sd_x = library_x + column_width + gap;
+    const catalog_x = library_x + column_width + gap;
+    const sd_x = catalog_x + column_width + gap;
     const usb_x = sd_x + column_width + gap;
     drawCompactLibrary(library_x, panel.y + 14);
+    drawCompactCatalog(catalog_x, panel.y + 14);
     drawCompactSd(sd_x, panel.y + 14);
     drawCompactUsb(usb_x, panel.y + 14);
 }
@@ -483,10 +499,22 @@ fn drawCompactLibrary(x: f32, y: f32) void {
         const preview = scan.preview();
         const coverage = artworkCoverage(preview.*);
         drawText(x, y + 28, colors.white, "{d} GAMES", .{preview.titles.len});
-        drawText(x + 104, y + 28, if (coverage == preview.titles.len) colors.good else colors.orange, "{d} ART", .{coverage});
+        drawText(x + 72, y + 28, if (coverage == preview.titles.len) colors.good else colors.orange, "{d} ART", .{coverage});
     } else {
         drawText(x, y + 28, colors.dim, "LOOKING FOR GAMES...", .{});
     }
+    drawButton(layout.addGames(), if (state.drop_mode == .games) colors.orange else colors.border, "ADD GAMES");
+}
+
+fn drawCompactCatalog(x: f32, y: f32) void {
+    drawText(x, y, colors.pink, "MOD CATALOG", .{});
+    if (state.mod_registry) |*catalog| {
+        drawText(x, y + 28, if (state.registry_is_demo) colors.orange else colors.good, "{d} {s}", .{ catalog.entries().len, if (state.registry_is_demo) "DEMO" else "LOADED" });
+    } else {
+        drawText(x, y + 28, colors.dim, "NOT LOADED", .{});
+    }
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    drawButton(layout.loadCatalog(metrics.width), if (state.drop_mode == .registry) colors.orange else colors.border, "LOAD CATALOG");
 }
 
 fn drawCompactSd(x: f32, y: f32) void {
@@ -795,6 +823,12 @@ fn handleClick(x: f32, y: f32) void {
     if (selectGridTitle(width, metrics.height, x, y)) return;
     if (contains(layout.refresh(width), x, y)) {
         runRefresh();
+    } else if (contains(layout.addGames(), x, y)) {
+        state.drop_mode = .games;
+        setStatus(true, "Drop a ROM folder or RetroArch .lpl playlist anywhere on this window.", .{});
+    } else if (contains(layout.loadCatalog(width), x, y)) {
+        state.drop_mode = .registry;
+        setStatus(true, "Drop a registry JSON file anywhere on this window.", .{});
     } else if (contains(layout.sdSync(width), x, y)) {
         state.preview_destination = .direct_sd;
         runSync(.direct_sd);
@@ -885,6 +919,10 @@ fn selectGridTitle(width: f32, height: f32, x: f32, y: f32) bool {
 fn handleDrop() void {
     if (isBusy() or sapp.getNumDroppedFiles() <= 0) return;
     const path = sapp.getDroppedFilePath(0);
+    if (state.drop_mode == .registry or std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".json")) {
+        loadRegistry(path);
+        return;
+    }
     const kind: SourceKind = blk: {
         const stat = std.Io.Dir.cwd().statFile(state.threaded.io(), path, .{}) catch |err| {
             setStatus(false, "Could not inspect dropped path: {s}.", .{@errorName(err)});
@@ -906,6 +944,25 @@ fn handleDrop() void {
         .automatic => unreachable,
     }
     runRefresh();
+}
+
+fn loadRegistry(path: []const u8) void {
+    const allocator = std.heap.c_allocator;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(state.threaded.io(), path, allocator, .limited(registry.maximum_registry_size)) catch |err| {
+        setStatus(false, "Could not read that mod catalog: {s}.", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(bytes);
+    var parsed = registry.parse(allocator, bytes) catch {
+        setStatus(false, "That file is not a valid m64menu mod catalog.", .{});
+        return;
+    };
+    if (state.mod_registry) |*existing| existing.deinit();
+    state.mod_registry = parsed;
+    state.registry_is_demo = false;
+    state.selected_mod = 0;
+    state.drop_mode = .games;
+    setStatus(true, "Loaded {d} mod catalog entries. Use ADD GAMES or drop another folder to continue.", .{parsed.entries().len});
 }
 
 fn scrollTitles(delta: f32) void {
