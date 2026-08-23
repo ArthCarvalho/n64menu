@@ -3,6 +3,10 @@ const sokol = @import("sokol");
 const importer = @import("importer");
 const deployer = @import("deployer");
 const icon = @import("icon.zig");
+const launchbox = @import("launchbox");
+const sdcard = @import("sdcard");
+const startup = @import("startup");
+const ui_scale = @import("ui_scale");
 
 const sg = sokol.gfx;
 const sapp = sokol.app;
@@ -28,6 +32,8 @@ const colors = struct {
     const dim = Color{ .r = 178, .g = 168, .b = 198 };
     const good = Color{ .r = 76, .g = 220, .b = 130 };
     const bad = Color{ .r = 255, .g = 90, .b = 112 };
+    const black = Color{ .r = 0, .g = 0, .b = 0 };
+    const logo_glow = Color{ .r = 116, .g = 0, .b = 70 };
 };
 
 const FixedText = struct {
@@ -48,8 +54,25 @@ const FixedText = struct {
 };
 
 const PowerState = enum { unknown, off, on };
+const SyncDestination = enum { direct_sd, usb };
+const SourceKind = enum { automatic, playlist, directory };
 const TitleSyncState = enum { ADD, KEEP, UPDATE };
 const UiLibraryDiff = struct { add: usize = 0, keep: usize = 0, update: usize = 0, remove: usize = 0 };
+
+const CardSnapshot = struct {
+    root: []u8,
+    has_menu_rom: bool,
+    has_library: bool,
+    detected_count: usize,
+    library: ?sdcard.InstalledLibrary = null,
+
+    fn deinit(self: *CardSnapshot) void {
+        const allocator = std.heap.c_allocator;
+        allocator.free(self.root);
+        if (self.library) |*library| library.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 const DeviceSnapshot = struct {
     deployer_path: []u8,
@@ -71,14 +94,62 @@ const DeviceSnapshot = struct {
     }
 };
 
+const DirectoryScanResult = struct {
+    root: []u8,
+    preview: importer.ScanResult,
+
+    fn deinit(self: *DirectoryScanResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.root);
+        self.preview.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const LibraryScan = union(enum) {
+    retroarch: importer.RetroArchScanResult,
+    directory: DirectoryScanResult,
+
+    fn deinit(self: *LibraryScan, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .retroarch => |*scan| scan.deinit(allocator),
+            .directory => |*scan| scan.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+
+    fn preview(self: *const LibraryScan) *const importer.ScanResult {
+        return switch (self.*) {
+            .retroarch => |*scan| &scan.preview,
+            .directory => |*scan| &scan.preview,
+        };
+    }
+
+    fn sourcePath(self: *const LibraryScan) []const u8 {
+        return switch (self.*) {
+            .retroarch => |scan| scan.source.playlist_path,
+            .directory => |scan| scan.root,
+        };
+    }
+};
+
 const DiscoveryConfig = struct {
-    playlist_override: FixedText,
+    source_kind: SourceKind,
+    source_path: FixedText,
 };
 
 const SyncConfig = struct {
-    playlist_path: FixedText,
+    destination: SyncDestination,
+    source_kind: SourceKind,
+    source_path: FixedText,
+    source_fingerprint: [32]u8,
+    card_root: FixedText,
     deployer_path: FixedText,
     port: FixedText,
+};
+
+const CardOutcome = struct {
+    card: ?CardSnapshot = null,
+    err: ?[]const u8 = null,
 };
 
 const DeviceOutcome = struct {
@@ -87,15 +158,18 @@ const DeviceOutcome = struct {
 };
 
 const RefreshResult = struct {
-    scan: ?importer.RetroArchScanResult = null,
+    scan: ?LibraryScan = null,
+    card: ?CardSnapshot = null,
     device: ?DeviceSnapshot = null,
     scan_error: ?[]const u8 = null,
+    card_error: ?[]const u8 = null,
     device_error: ?[]const u8 = null,
-    used_override: bool = false,
+    source_kind: SourceKind = .automatic,
     override_target_blocked: bool = false,
 };
 
 const SyncResult = struct {
+    destination: SyncDestination,
     err: ?[]const u8 = null,
     cleanup_error: ?[]const u8 = null,
 };
@@ -109,11 +183,14 @@ const state = struct {
     var threaded: std.Io.Threaded = undefined;
     var io_ready = false;
     var pass_action: sg.PassAction = .{};
-    var scan: ?importer.RetroArchScanResult = null;
+    var scan: ?LibraryScan = null;
+    var card: ?CardSnapshot = null;
     var device: ?DeviceSnapshot = null;
-    var playlist_override = FixedText{};
-    var source_is_override = false;
+    var dropped_source_kind: SourceKind = .automatic;
+    var dropped_source_path = FixedText{};
+    var active_source_kind: SourceKind = .automatic;
     var scan_error: ?[]const u8 = null;
+    var card_error: ?[]const u8 = null;
     var device_error: ?[]const u8 = null;
     var status: [768]u8 = @splat(0);
     var status_len: usize = 0;
@@ -124,15 +201,26 @@ const state = struct {
     var worker_busy = false;
     var worker_done = false;
     var worker_result: ?WorkerResult = null;
+    var shutting_down = false;
+    var preview_destination: SyncDestination = .usb;
+    var startup_elapsed: f64 = 0;
 };
 
 const layout = struct {
     fn refresh(width: f32) Rect {
-        return .{ .x = width - 424, .y = 50, .w = 132, .h = 38 };
+        return .{ .x = width - 552, .y = 50, .w = 104, .h = 38 };
     }
 
-    fn syncButton(width: f32) Rect {
-        return .{ .x = width - 276, .y = 50, .w = 232, .h = 38 };
+    fn sdSync(width: f32) Rect {
+        return .{ .x = width - 436, .y = 50, .w = 190, .h = 38 };
+    }
+
+    fn usbSync(width: f32) Rect {
+        return .{ .x = width - 234, .y = 50, .w = 190, .h = 38 };
+    }
+
+    fn launchBox(width: f32, y: f32) Rect {
+        return .{ .x = width - 116, .y = y, .w = 72, .h = 18 };
     }
 };
 
@@ -163,12 +251,14 @@ fn currentProcessEnviron() std.process.Environ {
 }
 
 export fn cleanup() void {
+    state.shutting_down = true;
     if (state.worker) |worker| {
         worker.join();
         state.worker = null;
     }
     harvestWorker();
     clearScan();
+    clearCard();
     clearDevice();
     sdtx.shutdown();
     sgl.shutdown();
@@ -178,26 +268,33 @@ export fn cleanup() void {
 
 export fn frame() void {
     harvestWorker();
-    const width = sapp.widthf();
-    const height = sapp.heightf();
+    state.startup_elapsed += sapp.frameDuration();
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    const width = metrics.width;
+    const height = metrics.height;
     sgl.defaults();
     sgl.matrixModeProjection();
     sgl.ortho(0, width, height, 0, -1, 1);
     sgl.matrixModeModelview();
 
-    drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = height - 48 }, colors.panel);
-    drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 6 }, colors.pink);
-    drawText(44, 50, colors.yellow, "M64 RETROARCH SYNC", .{});
-    drawText(44, 78, colors.dim, "Automatic RetroArch -> SummerCart workflow", .{});
+    if (startup.frameAt(state.startup_elapsed).stage != .done) {
+        drawStartup(width, height);
+    } else {
+        drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = height - 48 }, colors.panel);
+        drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 6 }, colors.pink);
+        drawText(44, 50, colors.yellow, "M64 RETROARCH SYNC", .{});
+        drawText(44, 78, colors.dim, "Automatic RetroArch -> SummerCart workflow", .{});
 
-    const busy = isBusy();
-    drawButton(layout.refresh(width), if (busy) colors.border else colors.orange, "REFRESH");
-    drawButton(layout.syncButton(width), if (canSync() and !busy) colors.yellow else colors.border, "SYNC TO SUMMERCART");
+        const busy = isBusy();
+        drawButton(layout.refresh(width), if (busy) colors.border else colors.orange, "REFRESH");
+        drawButton(layout.sdSync(width), if (canSyncSd() and !busy) colors.yellow else colors.border, "SYNC TO SD (FAST)");
+        drawButton(layout.usbSync(width), if (canSyncUsb() and !busy) colors.orange else colors.border, "SYNC OVER USB (SLOW)");
 
-    drawRetroArchPanel(width);
-    drawDevicePanel(width);
-    drawStatus();
-    drawTitles(width, height);
+        drawRetroArchPanel(width);
+        drawDestinationPanels(width);
+        drawStatus();
+        drawTitles(width, height);
+    }
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
     sgl.draw();
@@ -206,75 +303,193 @@ export fn frame() void {
     sg.commit();
 }
 
+fn drawStartup(width: f32, height: f32) void {
+    const current = startup.frameAt(state.startup_elapsed);
+    drawRect(.{ .x = 0, .y = 0, .w = width, .h = height }, colors.black);
+    if (current.stage == .black) return;
+
+    const screen_scale = @min(width / 640.0, height / 480.0);
+    const scale = current.scale * screen_scale;
+    const center_x = width * 0.5;
+    const center_y = height * 0.46;
+    const x = center_x - startup.logo_width * scale * 0.5;
+    const y = center_y - startup.logo_height * scale * 0.5;
+
+    switch (current.stage) {
+        .outline => {
+            drawStartupOutline(x, y, scale, scale * 1.5, colors.logo_glow);
+            drawStartupOutline(x, y, scale, scale, colors.pink);
+            drawLogoRuns(&startup.outer_runs, x, y, scale, 0, startup.logo_height, colors.black);
+        },
+        .white => drawLogoRuns(&startup.outer_runs, x, y, scale, 0, startup.logo_height, colors.white),
+        .color => drawStartupLogo(x, y, scale, current.intensity),
+        .black, .done => {},
+    }
+}
+
+fn drawStartupOutline(x: f32, y: f32, scale: f32, offset: f32, color: Color) void {
+    const directions = [_][2]f32{
+        .{ -1, 0 },  .{ 1, 0 },  .{ 0, -1 }, .{ 0, 1 },
+        .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, 1 },
+    };
+    for (directions) |direction| {
+        drawLogoRuns(&startup.outer_runs, x + direction[0] * offset, y + direction[1] * offset, scale, 0, startup.logo_height, color);
+    }
+}
+
+fn drawStartupLogo(x: f32, y: f32, scale: f32, intensity: f32) void {
+    drawStartupOutline(x, y, scale, scale, colors.black);
+    const bands = [_]struct { top: f32, bottom: f32, edge: Color, fill: Color }{
+        .{ .top = 0, .bottom = startup.logo_height * 0.44, .edge = .{ .r = 235, .g = 190, .b = 0 }, .fill = colors.yellow },
+        .{ .top = startup.logo_height * 0.44, .bottom = startup.logo_height * 0.74, .edge = .{ .r = 235, .g = 104, .b = 0 }, .fill = colors.orange },
+        .{ .top = startup.logo_height * 0.74, .bottom = startup.logo_height, .edge = .{ .r = 230, .g = 25, .b = 137 }, .fill = colors.pink },
+    };
+    for (bands) |band| {
+        drawLogoRuns(&startup.outer_runs, x, y, scale, band.top, band.bottom, dimColor(band.edge, intensity));
+        drawLogoRuns(&startup.inner_runs, x, y, scale, band.top, band.bottom, dimColor(band.fill, intensity));
+    }
+}
+
+fn drawLogoRuns(runs: []const startup.Run, x: f32, y: f32, scale: f32, top: f32, bottom: f32, color: Color) void {
+    sgl.beginQuads();
+    sgl.c3b(color.r, color.g, color.b);
+    for (runs) |run| {
+        const run_top = @max(top, @as(f32, @floatFromInt(run.y)));
+        const run_bottom = @min(bottom, @as(f32, @floatFromInt(run.y)) + 1.0);
+        if (run_top >= run_bottom) continue;
+        const left = x + @as(f32, @floatFromInt(run.x)) * scale;
+        const right = left + @as(f32, @floatFromInt(run.width)) * scale;
+        const draw_top = y + run_top * scale;
+        const draw_bottom = y + run_bottom * scale;
+        sgl.v2f(left, draw_top);
+        sgl.v2f(right, draw_top);
+        sgl.v2f(right, draw_bottom);
+        sgl.v2f(left, draw_bottom);
+    }
+    sgl.end();
+}
+
+fn dimColor(color: Color, intensity: f32) Color {
+    return .{
+        .r = @intFromFloat(@round(@as(f32, @floatFromInt(color.r)) * intensity)),
+        .g = @intFromFloat(@round(@as(f32, @floatFromInt(color.g)) * intensity)),
+        .b = @intFromFloat(@round(@as(f32, @floatFromInt(color.b)) * intensity)),
+    };
+}
+
 fn drawRetroArchPanel(width: f32) void {
     const panel = Rect{ .x = 44, .y = 112, .w = width - 88, .h = 170 };
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
-    drawText(60, 128, colors.pink, "RETROARCH N64 LIBRARY", .{});
     if (state.scan) |scan| {
-        const source = scan.source;
-        const coverage = artworkCoverage(scan.preview);
-        drawLabelValue(60, 156, "PLAYLIST", tail(source.playlist_path, 108), colors.white);
-        drawLabelValue(60, 180, "SYSTEM", source.system_name, colors.white);
-        drawText(60, 204, colors.dim, "PLAYLIST ENTRIES", .{});
-        drawText(228, 204, colors.white, "{d}", .{source.playlist_entries});
-        drawText(330, 204, colors.dim, "RESOLVED", .{});
-        drawText(426, 204, colors.white, "{d}", .{source.resolved_entries});
-        drawText(520, 204, colors.dim, "SELECTED", .{});
-        drawText(616, 204, colors.yellow, "{d}/{d}", .{ scan.preview.titles.len, importer.maximum_titles });
-        if (source.unsupported_entries != 0) drawText(760, 204, colors.bad, "{d} UNSUPPORTED", .{source.unsupported_entries});
-        drawText(60, 232, colors.dim, "ARTWORK COVERAGE", .{});
-        drawText(228, 232, if (coverage == scan.preview.titles.len) colors.good else colors.orange, "{d}/{d}", .{ coverage, scan.preview.titles.len });
-        drawText(330, 232, colors.dim, "SOURCE", .{});
-        if (state.source_is_override) {
-            drawText(426, 232, colors.orange, "DROPPED FALLBACK", .{});
-        } else {
-            drawText(426, 232, colors.good, "AUTO DETECTED", .{});
+        const preview = scan.preview();
+        const coverage = artworkCoverage(preview.*);
+        drawText(60, 128, colors.pink, "{s}", .{switch (scan) {
+            .retroarch => "RETROARCH N64 LIBRARY",
+            .directory => "DROPPED ROM DIRECTORY",
+        }});
+        drawLabelValue(60, 156, "SOURCE", tail(scan.sourcePath(), 108), colors.white);
+        switch (scan) {
+            .retroarch => |retroarch| {
+                drawLabelValue(60, 180, "SYSTEM", retroarch.source.system_name, colors.white);
+                drawText(60, 204, colors.dim, "PLAYLIST ENTRIES", .{});
+                drawText(228, 204, colors.white, "{d}", .{retroarch.source.playlist_entries});
+                drawText(330, 204, colors.dim, "RESOLVED", .{});
+                drawText(426, 204, colors.white, "{d}", .{retroarch.source.resolved_entries});
+                if (retroarch.source.unsupported_entries != 0) drawText(760, 204, colors.bad, "{d} UNSUPPORTED", .{retroarch.source.unsupported_entries});
+            },
+            .directory => {
+                drawText(60, 180, colors.dim, "SCAN", .{});
+                drawText(228, 180, colors.white, "RECURSIVE .Z64 / .V64 / .N64", .{});
+                drawText(60, 204, colors.dim, "ROMS FOUND", .{});
+                drawText(228, 204, colors.white, "{d}", .{preview.titles.len});
+            },
         }
-        drawText(60, 256, colors.dim, "Drop an .lpl file only to provide a fallback when automatic detection fails.", .{});
+        drawText(520, 204, colors.dim, "SELECTED", .{});
+        drawText(616, 204, colors.yellow, "{d}", .{preview.titles.len});
+        drawText(60, 232, colors.dim, "ARTWORK COVERAGE", .{});
+        drawText(228, 232, if (coverage == preview.titles.len) colors.good else colors.orange, "{d}/{d}", .{ coverage, preview.titles.len });
+        drawText(330, 232, colors.dim, "MODE", .{});
+        drawText(426, 232, if (state.active_source_kind == .automatic) colors.good else colors.orange, "{s}", .{switch (state.active_source_kind) {
+            .automatic => "AUTO DETECTED",
+            .playlist => "DROPPED FALLBACK",
+            .directory => "DROPPED DIRECTORY",
+        }});
+        drawText(60, 256, colors.dim, "Drop a ROM directory to scan recursively, or an .lpl playlist as fallback.", .{});
     } else {
+        drawText(60, 128, colors.pink, "N64 LIBRARY", .{});
         drawText(60, 164, colors.dim, "Playlist path: not detected", .{});
         drawText(60, 192, colors.dim, "System: unavailable", .{});
-        drawText(60, 220, colors.dim, "Playlist entries: 0   Resolved: 0   Selected: 0/{d}", .{importer.maximum_titles});
-        drawText(60, 248, colors.orange, "Drop an .lpl file to retry with its parent directory as fallback.", .{});
+        drawText(60, 220, colors.dim, "Playlist entries: 0   Resolved: 0   Selected: 0", .{});
+        drawText(60, 248, colors.orange, "Drop a ROM directory, or an .lpl playlist as fallback.", .{});
     }
 }
 
-fn drawDevicePanel(width: f32) void {
-    const panel = Rect{ .x = 44, .y = 298, .w = width - 88, .h = 144 };
+fn drawDestinationPanels(width: f32) void {
+    const gap: f32 = 12;
+    const panel_width = (width - 88 - gap) / 2;
+    drawCardPanel(.{ .x = 44, .y = 298, .w = panel_width, .h = 144 });
+    drawUsbPanel(.{ .x = 44 + panel_width + gap, .y = 298, .w = panel_width, .h = 144 });
+}
+
+fn drawCardPanel(panel: Rect) void {
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
-    drawText(60, 314, colors.pink, "SUMMERCART", .{});
+    drawText(panel.x + 16, 314, colors.pink, "MOUNTED SD CARD (PREFERRED)", .{});
+    if (state.card) |card| {
+        drawLabelValue(panel.x + 16, 344, "ROOT", tail(card.root, 42), colors.white);
+        drawText(panel.x + 16, 370, colors.dim, "MENU ROM", .{});
+        drawText(panel.x + 184, 370, if (card.has_menu_rom) colors.good else colors.orange, "{s}", .{if (card.has_menu_rom) "PRESENT" else "MISSING"});
+        drawText(panel.x + 16, 396, colors.dim, "INSTALLED", .{});
+        if (card.library) |library| {
+            drawText(panel.x + 184, 396, colors.white, "{d}", .{library.titles.len});
+            drawDiff(panel.x + 16, 420, library.titles.len, libraryDiffFor(library.titles));
+        } else {
+            drawText(panel.x + 184, 396, colors.orange, "UNAVAILABLE", .{});
+        }
+        if (card.detected_count > 1) drawText(panel.x + panel.w - 146, 314, colors.orange, "USING 1 OF {d}", .{card.detected_count});
+    } else {
+        drawText(panel.x + 16, 346, colors.dim, "ROOT       NOT DETECTED", .{});
+        drawText(panel.x + 16, 372, colors.dim, "MENU ROM   UNAVAILABLE", .{});
+        drawText(panel.x + 16, 398, colors.dim, "INSTALLED  0", .{});
+        drawText(panel.x + 16, 420, colors.orange, "INSERT OR MOUNT A SUMMERCART SD CARD", .{});
+    }
+}
+
+fn drawUsbPanel(panel: Rect) void {
+    drawRect(panel, colors.inset);
+    drawOutline(panel, colors.border, 2);
+    drawText(panel.x + 16, 314, colors.pink, "USB SUMMERCART", .{});
     if (state.device) |device| {
-        drawLabelValue(60, 344, "SERIAL", device.serial, colors.white);
-        drawLabelValue(60, 370, "PORT", tail(device.port, 108), colors.white);
-        drawText(60, 396, colors.dim, "POWER", .{});
+        drawLabelValue(panel.x + 16, 344, "SERIAL", device.serial, colors.white);
+        drawLabelValue(panel.x + 16, 370, "PORT", tail(device.port, 42), colors.white);
+        drawText(panel.x + 16, 396, colors.dim, "POWER", .{});
         const power_color = switch (device.power) {
             .off => colors.good,
             .on => colors.bad,
             .unknown => colors.orange,
         };
-        drawText(156, 396, power_color, "{s}", .{powerLabel(device.power)});
-        drawText(330, 396, colors.dim, "BACKEND", .{});
-        drawText(426, 396, colors.white, "{s}", .{device.backend});
+        drawText(panel.x + 184, 396, power_color, "{s}", .{powerLabel(device.power)});
         if (device.library) |library| {
-            const diff = libraryDiff();
-            drawText(60, 420, colors.dim, "INSTALLED", .{});
-            drawText(156, 420, colors.white, "{d}", .{library.titles.len});
-            drawText(250, 420, colors.good, "+{d} ADD", .{diff.add});
-            drawText(370, 420, colors.white, "{d} KEEP", .{diff.keep});
-            drawText(498, 420, colors.orange, "{d} UPDATE", .{diff.update});
-            drawText(650, 420, colors.bad, "-{d} HIDE", .{diff.remove});
+            drawDiff(panel.x + 16, 420, library.titles.len, libraryDiffFor(library.titles));
         } else {
-            drawText(60, 420, colors.orange, "INSTALLED LIBRARY UNAVAILABLE", .{});
+            drawText(panel.x + 16, 420, colors.orange, "INSTALLED LIBRARY UNAVAILABLE", .{});
         }
-        if (device.detected_count > 1) drawText(width - 238, 314, colors.orange, "USING 1 OF {d} CARTS", .{device.detected_count});
+        if (device.detected_count > 1) drawText(panel.x + panel.w - 146, 314, colors.orange, "USING 1 OF {d}", .{device.detected_count});
     } else {
-        drawText(60, 346, colors.dim, "SERIAL   NOT DETECTED", .{});
-        drawText(60, 372, colors.dim, "PORT     UNAVAILABLE", .{});
-        drawText(60, 398, colors.bad, "POWER    UNAVAILABLE (NO CART)", .{});
-        drawText(60, 420, colors.dim, "INSTALLED 0", .{});
+        drawText(panel.x + 16, 346, colors.dim, "SERIAL     NOT DETECTED", .{});
+        drawText(panel.x + 16, 372, colors.dim, "PORT       UNAVAILABLE", .{});
+        drawText(panel.x + 16, 398, colors.bad, "POWER      UNAVAILABLE", .{});
+        drawText(panel.x + 16, 420, colors.dim, "INSTALLED  0", .{});
     }
+}
+
+fn drawDiff(x: f32, y: f32, installed: usize, diff: UiLibraryDiff) void {
+    drawText(x, y, colors.dim, "{d} INST", .{installed});
+    drawText(x + 80, y, colors.good, "+{d} ADD", .{diff.add});
+    drawText(x + 176, y, colors.white, "{d} KEEP", .{diff.keep});
+    drawText(x + 272, y, colors.orange, "{d} UPDATE", .{diff.update});
+    drawText(x + 384, y, colors.bad, "-{d} HIDE", .{diff.remove});
 }
 
 fn drawTitles(width: f32, height: f32) void {
@@ -285,16 +500,24 @@ fn drawTitles(width: f32, height: f32) void {
     drawText(width - 282, top, colors.dim, "ARTWORK STATUS", .{});
     drawRect(.{ .x = 44, .y = top + 22, .w = width - 88, .h = 2 }, colors.border);
     if (state.scan) |scan| {
-        const titles = scan.preview.titles;
-        const rows = @max(@as(usize, 1), @as(usize, @intFromFloat((height - top - 48) / 24)));
+        const titles = scan.preview().titles;
+        const available = height - top - 48;
+        if (available <= 0) return;
+        const rows = @max(@as(usize, 1), @as(usize, @intFromFloat(available / 24)));
         const end = @min(titles.len, state.preview_scroll + rows);
         for (titles[state.preview_scroll..end], 0..) |title, row| {
             const y = top + 36 + @as(f32, @floatFromInt(row)) * 24;
-            drawText(44, y, colors.yellow, "{s}", .{title.id});
-            drawText(100, y, colors.white, "{s}", .{head(title.display_name, 82)});
+            drawText(44, y, colors.yellow, "{s}", .{importer.titleIdSlice(&title.id)});
+            const missing_artwork = title.artwork_path == null;
+            drawText(100, y, if (missing_artwork) colors.orange else colors.white, "{s}", .{head(title.display_name, 82)});
             const sync_state = titleSyncState(title);
             drawText(width - 360, y, syncStateColor(sync_state), "{s}", .{@tagName(sync_state)});
-            drawText(width - 282, y, if (title.artwork_path == null) colors.orange else colors.good, "{s}", .{@tagName(title.artwork_status)});
+            if (missing_artwork) {
+                drawText(width - 282, y, colors.orange, "MISSING", .{});
+                drawButton(layout.launchBox(width, y - 7), colors.yellow, "SEARCH");
+            } else {
+                drawText(width - 282, y, colors.good, "{s}", .{@tagName(title.artwork_status)});
+            }
         }
     } else {
         drawText(44, top + 36, colors.dim, "No resolved N64 titles.", .{});
@@ -303,12 +526,14 @@ fn drawTitles(width: f32, height: f32) void {
 
 export fn event(event_ptr: [*c]const sapp.Event) void {
     const input = event_ptr.*;
+    if (startup.frameAt(state.startup_elapsed).stage != .done) return;
+    const scale = ui_scale.metrics(sapp.widthf(), sapp.heightf()).scale;
     switch (input.type) {
-        .MOUSE_DOWN => if (input.mouse_button == .LEFT) handleClick(input.mouse_x, input.mouse_y),
+        .MOUSE_DOWN => if (input.mouse_button == .LEFT) handleClick(input.mouse_x / scale, input.mouse_y / scale),
         .MOUSE_SCROLL => scrollTitles(input.scroll_y),
         .KEY_DOWN => if (!input.key_repeat) switch (input.key_code) {
             .F5 => runRefresh(),
-            .ENTER => runSync(),
+            .ENTER => runPreferredSync(),
             .ESCAPE => sapp.requestQuit(),
             else => {},
         },
@@ -319,38 +544,78 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
 
 fn handleClick(x: f32, y: f32) void {
     if (isBusy()) return;
-    const width = sapp.widthf();
+    const width = ui_scale.metrics(sapp.widthf(), sapp.heightf()).width;
+    if (searchMissingArtwork(width, x, y)) return;
     if (contains(layout.refresh(width), x, y)) {
         runRefresh();
-    } else if (contains(layout.syncButton(width), x, y)) {
-        runSync();
+    } else if (contains(layout.sdSync(width), x, y)) {
+        state.preview_destination = .direct_sd;
+        runSync(.direct_sd);
+    } else if (contains(layout.usbSync(width), x, y)) {
+        state.preview_destination = .usb;
+        runSync(.usb);
     }
+}
+
+fn searchMissingArtwork(width: f32, x: f32, y: f32) bool {
+    const scan = state.scan orelse return false;
+    const titles = scan.preview().titles;
+    const top: f32 = 510;
+    const height = ui_scale.metrics(sapp.widthf(), sapp.heightf()).height;
+    if (height <= top + 40) return false;
+    const available = height - top - 48;
+    if (available <= 0) return false;
+    const rows = @max(@as(usize, 1), @as(usize, @intFromFloat(available / 24)));
+    const end = @min(titles.len, state.preview_scroll + rows);
+    for (titles[state.preview_scroll..end], 0..) |title, row| {
+        if (title.artwork_path != null) continue;
+        const row_y = top + 36 + @as(f32, @floatFromInt(row)) * 24;
+        if (!contains(layout.launchBox(width, row_y - 7), x, y)) continue;
+        launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, title.display_name) catch |err| {
+            setStatus(false, "Could not open LaunchBox search: {s}.", .{@errorName(err)});
+            return true;
+        };
+        setStatus(true, "Opened LaunchBox search for {s}.", .{title.display_name});
+        return true;
+    }
+    return false;
 }
 
 fn handleDrop() void {
     if (isBusy() or sapp.getNumDroppedFiles() <= 0) return;
     const path = sapp.getDroppedFilePath(0);
-    if (!std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".lpl")) {
-        setStatus(false, "Only a RetroArch .lpl playlist can be used as a fallback.", .{});
+    const kind: SourceKind = blk: {
+        const stat = std.Io.Dir.cwd().statFile(state.threaded.io(), path, .{}) catch |err| {
+            setStatus(false, "Could not inspect dropped path: {s}.", .{@errorName(err)});
+            return;
+        };
+        if (stat.kind == .directory) break :blk .directory;
+        if (stat.kind == .file and std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".lpl")) break :blk .playlist;
+        setStatus(false, "Drop a ROM directory or a RetroArch .lpl playlist.", .{});
+        return;
+    };
+    if (!state.dropped_source_path.set(path)) {
+        setStatus(false, "Dropped source path is too long.", .{});
         return;
     }
-    if (!state.playlist_override.set(path)) {
-        setStatus(false, "Dropped playlist path is too long.", .{});
-        return;
+    state.dropped_source_kind = kind;
+    switch (kind) {
+        .directory => setStatus(true, "Scanning dropped directory recursively...", .{}),
+        .playlist => setStatus(true, "Saved dropped playlist fallback; refreshing automatic detection first...", .{}),
+        .automatic => unreachable,
     }
-    setStatus(true, "Saved dropped playlist fallback; refreshing automatic detection first...", .{});
     runRefresh();
 }
 
 fn scrollTitles(delta: f32) void {
     const scan = state.scan orelse return;
-    if (delta < 0 and state.preview_scroll + 1 < scan.preview.titles.len) state.preview_scroll += 1;
+    if (delta < 0 and state.preview_scroll + 1 < scan.preview().titles.len) state.preview_scroll += 1;
     if (delta > 0 and state.preview_scroll > 0) state.preview_scroll -= 1;
 }
 
 fn runRefresh() void {
     if (isBusy()) return;
-    const config = DiscoveryConfig{ .playlist_override = state.playlist_override };
+    const config = DiscoveryConfig{ .source_kind = state.dropped_source_kind, .source_path = state.dropped_source_path };
     if (!beginWorker()) return;
     state.worker = std.Thread.spawn(.{}, refreshWorker, .{config}) catch |err| {
         cancelWorker();
@@ -360,39 +625,66 @@ fn runRefresh() void {
     setStatus(true, "Detecting RetroArch and SummerCart...", .{});
 }
 
-fn runSync() void {
+fn runPreferredSync() void {
+    if (state.card != null) {
+        runSync(.direct_sd);
+    } else {
+        runSync(.usb);
+    }
+}
+
+fn runSync(destination: SyncDestination) void {
     if (isBusy()) return;
     const scan = state.scan orelse {
-        setStatus(false, "Sync refused: no RetroArch N64 playlist is ready.", .{});
+        setStatus(false, "Sync refused: no N64 library is ready.", .{});
         return;
     };
-    const device = state.device orelse {
-        setStatus(false, "Sync refused: no SummerCart is detected.", .{});
-        return;
-    };
-    switch (device.power) {
-        .on => {
-            setStatus(false, "Sync refused: console is powered on. Power it off, then Refresh.", .{});
-            return;
-        },
-        .unknown => {
-            setStatus(false, "Sync refused: SummerCart power state is unknown. Refresh and retry.", .{});
-            return;
-        },
-        .off => {},
-    }
 
     var config = SyncConfig{
-        .playlist_path = .{},
+        .destination = destination,
+        .source_kind = state.active_source_kind,
+        .source_path = .{},
+        .source_fingerprint = libraryFingerprint(scan.preview().titles),
+        .card_root = .{},
         .deployer_path = .{},
         .port = .{},
     };
-    if (!config.playlist_path.set(scan.source.playlist_path) or
-        !config.deployer_path.set(device.deployer_path) or
-        !config.port.set(device.port))
-    {
+    if (!config.source_path.set(scan.sourcePath())) {
         setStatus(false, "Sync refused: a detected path exceeds the supported path length.", .{});
         return;
+    }
+    switch (destination) {
+        .direct_sd => {
+            const card = state.card orelse {
+                setStatus(false, "Sync refused: no mounted SummerCart SD card is detected.", .{});
+                return;
+            };
+            if (!config.card_root.set(card.root)) {
+                setStatus(false, "Sync refused: the mounted card path is too long.", .{});
+                return;
+            }
+        },
+        .usb => {
+            const device = state.device orelse {
+                setStatus(false, "Sync refused: no USB SummerCart is detected.", .{});
+                return;
+            };
+            switch (device.power) {
+                .on => {
+                    setStatus(false, "Sync refused: console is powered on. Power it off, then Refresh.", .{});
+                    return;
+                },
+                .unknown => {
+                    setStatus(false, "Sync refused: SummerCart power state is unknown. Refresh and retry.", .{});
+                    return;
+                },
+                .off => {},
+            }
+            if (!config.deployer_path.set(device.deployer_path) or !config.port.set(device.port)) {
+                setStatus(false, "Sync refused: a detected USB path exceeds the supported path length.", .{});
+                return;
+            }
+        },
     }
     if (!beginWorker()) return;
     state.worker = std.Thread.spawn(.{}, syncWorker, .{config}) catch |err| {
@@ -400,7 +692,10 @@ fn runSync() void {
         setStatus(false, "Could not start sync: {s}", .{@errorName(err)});
         return;
     };
-    setStatus(true, "Checking SummerCart power state...", .{});
+    switch (destination) {
+        .direct_sd => setStatus(true, "Preparing fast direct SD sync...", .{}),
+        .usb => setStatus(true, "Checking SummerCart power state...", .{}),
+    }
 }
 
 fn refreshWorker(config: DiscoveryConfig) void {
@@ -408,41 +703,86 @@ fn refreshWorker(config: DiscoveryConfig) void {
     const io = state.threaded.io();
     var result = RefreshResult{};
 
-    result.scan = importer.scanRetroArchLibrary(allocator, io, .{ .environ = state.threaded.environ.process_environ }) catch |auto_err| fallback: {
-        if (config.playlist_override.len == 0) {
-            result.scan_error = @errorName(auto_err);
-            break :fallback null;
-        }
-        const override_path = config.playlist_override.slice();
-        const parent = std.fs.path.dirname(override_path) orelse {
-            result.scan_error = "InvalidPlaylistPath";
-            break :fallback null;
-        };
-        const roots = [_][]const u8{parent};
-        var fallback_result = importer.scanRetroArchLibrary(allocator, io, .{
-            .search_roots = &roots,
-            .maximum_search_depth = 0,
-            .environ = state.threaded.environ.process_environ,
-        }) catch |fallback_err| {
-            result.scan_error = @errorName(fallback_err);
-            result.override_target_blocked = !std.ascii.eqlIgnoreCase(std.fs.path.basename(override_path), expected_playlist_name);
-            break :fallback null;
-        };
-        if (!std.ascii.eqlIgnoreCase(fallback_result.source.playlist_path, override_path)) {
-            fallback_result.deinit(allocator);
-            result.scan_error = "ExactPlaylistTargetUnavailable";
-            result.override_target_blocked = true;
-            break :fallback null;
-        }
-        result.used_override = true;
-        break :fallback fallback_result;
+    result.scan = switch (config.source_kind) {
+        .directory => directory: {
+            const root = config.source_path.slice();
+            const preview = importer.scanLibrary(allocator, io, .{ .rom_root = root, .recursive = true }) catch |err| {
+                result.scan_error = @errorName(err);
+                break :directory null;
+            };
+            result.source_kind = .directory;
+            break :directory .{ .directory = .{
+                .root = allocator.dupe(u8, root) catch {
+                    var owned_preview = preview;
+                    owned_preview.deinit(allocator);
+                    result.scan_error = "OutOfMemory";
+                    break :directory null;
+                },
+                .preview = preview,
+            } };
+        },
+        .automatic, .playlist => retroarch: {
+            const detected = importer.scanRetroArchLibrary(allocator, io, .{ .environ = state.threaded.environ.process_environ }) catch |auto_err| fallback: {
+                if (config.source_kind != .playlist or config.source_path.len == 0) {
+                    result.scan_error = @errorName(auto_err);
+                    break :fallback null;
+                }
+                const override_path = config.source_path.slice();
+                const parent = std.fs.path.dirname(override_path) orelse {
+                    result.scan_error = "InvalidPlaylistPath";
+                    break :fallback null;
+                };
+                const roots = [_][]const u8{parent};
+                var fallback_result = importer.scanRetroArchLibrary(allocator, io, .{
+                    .search_roots = &roots,
+                    .maximum_search_depth = 0,
+                    .environ = state.threaded.environ.process_environ,
+                }) catch |fallback_err| {
+                    result.scan_error = @errorName(fallback_err);
+                    result.override_target_blocked = !std.ascii.eqlIgnoreCase(std.fs.path.basename(override_path), expected_playlist_name);
+                    break :fallback null;
+                };
+                if (!std.ascii.eqlIgnoreCase(fallback_result.source.playlist_path, override_path)) {
+                    fallback_result.deinit(allocator);
+                    result.scan_error = "ExactPlaylistTargetUnavailable";
+                    result.override_target_blocked = true;
+                    break :fallback null;
+                }
+                result.source_kind = .playlist;
+                break :fallback fallback_result;
+            };
+            break :retroarch if (detected) |scan| LibraryScan{ .retroarch = scan } else null;
+        },
     };
 
+    var card_outcome = discoverCard(allocator, io);
+    result.card = card_outcome.card;
+    result.card_error = card_outcome.err;
+    card_outcome.card = null;
     var device_outcome = discoverDevice(allocator, io);
     result.device = device_outcome.device;
     result.device_error = device_outcome.err;
     device_outcome.device = null;
     finishWorker(.{ .refresh = result });
+}
+
+fn discoverCard(allocator: std.mem.Allocator, io: std.Io) CardOutcome {
+    var cards = sdcard.detectCards(allocator, io) catch |err| return .{ .err = @errorName(err) };
+    defer cards.deinit(allocator);
+    if (cards.cards.len == 0) return .{ .err = "NoMountedCardFound" };
+    if (cards.cards.len != 1) return .{ .err = "MultipleMountedCardsFound" };
+
+    const detected = cards.cards[0];
+    var snapshot = CardSnapshot{
+        .root = allocator.dupe(u8, detected.root) catch return .{ .err = "OutOfMemory" },
+        .has_menu_rom = detected.has_menu_rom,
+        .has_library = detected.has_library,
+        .detected_count = cards.cards.len,
+    };
+    snapshot.library = sdcard.readInstalledLibrary(allocator, io, snapshot.root) catch |err| {
+        return .{ .card = snapshot, .err = @errorName(err) };
+    };
+    return .{ .card = snapshot };
 }
 
 fn discoverDevice(allocator: std.mem.Allocator, io: std.Io) DeviceOutcome {
@@ -502,19 +842,21 @@ fn discoverDevice(allocator: std.mem.Allocator, io: std.Io) DeviceOutcome {
 fn syncWorker(config: SyncConfig) void {
     const allocator = std.heap.c_allocator;
     const io = state.threaded.io();
-    var result = SyncResult{};
+    var result = SyncResult{ .destination = config.destination };
 
-    var info = deployer.probeDevice(allocator, io, config.deployer_path.slice(), config.port.slice()) catch |err| {
-        result.err = @errorName(err);
-        finishWorker(.{ .sync = result });
-        return;
-    };
-    const powered_on = info.console_powered_on;
-    info.deinit(allocator);
-    if (powered_on) {
-        result.err = "ConsolePoweredOn";
-        finishWorker(.{ .sync = result });
-        return;
+    if (config.destination == .usb) {
+        var info = deployer.probeDevice(allocator, io, config.deployer_path.slice(), config.port.slice()) catch |err| {
+            result.err = @errorName(err);
+            finishWorker(.{ .sync = result });
+            return;
+        };
+        const powered_on = info.console_powered_on;
+        info.deinit(allocator);
+        if (powered_on) {
+            result.err = "ConsolePoweredOn";
+            finishWorker(.{ .sync = result });
+            return;
+        }
     }
 
     const staging = createStagingDirectory(allocator, io) catch |err| {
@@ -538,28 +880,53 @@ fn syncFromStaging(
     staging: []const u8,
     config: *const SyncConfig,
 ) !void {
-    const playlist_path = config.playlist_path.slice();
-    const parent = std.fs.path.dirname(playlist_path) orelse return error.InvalidPlaylistPath;
-    const roots = [_][]const u8{parent};
-    var imported = try importer.importRetroArchLibrary(allocator, io, staging, .{
-        .search_roots = &roots,
-        .maximum_search_depth = 0,
-        .environ = state.threaded.environ.process_environ,
-    }, .{ .context = null, .callback = importProgress });
-    defer imported.deinit(allocator);
-    if (!std.ascii.eqlIgnoreCase(imported.source.playlist_path, playlist_path)) return error.PlaylistChanged;
+    switch (config.source_kind) {
+        .directory => {
+            var imported = try importer.importLibrary(allocator, io, .{
+                .output_root = staging,
+                .rom_root = config.source_path.slice(),
+                .recursive = true,
+            }, .{ .context = null, .callback = importProgress });
+            defer imported.deinit(allocator);
+            if (!std.mem.eql(u8, &libraryFingerprint(imported.titles), &config.source_fingerprint)) return error.SourceChanged;
+        },
+        .automatic, .playlist => {
+            const playlist_path = config.source_path.slice();
+            const parent = std.fs.path.dirname(playlist_path) orelse return error.InvalidPlaylistPath;
+            const roots = [_][]const u8{parent};
+            var imported = try importer.importRetroArchLibrary(allocator, io, staging, .{
+                .search_roots = &roots,
+                .maximum_search_depth = 0,
+                .environ = state.threaded.environ.process_environ,
+            }, .{ .context = null, .callback = importProgress });
+            defer imported.deinit(allocator);
+            if (!std.ascii.eqlIgnoreCase(imported.source.playlist_path, playlist_path)) return error.PlaylistChanged;
+            if (!std.mem.eql(u8, &libraryFingerprint(imported.preview.titles), &config.source_fingerprint)) return error.SourceChanged;
+        },
+    }
 
-    const menu_root = try std.fs.path.join(allocator, &.{ staging, "menu" });
-    defer allocator.free(menu_root);
     const menu_rom = (try findMenuRom(allocator, io)) orelse return error.Sc64MenuNotFound;
     defer allocator.free(menu_rom);
-    setStatus(true, "Staging complete; syncing to SummerCart...", .{});
-    try deployer.sync(allocator, io, .{
-        .deployer_path = config.deployer_path.slice(),
-        .port = config.port.slice(),
-        .menu_root = menu_root,
-        .sc64menu_path = menu_rom,
-    }, .{ .context = null, .callback = deployProgress });
+    const staged_rom = try std.fs.path.join(allocator, &.{ staging, "sc64menu.n64" });
+    defer allocator.free(staged_rom);
+    try std.Io.Dir.copyFileAbsolute(menu_rom, staged_rom, io, .{});
+    switch (config.destination) {
+        .direct_sd => {
+            setStatus(true, "Staging complete; copying directly to mounted SD...", .{});
+            try sdcard.syncFromStaging(allocator, io, staging, config.card_root.slice(), .{
+                .context = null,
+                .callback = sdProgress,
+            });
+        },
+        .usb => {
+            setStatus(true, "Staging complete; syncing over USB...", .{});
+            try deployer.sync(allocator, io, .{
+                .deployer_path = config.deployer_path.slice(),
+                .port = config.port.slice(),
+                .staging_root = staging,
+            }, .{ .context = null, .callback = deployProgress });
+        },
+    }
 }
 
 fn findMenuRom(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
@@ -622,6 +989,10 @@ fn deployProgress(_: ?*anyopaque, progress_event: deployer.ProgressEvent) void {
     setStatus(true, "Syncing {d}/{d}: {s}", .{ progress_event.current, progress_event.total, progress_event.path });
 }
 
+fn sdProgress(_: ?*anyopaque, progress_event: sdcard.ProgressEvent) void {
+    setStatus(true, "Copying {d}/{d}: {s}", .{ progress_event.current, progress_event.total, progress_event.path });
+}
+
 fn beginWorker() bool {
     lockWorker();
     defer unlockWorker();
@@ -669,49 +1040,71 @@ fn harvestWorker() void {
 
 fn harvestRefresh(result: *RefreshResult) void {
     clearScan();
+    clearCard();
     clearDevice();
     state.scan = result.scan;
     result.scan = null;
+    state.card = result.card;
+    result.card = null;
     state.device = result.device;
     result.device = null;
     state.scan_error = result.scan_error;
+    state.card_error = result.card_error;
     state.device_error = result.device_error;
-    state.source_is_override = result.used_override;
+    state.active_source_kind = result.source_kind;
     state.preview_scroll = 0;
+    state.preview_destination = if (state.card != null) .direct_sd else .usb;
 
     if (result.override_target_blocked) {
         setStatus(false, "Playlist fallback failed: core can only target {s}; exact arbitrary .lpl targeting is unavailable.", .{expected_playlist_name});
     } else if (state.scan == null) {
-        setStatus(false, "RetroArch detection failed: {s}. SummerCart: {s}.", .{ state.scan_error orelse "UnknownError", deviceSummary() });
+        setStatus(false, "RetroArch detection failed: {s}. SD: {s}; USB: {s}.", .{ state.scan_error orelse "UnknownError", cardSummary(), deviceSummary() });
+    } else if (state.card != null) {
+        if (state.card_error) |name| {
+            setStatus(false, "Mounted SD detected, but its installed library could not be read: {s}.", .{name});
+        } else {
+            setStatus(true, "Ready for fast direct SD sync of {d} title(s).", .{state.scan.?.preview().titles.len});
+        }
     } else if (state.device == null) {
-        setStatus(false, "RetroArch library ready; SummerCart detection failed: {s}.", .{state.device_error orelse "UnknownError"});
+        setStatus(false, "N64 library ready; no mounted SD or USB SummerCart detected.", .{});
     } else if (state.device.?.power == .on) {
-        setStatus(false, "Library and SummerCart detected, but sync is blocked while the console is powered on.", .{});
+        setStatus(false, "USB SummerCart detected, but sync is blocked while the console is powered on.", .{});
     } else if (state.device.?.power == .unknown) {
-        setStatus(false, "Library and SummerCart detected, but power probe failed: {s}.", .{state.device_error orelse "UnknownError"});
+        setStatus(false, "USB SummerCart detected, but power probe failed: {s}.", .{state.device_error orelse "UnknownError"});
     } else if (state.device_error != null) {
-        setStatus(false, "Ready to sync, but temporary metadata cleanup failed: {s}.", .{state.device_error.?});
+        setStatus(false, "USB is available, but its installed library could not be read: {s}.", .{state.device_error.?});
     } else {
-        setStatus(true, "Ready to sync {d} title(s) to SummerCart.", .{state.scan.?.preview.titles.len});
+        setStatus(true, "Ready to sync {d} title(s) over USB.", .{state.scan.?.preview().titles.len});
     }
 }
 
 fn harvestSync(result: SyncResult) void {
+    const destination = switch (result.destination) {
+        .direct_sd => "Direct SD sync",
+        .usb => "USB sync",
+    };
     if (result.err) |name| {
         if (std.mem.eql(u8, name, "ConsolePoweredOn")) {
             if (state.device) |*device| device.power = .on;
-            setStatus(false, "Sync refused: console is powered on.", .{});
+            setStatus(false, "USB sync refused: console is powered on.", .{});
         } else if (result.cleanup_error) |cleanup_name| {
-            setStatus(false, "Sync failed: {s}; staging cleanup also failed: {s}.", .{ name, cleanup_name });
+            setStatus(false, "{s} failed: {s}; staging cleanup also failed: {s}.", .{ destination, name, cleanup_name });
         } else {
-            setStatus(false, "Sync failed: {s}.", .{name});
+            setStatus(false, "{s} failed: {s}.", .{ destination, name });
         }
     } else if (result.cleanup_error) |name| {
-        setStatus(false, "Sync completed, but private staging cleanup failed: {s}.", .{name});
+        setStatus(false, "{s} completed, but private staging cleanup failed: {s}.", .{ destination, name });
     } else {
-        setStatus(true, "Sync completed; refreshing installed library...", .{});
-        runRefresh();
+        if (!state.shutting_down) {
+            setStatus(true, "{s} completed; refreshing installed libraries...", .{destination});
+            runRefresh();
+        }
     }
+}
+
+fn cardSummary() []const u8 {
+    if (state.card) |card| return card.root;
+    return state.card_error orelse "not detected";
 }
 
 fn deviceSummary() []const u8 {
@@ -719,36 +1112,48 @@ fn deviceSummary() []const u8 {
     return state.device_error orelse "not detected";
 }
 
-fn canSync() bool {
+fn canSyncSd() bool {
+    return state.scan != null and state.card != null;
+}
+
+fn canSyncUsb() bool {
     return state.scan != null and state.device != null and state.device.?.power == .off;
 }
 
 fn titleSyncState(title: importer.Title) TitleSyncState {
-    const device = state.device orelse return .ADD;
-    const library = device.library orelse return .ADD;
-    for (library.titles) |installed| {
-        if (!std.mem.eql(u8, &installed.id, &title.id)) continue;
+    switch (state.preview_destination) {
+        .direct_sd => if (state.card) |card| {
+            if (card.library) |library| return titleSyncStateFor(title, library.titles);
+        },
+        .usb => if (state.device) |device| {
+            if (device.library) |library| return titleSyncStateFor(title, library.titles);
+        },
+    }
+    return .ADD;
+}
+
+fn titleSyncStateFor(title: importer.Title, installed_titles: anytype) TitleSyncState {
+    for (installed_titles) |installed| {
+        if (!std.mem.eql(u8, installed.idSlice(), importer.titleIdSlice(&title.id))) continue;
         // Legacy libraries did not have name sidecars, so the deployer falls back
         // to the ID. Matching IDs still mean the ROM is already installed.
-        if (std.mem.eql(u8, installed.name, &installed.id) or asciiNameEqual(installed.name, title.display_name)) return .KEEP;
+        if (std.mem.eql(u8, installed.name, installed.idSlice()) or asciiNameEqual(installed.name, title.display_name)) return .KEEP;
         return .UPDATE;
     }
     return .ADD;
 }
 
-fn libraryDiff() UiLibraryDiff {
+fn libraryDiffFor(installed_titles: anytype) UiLibraryDiff {
     var result = UiLibraryDiff{};
     const scan = state.scan orelse return result;
-    const device = state.device orelse return result;
-    const library = device.library orelse return result;
-    for (scan.preview.titles) |title| switch (titleSyncState(title)) {
+    for (scan.preview().titles) |title| switch (titleSyncStateFor(title, installed_titles)) {
         .ADD => result.add += 1,
         .KEEP => result.keep += 1,
         .UPDATE => result.update += 1,
     };
-    for (library.titles) |installed| {
+    for (installed_titles) |installed| {
         var found = false;
-        for (scan.preview.titles) |title| if (std.mem.eql(u8, &installed.id, &title.id)) {
+        for (scan.preview().titles) |title| if (std.mem.eql(u8, installed.idSlice(), importer.titleIdSlice(&title.id))) {
             found = true;
             break;
         };
@@ -789,9 +1194,25 @@ fn artworkCoverage(scan: importer.ScanResult) usize {
     return count;
 }
 
+fn libraryFingerprint(titles: []const importer.Title) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (titles) |title| {
+        hash.update(importer.titleIdSlice(&title.id));
+        hash.update("\x00");
+        hash.update(title.display_name);
+        hash.update("\x00");
+    }
+    return hash.finalResult();
+}
+
 fn clearScan() void {
     if (state.scan) |*scan| scan.deinit(std.heap.c_allocator);
     state.scan = null;
+}
+
+fn clearCard() void {
+    if (state.card) |*card| card.deinit();
+    state.card = null;
 }
 
 fn clearDevice() void {
@@ -863,7 +1284,8 @@ fn drawButton(rect: Rect, color: Color, label: []const u8) void {
 }
 
 fn drawText(x: f32, y: f32, color: Color, comptime format: []const u8, args: anytype) void {
-    sdtx.canvas(sapp.widthf(), sapp.heightf());
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    sdtx.canvas(metrics.width, metrics.height);
     sdtx.font(0);
     sdtx.color3b(color.r, color.g, color.b);
     sdtx.pos(x / 8.0, y / 8.0);

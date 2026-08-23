@@ -17,7 +17,6 @@ $ErrorActionPreference = "Stop"
 
 $RomExtensions = @(".n64", ".v64", ".z64")
 $ImageExtensions = @(".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff")
-$MaximumTitles = 40
 
 function Get-Directory([string]$Path, [string]$Name) {
     if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.Directory]::Exists($Path)) {
@@ -189,7 +188,7 @@ function Get-RomId([string]$Path) {
             $null = $algorithm.TransformBlock($buffer, 0, $count, $buffer, 0)
         }
         $null = $algorithm.TransformFinalBlock([byte[]]::new(0), 0, 0)
-        return [System.BitConverter]::ToString($algorithm.Hash).Replace("-", "").Substring(0, 5)
+        return [System.BitConverter]::ToString($algorithm.Hash).Replace("-", "")
     }
     finally {
         $input.Dispose()
@@ -275,7 +274,6 @@ $romRoot = Get-Directory $RomPath "-RomPath"
 $option = if ($Recursive) { [System.IO.SearchOption]::AllDirectories } else { [System.IO.SearchOption]::TopDirectoryOnly }
 $roms = @(Get-Files $romRoot $RomExtensions $option)
 if ($roms.Count -eq 0) { throw "No N64 ROMs were found." }
-if ($roms.Count -gt $MaximumTitles) { throw "m64menu supports at most $MaximumTitles titles." }
 
 $images = $null
 if (-not [string]::IsNullOrWhiteSpace($ImagePath)) {
@@ -294,8 +292,13 @@ $cacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "m64menu-boxart-cache"
 $ids = [System.Collections.Generic.List[string]]::new()
 foreach ($rom in $roms) {
     if ([System.IO.FileInfo]::new($rom).Length -gt (78 * 1024 * 1024)) { throw "ROM exceeds m64menu's 78 MiB limit: $rom" }
-    $id = Get-RomId $rom
-    if ($ids.Contains($id)) { throw "Generated ID collision: $id" }
+    $hash = Get-RomId $rom
+    $id = $null
+    foreach ($length in 5..7) {
+        $candidate = $hash.Substring(0, $length)
+        if (-not $ids.Contains($candidate)) { $id = $candidate; break }
+    }
+    if ($null -eq $id) { throw "Generated ID collision: $($hash.Substring(0, 7))" }
     $ids.Add($id)
     $destination = Join-Path $titleRoot $id
     [System.IO.Directory]::CreateDirectory($destination) | Out-Null

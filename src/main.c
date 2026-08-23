@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <limits.h>
+#include <stdlib.h>
 
 #include <libcart/cart.h>
 #include <libdragon.h>
@@ -188,7 +190,7 @@ unsigned long long startup_start_ms = 0;
 int library_position_segment = 0;
 int library_row_window_start = 0;
 int library_populated_rows = 0;
-char library_row_initial[50] = {0};
+static char title_row_initial(int row);
 
 char title_initial_normalize(char c) {
     if(c >= 'a' && c <= 'z') return c - ('a' - 'A');
@@ -516,7 +518,7 @@ void ribbon_draw(void) {
     // what makes them read as standing on the plane rather than printed on it.
     for(int i = 0; i < tab_count; i++) {
         int row = library_row_window_start + i;
-        char initial = library_row_initial[row] != 0 ? library_row_initial[row] : '?';
+        char initial = title_row_initial(row);
 
         // Sit the letter low and left on the tab. Descending the slant already
         // carries it left, so the offset is measured from the tab's midline at
@@ -664,6 +666,7 @@ typedef struct SquareSprite_s {
 
 typedef struct TitleBox_s {
     char id[8];
+    char initial;
     sprite_t * image;
     SquareSprite sprite;
     float scale;
@@ -678,41 +681,25 @@ typedef struct TitleBox_s {
 
 float title_brightness = 1.0f;
 
-#define MAX_TITLE_COUNT 40
-
-int title_count = 0;
-
-/** Set when the catalog was larger than the menu can hold, so the UI can say so. */
-int title_truncated = 0;
+TitleBox *title_list = NULL;
+size_t title_count = 0;
+size_t title_capacity = 0;
+int title_catalog_incomplete = 0;
 
 /** Longest title ID accepted, excluding the terminator (TitleBox.id is 8 bytes). */
 #define TITLE_ID_MAX 7
 
-/** Upper bound on menu/title.csv, so a malformed card cannot exhaust memory. */
-#define TITLE_CSV_MAX 1024
-
-/** Static storage avoids disturbing the heap that owns all loaded sprites. */
-static char title_csv[TITLE_CSV_MAX + 1];
-
-TitleBox title_list[MAX_TITLE_COUNT];
-
 #define TITLE_COLUMNS 4
-#define TITLE_ROWS 50
-#define TITLE_TOTAL_SLOTS (TITLE_ROWS * TITLE_COLUMNS)
+#define COVER_CACHE_SLOTS 16
+#define UNUSED_TITLE_INDEX SIZE_MAX
 
-TitleBox * title_row[TITLE_ROWS][TITLE_COLUMNS] = {
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL},
-    {NULL, NULL, NULL, NULL}
-};
-int title_row_count[TITLE_ROWS] = {4,4,2,0,0,0,0,0,0,0};
+typedef struct CoverCacheSlot_s {
+    size_t title_index;
+    sprite_t *image;
+} CoverCacheSlot;
+
+CoverCacheSlot cover_cache[COVER_CACHE_SLOTS];
+float title_row_pitch = 1.0f;
 
 TitleBox * selectedTitle = NULL;
 
@@ -720,6 +707,24 @@ int cursor_x = 0;
 int cursor_x_timer = 0;
 int cursor_y = 0;
 int cursor_y_timer = 0;
+
+static int title_row_size(int row) {
+    if(row < 0) return 0;
+    size_t first = (size_t)row * TITLE_COLUMNS;
+    if(first >= title_count) return 0;
+    size_t remaining = title_count - first;
+    return remaining < TITLE_COLUMNS ? (int)remaining : TITLE_COLUMNS;
+}
+
+static TitleBox *title_at(int row, int column) {
+    if(column < 0 || column >= title_row_size(row)) return NULL;
+    return &title_list[(size_t)row * TITLE_COLUMNS + (size_t)column];
+}
+
+static char title_row_initial(int row) {
+    TitleBox *title = title_at(row, 0);
+    return title != NULL && title->initial != 0 ? title->initial : '?';
+}
 
 void TitleBox_create(TitleBox * title, sprite_t * image, float x, float y) {
     title->image = image;
@@ -740,6 +745,7 @@ void TitleBox_create2(TitleBox * title, sprite_t * image, char * id) {
     if(id_length >= sizeof(title->id)) id_length = sizeof(title->id) - 1;
     memcpy(title->id, id, id_length);
     title->id[id_length] = 0;
+    title->initial = 0;
     title->image = image;
     title->sprite.x = 0.0f;
     title->sprite.y = 0.0f;
@@ -805,16 +811,129 @@ void TitleBox_draw(TitleBox * title) {
     // Unselected art recedes into the black field; the active cover is the only one at full strength.
     float level = title->isSelected ? 1.0f : 0.40f;
     int b = title_brightness * level * 255.0f;
-    rdpq_set_mode_standard();
-    rdpq_mode_filter(FILTER_BILINEAR);
-    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
-    rdpq_set_prim_color(RGBA32(b, b, b, 255));
-    rdpq_sprite_blit(title->image, offsetX, screenY, &(rdpq_blitparms_t){
-        .scale_x = titleScale, .scale_y = titleScale,
-    });
+    if(title->image != NULL) {
+        rdpq_set_mode_standard();
+        rdpq_mode_filter(FILTER_BILINEAR);
+        rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+        rdpq_set_prim_color(RGBA32(b, b, b, 255));
+        rdpq_sprite_blit(title->image, offsetX, screenY, &(rdpq_blitparms_t){
+            .scale_x = titleScale, .scale_y = titleScale,
+        });
+    } else {
+        rdpq_set_mode_fill(RGBA32(24, 10, 42, 255));
+        rdpq_fill_rectangle(offsetX, screenY, offsetX + scaledWidth, screenY + scaledHeight);
+        outline_draw(offsetX, screenY, scaledWidth, scaledHeight, 2, RGBA32(91, 54, 129, 255));
+    }
 
     if(title->isSelected) {
         focus_draw(offsetX - 3, screenY - 3, scaledWidth + 6, scaledHeight + 6);
+    }
+}
+
+static void cover_cache_init(void) {
+    for(int i = 0; i < COVER_CACHE_SLOTS; i++) {
+        cover_cache[i].title_index = UNUSED_TITLE_INDEX;
+        cover_cache[i].image = NULL;
+    }
+}
+
+static bool cover_is_wanted(size_t index, int first_row, int last_row) {
+    int row = (int)(index / TITLE_COLUMNS);
+    return row >= first_row && row <= last_row;
+}
+
+static int cover_find_slot(size_t index) {
+    for(int i = 0; i < COVER_CACHE_SLOTS; i++) {
+        if(cover_cache[i].title_index == index) return i;
+    }
+    return -1;
+}
+
+static sprite_t *cover_load(char *filename) {
+    const long expected_size = 8 + 256 * 179 * 2;
+    FILE *f = fopen(filename, "rb");
+    if(f == NULL) return NULL;
+    if(fseek(f, 0, SEEK_END) != 0 || ftell(f) != expected_size || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    uint8_t *buffer = malloc((size_t)expected_size);
+    if(buffer == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    size_t read = fread(buffer, 1, (size_t)expected_size, f);
+    bool valid = read == (size_t)expected_size && !ferror(f) &&
+        buffer[0] == 1 && buffer[1] == 0 && buffer[2] == 0 && buffer[3] == 179 &&
+        buffer[4] == 2 && buffer[5] == 0 && buffer[6] == 1 && buffer[7] == 1;
+    fclose(f);
+    if(!valid) {
+        free(buffer);
+        return NULL;
+    }
+    sprite_t *image = sprite_load_buf(buffer, (int)expected_size);
+    image->flags |= SPRITE_FLAGS_OWNEDBUFFER;
+    return image;
+}
+
+static void cover_cache_sync(void) {
+    if(title_count == 0) return;
+    int first_row = (int)((viewport_y - BOX_REGION_Y_MIN) / title_row_pitch) - 1;
+    int last_row = (int)((viewport_y_bottom - BOX_REGION_Y_MIN) / title_row_pitch) + 1;
+    if(first_row < 0) first_row = 0;
+    if(last_row >= library_populated_rows) last_row = library_populated_rows - 1;
+    if(cursor_y < first_row) first_row = cursor_y;
+    if(cursor_y > last_row) last_row = cursor_y;
+    while((last_row - first_row + 1) * TITLE_COLUMNS > COVER_CACHE_SLOTS) {
+        if(cursor_y - first_row > last_row - cursor_y) first_row++;
+        else last_row--;
+    }
+
+    bool must_free = false;
+    for(int i = 0; i < COVER_CACHE_SLOTS; i++) {
+        if(cover_cache[i].title_index != UNUSED_TITLE_INDEX &&
+           !cover_is_wanted(cover_cache[i].title_index, first_row, last_row)) {
+            must_free = true;
+            break;
+        }
+    }
+    if(must_free) rspq_wait();
+    for(int i = 0; i < COVER_CACHE_SLOTS; i++) {
+        size_t index = cover_cache[i].title_index;
+        if(index == UNUSED_TITLE_INDEX || cover_is_wanted(index, first_row, last_row)) continue;
+        title_list[index].image = NULL;
+        if(cover_cache[i].image != NULL) sprite_free(cover_cache[i].image);
+        cover_cache[i].title_index = UNUSED_TITLE_INDEX;
+        cover_cache[i].image = NULL;
+    }
+
+    for(int row = first_row; row <= last_row; row++) {
+        int count = title_row_size(row);
+        for(int column = 0; column < count; column++) {
+            size_t index = (size_t)row * TITLE_COLUMNS + (size_t)column;
+            if(cover_find_slot(index) >= 0) continue;
+            int slot = -1;
+            for(int i = 0; i < COVER_CACHE_SLOTS; i++) if(cover_cache[i].title_index == UNUSED_TITLE_INDEX) {
+                slot = i;
+                break;
+            }
+            if(slot < 0) return;
+            char filename[64];
+            snprintf(filename, sizeof(filename), "sd:/menu/title/%s/%s_e.sprite", title_list[index].id, title_list[index].id);
+            sprite_t *image = cover_load(filename);
+            cover_cache[slot].title_index = index;
+            cover_cache[slot].image = image;
+            title_list[index].image = image;
+        }
+    }
+}
+
+static void cover_cache_destroy(void) {
+    rspq_wait();
+    for(int i = 0; i < COVER_CACHE_SLOTS; i++) {
+        if(cover_cache[i].image != NULL) sprite_free(cover_cache[i].image);
+        cover_cache[i].title_index = UNUSED_TITLE_INDEX;
+        cover_cache[i].image = NULL;
     }
 }
 
@@ -948,94 +1067,78 @@ bool setupRomLoad(TitleBox * title) {
     return true;
 }
 
+static bool catalog_append(char *id) {
+    if(title_count == title_capacity) {
+        size_t capacity = title_capacity == 0 ? 64 : title_capacity * 2;
+        if(capacity < title_capacity || capacity > SIZE_MAX / sizeof(*title_list)) return false;
+        TitleBox *resized = realloc(title_list, capacity * sizeof(*title_list));
+        if(resized == NULL) return false;
+        title_list = resized;
+        title_capacity = capacity;
+    }
+    TitleBox_create2(&title_list[title_count], NULL, id);
+    title_count++;
+    return true;
+}
+
 void load_titles() {
-    int row_max = TITLE_COLUMNS;
+    title_count = 0;
+    title_catalog_incomplete = 0;
+    selectedTitle = NULL;
+    cover_cache_init();
 
-    //row_max = 4; // Quick hack to reduce the number of titles per row
-
-    FILE * f = fopen("sd://menu/title.csv", "r");
-    if(f != NULL){
-        setvbuf(f, NULL, _IONBF, 0);
-        fseek(f, 0, SEEK_END);
-        long csvsize = ftell(f);
-        fseek(f, 0, SEEK_SET);
-
-        if(csvsize < 0) csvsize = 0;
-        if(csvsize > TITLE_CSV_MAX) {
-            // Read only what we will parse rather than overrunning the buffer.
-            csvsize = TITLE_CSV_MAX;
-            title_truncated = 1;
-        }
-
-        size_t read = fread(title_csv, 1, csvsize, f);
-        title_csv[read] = 0;
-        fclose(f);
-
-        char flbuf[TITLE_ID_MAX + 1];
-        int flbfpos = 0;
-        bool invalid_id = false;
-        title_count = 0;
-
-        for(char * it = title_csv; ; it++) {
-            char c = *it;
-            if(c == ',' || c == ' ' || c == '\r' || c == '\n' || c == 0) {
-                if(flbfpos != 0 && !invalid_id) {
-                    flbuf[flbfpos] = 0;
-
-                    if(title_count >= MAX_TITLE_COUNT || (title_count / row_max) >= TITLE_ROWS) {
-                        title_truncated = 1;
-                        break;
+    FILE *f = fopen("sd://menu/title.csv", "r");
+    if(f != NULL) {
+        char id[TITLE_ID_MAX + 1];
+        int length = 0;
+        bool invalid = false;
+        while(true) {
+            int next = fgetc(f);
+            char c = next == EOF ? 0 : (char)next;
+            bool delimiter = c == ',' || c == ' ' || c == '\r' || c == '\n' || c == 0;
+            if(delimiter) {
+                if(length != 0 || invalid) {
+                    if(!invalid && length <= TITLE_ID_MAX) {
+                        id[length] = 0;
+                        if(!catalog_append(id)) {
+                            title_catalog_incomplete = 1;
+                            break;
+                        }
+                    } else {
+                        title_catalog_incomplete = 1;
                     }
-
-                    char filename[64];
-                    snprintf(filename, sizeof(filename), "sd:/menu/title/%s/%s_e.sprite", flbuf, flbuf);
-
-                    sprite_t * image = sprite_load(filename);
-                    TitleBox_create2(&title_list[title_count], image, flbuf);
-                    if((title_count % row_max) == 0) {
-                        library_row_initial[title_count / row_max] = title_initial_load(flbuf);
-                    }
-                    title_row[title_count / row_max][title_count % row_max] = &title_list[title_count];
-                    title_count++;
                 }
-                flbfpos = 0;
-                invalid_id = false;
-            } else if(flbfpos < TITLE_ID_MAX) {
-                flbuf[flbfpos] = c;
-                flbfpos++;
+                length = 0;
+                invalid = false;
+            } else if(length < TITLE_ID_MAX &&
+                      ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
+                id[length++] = c;
             } else {
-                // Consume an oversized token, but never add its truncated prefix.
-                invalid_id = true;
-                title_truncated = 1;
+                invalid = true;
             }
-
-            if(c == 0) break;
+            if(next == EOF || c == 0) break;
         }
+        if(ferror(f)) title_catalog_incomplete = 1;
+        fclose(f);
     }
 
-    library_populated_rows = (title_count + row_max - 1) / row_max;
+    size_t rows = title_count / TITLE_COLUMNS + (title_count % TITLE_COLUMNS != 0);
+    library_populated_rows = rows > INT_MAX ? INT_MAX : (int)rows;
 
-    for(int y = 0; y < TITLE_ROWS; y++) { 
-        int row_count = 0;
-        for(int x = 0; x < row_max; x++) {
-            if(title_row[y][x] != NULL) row_count++;
-        }
-        title_row_count[y] = row_count;
-    }
-    
     // Fixed tile pitch with real gutters, rather than scaling covers to fill the row edge-to-edge.
     float tileWidth = (BOX_REGION_X_MAX - BOX_REGION_X_MIN - GRID_GUTTER * (TITLE_COLUMNS - 1)) / TITLE_COLUMNS;
     float rowScale = tileWidth / TITLE_BOX_WIDTH_E;
     float tileHeight = TITLE_BOX_HEIGHT_E * rowScale;
+    title_row_pitch = tileHeight + GRID_GUTTER;
 
     float currentRowY = box_region_min_y;
-    for(int y = 0; y < TITLE_ROWS; y++) {
-        int currentRowCount = title_row_count[y];
+    for(int y = 0; y < library_populated_rows; y++) {
+        int currentRowCount = title_row_size(y);
         if(currentRowCount == 0) continue;
 
-        for(int x = 0; x < row_max; x++) {
-            TitleBox * current = title_row[y][x];
-            if(current == NULL) continue;
+        for(int x = 0; x < currentRowCount; x++) {
+            TitleBox *current = title_at(y, x);
+            if(x == 0) current->initial = title_initial_load(current->id);
             current->scale = rowScale;
 
             current->sprite.x = BOX_REGION_X_MIN + (tileWidth + GRID_GUTTER) * x;
@@ -1048,6 +1151,7 @@ void load_titles() {
     if(currentRowY > SCREEN_HEIGHT) {
         box_region_max_y = currentRowY;
     }
+    cover_cache_sync();
 }
 
 float gametitle_fade = 0.0f;
@@ -1064,7 +1168,16 @@ void menu_update() {
     int limit_reached = 0;
     int cursor_move = 0;
 
-    int currentRowCount = title_row_count[cursor_y];
+    if(title_count == 0 || library_populated_rows == 0) {
+        selectedTitle = NULL;
+        cursor_x = 0;
+        cursor_y = 0;
+        library_position_segment = 0;
+        library_row_window_start = 0;
+        return;
+    }
+
+    int currentRowCount = title_row_size(cursor_y);
 
     if(main_state == 3) {
         int input_x = 0;
@@ -1143,20 +1256,14 @@ void menu_update() {
         if(cursor_y < 0) {
             if(prev_cursor_y != cursor_y) limit_reached = 1;
             cursor_y = 0;
-        } else if (cursor_y >= TITLE_ROWS) {
+        } else if (cursor_y >= library_populated_rows) {
             if(prev_cursor_y != cursor_y) limit_reached = 1;
-            cursor_y = TITLE_ROWS-1;
+            cursor_y = library_populated_rows - 1;
         }
 
         // Next row?
-        int rowCount = title_row_count[cursor_y];
-        if(rowCount == 0) {
-            cursor_y--;
-            limit_reached = 1;
-            rowCount = title_row_count[cursor_y];
-        } else {
-            if(prev_cursor_y != cursor_y) cursor_move = 1;
-        }
+        int rowCount = title_row_size(cursor_y);
+        if(prev_cursor_y != cursor_y) cursor_move = 1;
 
     
         // Select most fitting x based on title sizes
@@ -1196,7 +1303,7 @@ void menu_update() {
     }
 
     if(cursor_x >= 0) {
-        TitleBox * cur = title_row[cursor_y][cursor_x];
+        TitleBox * cur = title_at(cursor_y, cursor_x);
         if(cur != NULL) {
             if(selectedTitle != NULL) {
                 selectedTitle->isSelected = 0;
@@ -1211,7 +1318,7 @@ void menu_update() {
         selectedTitle = NULL;
     }
 
-    int populated_rows = (title_count + TITLE_COLUMNS - 1) / TITLE_COLUMNS;
+    int populated_rows = library_populated_rows;
     int visible_rows = populated_rows < 5 ? populated_rows : 5;
     if(cursor_y < library_row_window_start) {
         library_row_window_start = cursor_y;
@@ -1232,12 +1339,9 @@ void menu_update() {
 
     
 
-    for(int y = 0; y < TITLE_ROWS; y++) {
-        for(int x = 0; x < TITLE_COLUMNS; x++) {
-            TitleBox * current = title_row[y][x];
-            if(current == NULL) continue;
-            TitleBox_update(current);
-        }
+    for(int i = 0; i < COVER_CACHE_SLOTS; i++) {
+        size_t index = cover_cache[i].title_index;
+        if(index != UNUSED_TITLE_INDEX) TitleBox_update(&title_list[index]);
     }
 
     if(selectedTitle) {
@@ -1258,6 +1362,7 @@ void menu_update() {
     }
 
     viewport_y_bottom = viewport_y + (BOX_REGION_Y_MAX - BOX_REGION_Y_MIN);
+    cover_cache_sync();
 
     // fade out
     if(main_state > 3) {
@@ -1311,12 +1416,12 @@ void menu_draw() {
         
         rdpq_mode_filter(FILTER_BILINEAR);
 
-        for(int y = 0; y < TITLE_ROWS; y++) {
-            for(int x = 0; x < TITLE_COLUMNS; x++) {
-                TitleBox * current = title_row[y][x];
-                if(current == NULL || current == selectedTitle) continue;
-                TitleBox_draw(current);
-            }
+        for(int i = 0; i < COVER_CACHE_SLOTS; i++) {
+            size_t index = cover_cache[i].title_index;
+            if(index == UNUSED_TITLE_INDEX) continue;
+            TitleBox *current = &title_list[index];
+            if(current == selectedTitle) continue;
+            TitleBox_draw(current);
         }
         if(selectedTitle != NULL) {
             // Draw last
@@ -1385,7 +1490,7 @@ void draw(int cur_frame) {
         // dim violet was chosen against black and lost most of its contrast once the
         // ground became violet too.
         rdpq_text_printf(NULL, FONT_SMALL, BOX_REGION_X_MIN, HINT_Y + 12,
-            title_truncated ? "^00%d ^02TITLES (LIMIT)" : "^00%d ^02TITLES", title_count);
+            title_catalog_incomplete ? "^00%zu ^02TITLES (PARTIAL)" : "^00%zu ^02TITLES", title_count);
 
         // Circular M64-style caps. The letter is centred on the cap and drawn in
         // black, so it reads as printed on the button rather than floating over it.
@@ -1492,6 +1597,9 @@ int main(void)
         cur_frame++;
     }
 
+    cover_cache_destroy();
+    free(title_list);
+    title_list = NULL;
     flashcart_deinit();
 
 

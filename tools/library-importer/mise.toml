@@ -1,4 +1,5 @@
 [tools]
+rust = "1.87.0"
 zig = "0.16.0"
 
 [tasks.build]

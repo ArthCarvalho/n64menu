@@ -2,10 +2,11 @@ const std = @import("std");
 const zigimg = @import("zigimg");
 const builtin = @import("builtin");
 
-pub const maximum_titles = 40;
 pub const maximum_rom_size = 78 * 1024 * 1024;
 pub const sprite_width = 256;
 pub const sprite_height = 179;
+pub const title_id_capacity = 7;
+pub const TitleId = [title_id_capacity]u8;
 
 const rom_extensions = [_][]const u8{ ".n64", ".v64", ".z64" };
 const image_extensions = [_][]const u8{ ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff" };
@@ -13,7 +14,7 @@ const n64_playlist_name = "Nintendo - Nintendo 64.lpl";
 const maximum_playlist_size = 8 * 1024 * 1024;
 
 pub const Config = struct {
-    output_root: []const u8,
+    output_root: []const u8 = "",
     rom_root: []const u8,
     image_root: ?[]const u8 = null,
     /// May point either at Named_Boxarts or at its parent directory.
@@ -34,7 +35,8 @@ pub const ArtworkStatus = enum {
 pub const Title = struct {
     rom_path: []u8,
     display_name: []u8,
-    id: [5]u8,
+    id: TitleId,
+    content_hash: [32]u8 = @splat(0),
     artwork_path: ?[]u8,
     artwork_status: ArtworkStatus,
 
@@ -132,7 +134,6 @@ const Match = struct {
 const ByteOrder = enum { z64, v64, n64 };
 
 pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !ScanResult {
-    try validateDirectory(io, config.output_root);
     try validateDirectory(io, config.rom_root);
     if (config.image_root) |path| try validateDirectory(io, path);
 
@@ -147,7 +148,6 @@ pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !Sc
     try collectFiles(allocator, io, config.rom_root, config.recursive, &rom_extensions, &roms);
     std.mem.sort([]u8, roms.items, {}, pathLessThan);
     if (roms.items.len == 0) return error.NoRomsFound;
-    if (roms.items.len > maximum_titles) return error.TooManyTitles;
 
     var images: std.ArrayList([]u8) = .empty;
     defer freePaths(allocator, &images);
@@ -172,8 +172,7 @@ pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !Sc
     for (roms.items) |rom_path| {
         const normalized = try readNormalizedRom(allocator, io, rom_path);
         defer allocator.free(normalized);
-        const id = normalizedId(normalized);
-        for (titles.items) |title| if (std.mem.eql(u8, &title.id, &id)) return error.IdCollision;
+        const assigned = try uniqueNormalizedId(normalized, titles.items);
 
         const display_name = try allocator.dupe(u8, basenameWithoutExtension(rom_path));
         errdefer allocator.free(display_name);
@@ -182,7 +181,8 @@ pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !Sc
         try titles.append(allocator, .{
             .rom_path = try allocator.dupe(u8, rom_path),
             .display_name = display_name,
-            .id = id,
+            .id = assigned.id,
+            .content_hash = assigned.digest,
             .artwork_path = if (match) |found| @constCast(found.path) else null,
             .artwork_status = if (match) |found| found.status else .generated,
         });
@@ -197,6 +197,7 @@ pub fn importLibrary(
     config: Config,
     progress: ?Progress,
 ) !ScanResult {
+    try validateDirectory(io, config.output_root);
     var result = try scanLibrary(allocator, io, config);
     errdefer result.deinit(allocator);
 
@@ -291,7 +292,7 @@ fn stageTitles(
     try cwd.createDirPath(io, title_root);
 
     for (titles, 0..) |*title, index| {
-        const destination = try std.fs.path.join(allocator, &.{ title_root, &title.id });
+        const destination = try std.fs.path.join(allocator, &.{ title_root, titleIdSlice(&title.id) });
         defer allocator.free(destination);
         try cwd.createDirPath(io, destination);
 
@@ -576,20 +577,19 @@ fn scanRetroArchPlaylist(
         titles.deinit(allocator);
     }
     for (playlist.entries) |entry| {
-        if (titles.items.len == maximum_titles) break;
         if (!isSupportedPlaylistRom(entry.path)) continue;
         const rom_path = resolvePlaylistRomPath(allocator, io, entry.path, mounted_roots) catch continue;
         errdefer allocator.free(rom_path);
         const normalized = try readNormalizedRom(allocator, io, rom_path);
         defer allocator.free(normalized);
-        const id = normalizedId(normalized);
-        for (titles.items) |title| if (std.mem.eql(u8, &title.id, &id)) return error.IdCollision;
+        const assigned = try uniqueNormalizedId(normalized, titles.items);
         const artwork = try findRetroArchPlaylistArtwork(allocator, entry, rom_path, boxarts.items, snaps.items);
         errdefer if (artwork) |match| allocator.free(match.path);
         try titles.append(allocator, .{
             .rom_path = rom_path,
             .display_name = try allocator.dupe(u8, if (entry.label.len != 0) entry.label else basenameWithoutExtension(rom_path)),
-            .id = id,
+            .id = assigned.id,
+            .content_hash = assigned.digest,
             .artwork_path = if (artwork) |match| @constCast(match.path) else null,
             .artwork_status = if (artwork) |match| match.status else .generated,
         });
@@ -810,7 +810,14 @@ fn collectFiles(
     while (try iterator.next(io)) |entry| {
         const path = try std.fs.path.join(allocator, &.{ root, entry.name });
         errdefer allocator.free(path);
-        switch (entry.kind) {
+        const kind = if (entry.kind == .unknown)
+            (std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+                allocator.free(path);
+                continue;
+            }).kind
+        else
+            entry.kind;
+        switch (kind) {
             .file => if (hasExtension(entry.name, extensions)) try paths.append(allocator, path) else allocator.free(path),
             .directory => if (recursive) {
                 defer allocator.free(path);
@@ -1004,19 +1011,40 @@ fn normalizeRom(bytes: []u8) !void {
     }
 }
 
-fn normalizedId(bytes: []const u8) [5]u8 {
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+fn normalizedId(digest: [32]u8, length: usize) TitleId {
     const alphabet = "0123456789ABCDEF";
-    return .{
-        alphabet[digest[0] >> 4], alphabet[digest[0] & 15],
-        alphabet[digest[1] >> 4], alphabet[digest[1] & 15],
-        alphabet[digest[2] >> 4],
-    };
+    var result: TitleId = @splat(0);
+    for (0..length) |index| {
+        const byte = digest[index / 2];
+        result[index] = alphabet[if (index % 2 == 0) byte >> 4 else byte & 15];
+    }
+    return result;
 }
 
-fn outputPath(allocator: std.mem.Allocator, directory: []const u8, id: [5]u8, suffix: []const u8) ![]u8 {
-    const filename = try std.mem.concat(allocator, u8, &.{ &id, suffix });
+const AssignedId = struct { id: TitleId, digest: [32]u8 };
+
+fn uniqueNormalizedId(bytes: []const u8, titles: []const Title) !AssignedId {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    for (titles) |title| if (std.mem.eql(u8, &title.content_hash, &digest)) return error.IdCollision;
+    for (5..title_id_capacity + 1) |length| {
+        const candidate = normalizedId(digest, length);
+        var collision = false;
+        for (titles) |title| if (std.mem.eql(u8, titleIdSlice(&title.id), titleIdSlice(&candidate))) {
+            collision = true;
+            break;
+        };
+        if (!collision) return .{ .id = candidate, .digest = digest };
+    }
+    return error.IdCollision;
+}
+
+pub fn titleIdSlice(id: *const TitleId) []const u8 {
+    return id[0 .. std.mem.indexOfScalar(u8, id, 0) orelse id.len];
+}
+
+fn outputPath(allocator: std.mem.Allocator, directory: []const u8, id: TitleId, suffix: []const u8) ![]u8 {
+    const filename = try std.mem.concat(allocator, u8, &.{ titleIdSlice(&id), suffix });
     defer allocator.free(filename);
     return std.fs.path.join(allocator, &.{ directory, filename });
 }
@@ -1028,11 +1056,14 @@ fn asciiText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 }
 
 fn titleCsvBytes(allocator: std.mem.Allocator, titles: []const Title) ![]u8 {
-    const result = try allocator.alloc(u8, titles.len * 6 + 1);
+    var size: usize = 1;
+    for (titles) |title| size += titleIdSlice(&title.id).len + 1;
+    const result = try allocator.alloc(u8, size);
     var offset: usize = 0;
     for (titles) |title| {
-        @memcpy(result[offset..][0..5], &title.id);
-        offset += 5;
+        const id = titleIdSlice(&title.id);
+        @memcpy(result[offset..][0..id.len], id);
+        offset += id.len;
         result[offset] = ',';
         offset += 1;
     }
@@ -1146,8 +1177,14 @@ test "byte-order conversion equivalence and normalized ID stability" {
     try normalizeRom(&n64);
     try std.testing.expectEqualSlices(u8, &z64, &v64);
     try std.testing.expectEqualSlices(u8, &z64, &n64);
-    try std.testing.expectEqual(normalizedId(&z64), normalizedId(&v64));
-    try std.testing.expectEqual(normalizedId(&z64), normalizedId(&n64));
+    var z64_digest: [32]u8 = undefined;
+    var v64_digest: [32]u8 = undefined;
+    var n64_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&z64, &z64_digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(&v64, &v64_digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(&n64, &n64_digest, .{});
+    try std.testing.expectEqual(normalizedId(z64_digest, 5), normalizedId(v64_digest, 5));
+    try std.testing.expectEqual(normalizedId(z64_digest, 5), normalizedId(n64_digest, 5));
 }
 
 test "normalized name matching" {
@@ -1259,8 +1296,8 @@ test "candidate discovery selects direct usable RetroArch playlist" {
 
 test "title CSV bytes" {
     const titles = [_]Title{
-        .{ .rom_path = undefined, .display_name = undefined, .id = "ABCDE".*, .artwork_path = null, .artwork_status = .generated },
-        .{ .rom_path = undefined, .display_name = undefined, .id = "12345".*, .artwork_path = null, .artwork_status = .generated },
+        .{ .rom_path = undefined, .display_name = undefined, .id = "ABCDE\x00\x00".*, .artwork_path = null, .artwork_status = .generated },
+        .{ .rom_path = undefined, .display_name = undefined, .id = "12345\x00\x00".*, .artwork_path = null, .artwork_status = .generated },
     };
     const bytes = try titleCsvBytes(std.testing.allocator, &titles);
     defer std.testing.allocator.free(bytes);
@@ -1310,8 +1347,38 @@ test "end-to-end fallback import" {
     var buffer: [32]u8 = undefined;
     var reader = csv_file.readerStreaming(std.testing.io, &buffer);
     try reader.interface.readSliceAll(&csv);
-    try std.testing.expectEqualSlices(u8, &result.titles[0].id, csv[0..5]);
+    try std.testing.expectEqualSlices(u8, titleIdSlice(&result.titles[0].id), csv[0..5]);
     try std.testing.expectEqualSlices(u8, ",\x00", csv[5..]);
+}
+
+test "recursive scan supports more than forty ROMs and adjacent artwork" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "roms/with-art");
+    try temp.dir.createDirPath(std.testing.io, "roms/missing/nested");
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "roms/with-art/Game-00.z64", .data = &.{ 0x80, 0x37, 0x12, 0x40, 0, 0, 0, 0 } });
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "roms/with-art/Game-00.png", .data = "art" });
+    for (1..41) |index| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "roms/missing/nested/Game-{d:0>2}.z64", .{index});
+        try temp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = &.{ 0x80, 0x37, 0x12, 0x40, 0, 0, 0, @intCast(index) } });
+    }
+
+    const root = try tempPath(allocator, temp, "roms");
+    defer allocator.free(root);
+    var result = try scanLibrary(allocator, std.testing.io, .{ .rom_root = root, .recursive = true });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 41), result.titles.len);
+
+    var exact: usize = 0;
+    var missing: usize = 0;
+    for (result.titles) |title| {
+        if (title.artwork_status == .exact_sibling) exact += 1;
+        if (title.artwork_path == null) missing += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), exact);
+    try std.testing.expectEqual(@as(usize, 40), missing);
 }
 
 fn tempPath(allocator: std.mem.Allocator, temp: std.testing.TmpDir, child: []const u8) ![]u8 {
