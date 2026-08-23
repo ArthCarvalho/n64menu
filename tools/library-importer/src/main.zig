@@ -765,6 +765,7 @@ fn drawModArtwork(rect: Rect, artwork: *const ArtworkTexture) void {
     const y = rect.y + (rect.h - height) * 0.5;
     sgl.enableTexture();
     sgl.texture(artwork.view, state.artwork_sampler);
+    sgl.c3b(255, 255, 255);
     sgl.beginQuads();
     sgl.v2fT2f(x, y, 0, 0);
     sgl.v2fT2f(x + width, y, 1, 0);
