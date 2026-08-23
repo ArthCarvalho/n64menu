@@ -19,6 +19,7 @@ pub const Entry = struct {
     output: Output = .{},
     compatibility: []const u8,
     saveType: ?[]const u8 = null,
+    artwork: ?Artwork = null,
     rights: Rights,
 };
 
@@ -56,6 +57,13 @@ pub const Output = struct {
 pub const Rights = struct {
     patchRedistributionAllowed: bool,
     artworkRedistributionAllowed: bool,
+};
+
+pub const Artwork = struct {
+    url: []const u8,
+    size: usize,
+    sha256: []const u8,
+    sourcePage: []const u8,
 };
 
 const Document = struct {
@@ -114,20 +122,25 @@ pub fn download(
     errdefer allocator.free(destination);
     if (try cachedArtifactReady(io, destination, entry)) return destination;
 
+    try downloadVerified(allocator, io, entry.patch.url, entry.patch.size, entry.patch.sha256, destination);
+    return destination;
+}
+
+fn downloadVerified(allocator: std.mem.Allocator, io: std.Io, url: []const u8, size: usize, sha256: []const u8, destination: []const u8) !void {
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
-    const response_bytes = try allocator.alloc(u8, entry.patch.size);
+    const response_bytes = try allocator.alloc(u8, size);
     defer allocator.free(response_bytes);
     var response: std.Io.Writer = .fixed(response_bytes);
     const result = try client.fetch(.{
-        .location = .{ .url = entry.patch.url },
+        .location = .{ .url = url },
         .response_writer = &response,
         .headers = .{ .user_agent = .{ .override = "m64menu-importer/0.1" } },
     });
     if (result.status != .ok) return error.DownloadFailed;
     const written = response.buffered();
-    if (written.len != entry.patch.size) return error.DownloadSizeMismatch;
-    if (!sha256Matches(written, entry.patch.sha256)) return error.DownloadHashMismatch;
+    if (written.len != size) return error.DownloadSizeMismatch;
+    if (!sha256Matches(written, sha256)) return error.DownloadHashMismatch;
     const temporary = try std.fmt.allocPrint(allocator, "{s}.tmp", .{destination});
     defer allocator.free(temporary);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temporary, .data = written });
@@ -135,7 +148,6 @@ pub fn download(
         std.Io.Dir.cwd().deleteFile(io, destination) catch {};
         try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), destination, io);
     };
-    return destination;
 }
 
 pub fn cachedArtifactPath(allocator: std.mem.Allocator, entry: Entry, cache_directory: []const u8) ![]u8 {
@@ -155,6 +167,18 @@ pub fn cachedArtifactReady(io: std.Io, path: []const u8, entry: Entry) !bool {
 pub fn cachedArtifactExists(io: std.Io, path: []const u8, entry: Entry) bool {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .file and stat.size == entry.patch.size;
+}
+
+pub fn downloadArtwork(allocator: std.mem.Allocator, io: std.Io, entry: Entry, cache_directory: []const u8) !?[]u8 {
+    const artwork = entry.artwork orelse return null;
+    try std.Io.Dir.cwd().createDirPath(io, cache_directory);
+    const filename = try std.fmt.allocPrint(allocator, "{s}-{s}.jpg", .{ entry.id, entry.version });
+    defer allocator.free(filename);
+    const destination = try std.fs.path.join(allocator, &.{ cache_directory, filename });
+    errdefer allocator.free(destination);
+    if (try fileMatches(io, destination, artwork.size, artwork.sha256)) return destination;
+    try downloadVerified(allocator, io, artwork.url, artwork.size, artwork.sha256, destination);
+    return destination;
 }
 
 pub fn readPatchBytes(allocator: std.mem.Allocator, io: std.Io, artifact_path: []const u8, entry: Entry) ![]u8 {
@@ -209,6 +233,9 @@ fn validateEntry(entry: Entry) !void {
     if (entry.patch.patchCrc32) |value| if (!validHex(value, 8)) return error.InvalidRegistryHash;
     if (entry.output.sha1) |value| if (!validHex(value, 40)) return error.InvalidRegistryHash;
     if (entry.saveType) |value| if (!validSaveType(value)) return error.InvalidRegistryEntry;
+    if (entry.artwork) |artwork| {
+        if (!validHttpsUrl(artwork.url) or !validHttpsUrl(artwork.sourcePage) or artwork.size == 0 or artwork.size > 8 * 1024 * 1024 or !validHex(artwork.sha256, 64)) return error.InvalidRegistryEntry;
+    }
     if (entry.patch.archiveMember) |member| {
         if (std.fs.path.isAbsolute(member) or std.mem.indexOf(u8, member, "..") != null or std.mem.indexOfScalar(u8, member, '\\') != null) return error.InvalidArchiveMember;
         if (entry.patch.memberSize == null or entry.patch.memberSize.? == 0 or entry.patch.memberSize.? > maximum_artifact_size or entry.patch.memberSha256 == null or !validHex(entry.patch.memberSha256.?, 64)) return error.InvalidRegistryEntry;

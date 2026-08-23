@@ -34,6 +34,12 @@
         "sha1": "01A09799E7C36229DCFAA800F80EE030852A60DD"
       },
       "compatibility": "excellent",
+      "artwork": {
+        "url": "https://api.romhacking.com/game/sm64-the-green-stars/Capture.JPG",
+        "size": 43525,
+        "sha256": "604D2AA021CF5E46437A4C514196118CF1BC2AD6CE1EA297BE7555D0E82F1B71",
+        "sourcePage": "https://romhacking.com/hack/sm64-the-green-stars"
+      },
       "rights": {
         "patchRedistributionAllowed": false,
         "artworkRedistributionAllowed": false
@@ -70,6 +76,12 @@
         "sha1": "1AE98BA63E95874C46187A7233FFD7B73A068D5E"
       },
       "compatibility": "unknown",
+      "artwork": {
+        "url": "https://api.romhacking.com/game/ZAMination-Squid-Game-64/snap0004.jpg",
+        "size": 346969,
+        "sha256": "047857878D472A8F4AF9AE51F3BE1853F11D1EA378127C783872FBBF8D479D41",
+        "sourcePage": "https://romhacking.com/hack/ZAMination-Squid-Game-64"
+      },
       "rights": {
         "patchRedistributionAllowed": false,
         "artworkRedistributionAllowed": false

@@ -75,6 +75,7 @@ const page_layout = struct {
     const mod_first_y: f32 = grid_y + 118;
     const mod_row_height: f32 = 18;
     const mod_button_y: f32 = grid_y + 166;
+    const mod_page_button_offset: f32 = 176;
     const artwork_button_y: f32 = grid_y + 136;
 
     fn detailX(width: f32) f32 {
@@ -224,10 +225,17 @@ const ModDownloadResult = struct {
     err: ?[]const u8 = null,
 };
 
+const ModArtworkResult = struct {
+    registry_index: usize,
+    path: ?[]u8 = null,
+    err: ?[]const u8 = null,
+};
+
 const WorkerResult = union(enum) {
     refresh: RefreshResult,
     sync: SyncResult,
     mod_download: ModDownloadResult,
+    mod_artwork: ModArtworkResult,
 };
 
 const state = struct {
@@ -236,6 +244,8 @@ const state = struct {
     var pass_action: sg.PassAction = .{};
     var artwork_sampler: sg.Sampler = .{};
     var artwork_textures: [grid.maximum_visible_cards]ArtworkTexture = @splat(.{});
+    var mod_artwork_texture = ArtworkTexture{};
+    var mod_artwork_registry_index: usize = std.math.maxInt(usize);
     var mod_registry: ?registry.Registry = null;
     var registry_is_demo = true;
     var drop_mode: DropMode = .games;
@@ -330,6 +340,7 @@ export fn cleanup() void {
     }
     harvestWorker();
     clearArtworkTextures();
+    destroyArtworkTexture(&state.mod_artwork_texture);
     if (state.artwork_sampler.id != sg.invalid_id) sg.destroySampler(state.artwork_sampler);
     clearScan();
     clearCard();
@@ -660,8 +671,32 @@ fn drawCompatibleMods(panel: Rect, title: importer.Title, count: usize) void {
         drawText(panel.x + 16, panel.y + 118 + @as(f32, @floatFromInt(row)) * 18, if (row == state.selected_mod) colors.yellow else colors.white, "{s} {s}", .{ head(entry.name, 28), entry.version });
     }
     const selected = catalog.entries()[matches[state.selected_mod]];
+    syncSelectedModArtwork(matches[state.selected_mod], selected);
+    if (textureForSelectedMod()) |artwork| {
+        drawModArtwork(.{ .x = panel.x + panel.w - 132, .y = panel.y + 18, .w = 116, .h = 82 }, artwork);
+    }
     const cached = isModCached(selected);
-    drawButton(.{ .x = panel.x + 16, .y = panel.y + 166, .w = 168, .h = 26 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else if (selected.patch.archiveMember == null) "DOWNLOAD PATCH" else "DOWNLOAD ARCHIVE");
+    drawButton(.{ .x = panel.x + 16, .y = panel.y + 166, .w = 152, .h = 26 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else "DOWNLOAD MOD");
+    drawButton(.{ .x = panel.x + 176, .y = panel.y + 166, .w = 152, .h = 26 }, colors.orange, if (selected.artwork == null) "SEARCH LAUNCHBOX" else "VIEW MOD PAGE");
+}
+
+fn drawModArtwork(rect: Rect, artwork: *const ArtworkTexture) void {
+    drawRect(rect, colors.background);
+    const scale = @min(rect.w / artwork.width, rect.h / artwork.height);
+    const width = artwork.width * scale;
+    const height = artwork.height * scale;
+    const x = rect.x + (rect.w - width) * 0.5;
+    const y = rect.y + (rect.h - height) * 0.5;
+    sgl.enableTexture();
+    sgl.texture(artwork.view, state.artwork_sampler);
+    sgl.beginQuads();
+    sgl.v2fT2f(x, y, 0, 0);
+    sgl.v2fT2f(x + width, y, 1, 0);
+    sgl.v2fT2f(x + width, y + height, 1, 1);
+    sgl.v2fT2f(x, y + height, 0, 1);
+    sgl.end();
+    sgl.disableTexture();
+    drawOutline(rect, colors.border, 1);
 }
 
 fn isModCached(entry: registry.Entry) bool {
@@ -781,6 +816,11 @@ fn textureForTitle(index: usize) ?*const ArtworkTexture {
     return null;
 }
 
+fn textureForSelectedMod() ?*const ArtworkTexture {
+    if (state.mod_artwork_texture.title_index == std.math.maxInt(usize) or state.mod_artwork_texture.failed) return null;
+    return &state.mod_artwork_texture;
+}
+
 fn clearArtworkTextures() void {
     for (&state.artwork_textures) |*texture| destroyArtworkTexture(texture);
 }
@@ -832,6 +872,7 @@ fn handleClick(x: f32, y: f32) void {
     const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
     const width = metrics.width;
     if (downloadSelectedMod(width, x, y)) return;
+    if (openSelectedModPage(width, x, y)) return;
     if (selectCompatibleMod(width, x, y)) return;
     if (searchMissingArtwork(width, x, y)) return;
     if (selectGridTitle(width, metrics.height, x, y)) return;
@@ -852,6 +893,40 @@ fn handleClick(x: f32, y: f32) void {
     }
 }
 
+fn openSelectedModPage(width: f32, x: f32, y: f32) bool {
+    const button = Rect{ .x = page_layout.detailX(width) + page_layout.mod_page_button_offset, .y = page_layout.mod_button_y, .w = 152, .h = 26 };
+    if (!contains(button, x, y)) return false;
+    const selected = selectedRegistryEntry() orelse return false;
+    if (selected.artwork == null) {
+        launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, selected.name) catch {
+            setStatus(false, "Could not open the LaunchBox search.", .{});
+            return true;
+        };
+        setStatus(true, "Opened a LaunchBox search for {s}.", .{selected.name});
+        return true;
+    }
+    const url = launchbox.attributedUrl(std.heap.c_allocator, selected.projectUrl) catch return true;
+    defer std.heap.c_allocator.free(url);
+    launchbox.openUrl(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, url) catch {
+        setStatus(false, "Could not open the mod project page.", .{});
+        return true;
+    };
+    setStatus(true, "Opened {s}'s project page.", .{selected.name});
+    return true;
+}
+
+fn selectedRegistryEntry() ?registry.Entry {
+    const scan = state.scan orelse return null;
+    const titles = scan.preview().titles;
+    if (titles.len == 0 or state.preview_scroll >= titles.len) return null;
+    const catalog = if (state.mod_registry) |*value| value else return null;
+    var matches: [8]usize = undefined;
+    const count = registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches);
+    if (count == 0) return null;
+    const shown = @min(count, matches.len);
+    return catalog.entries()[matches[@min(state.selected_mod, shown - 1)]];
+}
+
 fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
     if (width < 840 or x < page_layout.detailContentX(width) or x > width - page_layout.right_margin) return false;
     const scan = state.scan orelse return false;
@@ -865,6 +940,7 @@ fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
         const row_y = page_layout.mod_first_y + @as(f32, @floatFromInt(row)) * page_layout.mod_row_height;
         if (y >= row_y - 8 and y <= row_y + 12) {
             state.selected_mod = row;
+            clearSelectedModArtwork();
             return true;
         }
     }
@@ -1030,6 +1106,48 @@ fn modDownloadWorker(config: ModDownloadConfig) void {
         return;
     };
     finishWorker(.{ .mod_download = .{ .registry_index = config.registry_index, .path = path } });
+}
+
+fn syncSelectedModArtwork(registry_index: usize, entry: registry.Entry) void {
+    if (state.mod_artwork_registry_index == registry_index) return;
+    clearSelectedModArtwork();
+    if (entry.artwork == null) {
+        state.mod_artwork_registry_index = registry_index;
+        return;
+    }
+    if (isBusy()) return;
+    state.mod_artwork_registry_index = registry_index;
+    if (!beginWorker()) return;
+    state.worker = std.Thread.spawn(.{}, modArtworkWorker, .{registry_index}) catch {
+        cancelWorker();
+        return;
+    };
+}
+
+fn clearSelectedModArtwork() void {
+    destroyArtworkTexture(&state.mod_artwork_texture);
+    state.mod_artwork_registry_index = std.math.maxInt(usize);
+}
+
+fn modArtworkWorker(registry_index: usize) void {
+    const allocator = std.heap.c_allocator;
+    const catalog = &(state.mod_registry orelse {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = "RegistryUnavailable" } });
+        return;
+    });
+    const cache = registryCachePath(allocator) catch |err| {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
+        return;
+    };
+    defer allocator.free(cache);
+    const path = (registry.downloadArtwork(allocator, state.threaded.io(), catalog.entries()[registry_index], cache) catch |err| {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
+        return;
+    }) orelse {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index } });
+        return;
+    };
+    finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .path = path } });
 }
 
 fn registryCachePath(allocator: std.mem.Allocator) ![]u8 {
@@ -1465,7 +1583,38 @@ fn harvestWorker() void {
         .refresh => |*refresh| harvestRefresh(refresh),
         .sync => |sync_result| harvestSync(sync_result),
         .mod_download => |download_result| harvestModDownload(download_result),
+        .mod_artwork => |artwork_result| harvestModArtwork(artwork_result),
     }
+}
+
+fn harvestModArtwork(result: ModArtworkResult) void {
+    defer if (result.path) |path| std.heap.c_allocator.free(path);
+    if (result.registry_index != state.mod_artwork_registry_index) return;
+    const path = result.path orelse return;
+    var decoded = importer.decodeArtwork(std.heap.c_allocator, state.threaded.io(), path) catch return;
+    defer decoded.deinit(std.heap.c_allocator);
+    var mip_levels: [sg.max_mipmaps]sg.Range = @splat(.{});
+    mip_levels[0] = .{ .ptr = decoded.pixels.ptr, .size = decoded.pixels.len };
+    const image = sg.makeImage(.{
+        .width = @intCast(decoded.width),
+        .height = @intCast(decoded.height),
+        .pixel_format = .RGBA8,
+        .data = .{ .mip_levels = mip_levels },
+        .label = "mod-artwork",
+    });
+    if (sg.queryImageState(image) != .VALID) return;
+    const view = sg.makeView(.{ .texture = .{ .image = image }, .label = "mod-artwork-view" });
+    if (sg.queryViewState(view) != .VALID) {
+        sg.destroyImage(image);
+        return;
+    }
+    state.mod_artwork_texture = .{
+        .title_index = result.registry_index,
+        .image = image,
+        .view = view,
+        .width = @floatFromInt(decoded.width),
+        .height = @floatFromInt(decoded.height),
+    };
 }
 
 fn harvestModDownload(result: ModDownloadResult) void {

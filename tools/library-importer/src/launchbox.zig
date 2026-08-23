@@ -54,6 +54,15 @@ pub fn openSearch(
     const url = try searchUrl(allocator, display_name);
     defer allocator.free(url);
 
+    try openUrl(allocator, io, environ, url);
+}
+
+pub fn attributedUrl(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const separator: u8 = if (std.mem.indexOfScalar(u8, url, '?') == null) '?' else '&';
+    return std.fmt.allocPrint(allocator, "{s}{c}utm_source=m64menu&utm_medium=desktop_app&utm_campaign=mod_catalog", .{ url, separator });
+}
+
+pub fn openUrl(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, url: []const u8) !void {
     var system_root: ?[]u8 = null;
     defer if (system_root) |path| allocator.free(path);
     var executable: []const u8 = undefined;
@@ -125,4 +134,13 @@ test "LaunchBox URL encodes UTF-8 and brackets" {
         "https://gamesdb.launchbox-app.com/games/results/Pokemon%20%5BHack%5D%20-%20Pok%C3%A9mon",
         url,
     );
+}
+
+test "project attribution uses explicit analytics parameters" {
+    const plain = try attributedUrl(std.testing.allocator, "https://example.com/mod");
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("https://example.com/mod?utm_source=m64menu&utm_medium=desktop_app&utm_campaign=mod_catalog", plain);
+    const existing = try attributedUrl(std.testing.allocator, "https://example.com/mod?version=1");
+    defer std.testing.allocator.free(existing);
+    try std.testing.expectEqualStrings("https://example.com/mod?version=1&utm_source=m64menu&utm_medium=desktop_app&utm_campaign=mod_catalog", existing);
 }
