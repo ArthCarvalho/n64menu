@@ -61,6 +61,20 @@ const SourceKind = enum { automatic, playlist, directory };
 const TitleSyncState = enum { ADD, KEEP, UPDATE };
 const UiLibraryDiff = struct { add: usize = 0, keep: usize = 0, update: usize = 0, remove: usize = 0 };
 
+const page_layout = struct {
+    const workflow_y: f32 = 142;
+    const workflow_height: f32 = 72;
+    const status_y: f32 = 226;
+    const library_top: f32 = 252;
+    const grid_y: f32 = library_top + 38;
+    const detail_x: f32 = 616;
+    const detail_content_x: f32 = detail_x + 16;
+    const mod_first_y: f32 = grid_y + 136;
+    const mod_row_height: f32 = 20;
+    const mod_button_y: f32 = grid_y + 198;
+    const artwork_button_y: f32 = grid_y + 188;
+};
+
 const ArtworkTexture = struct {
     title_index: usize = std.math.maxInt(usize),
     failed: bool = false,
@@ -314,7 +328,8 @@ export fn frame() void {
     if (startup.frameAt(state.startup_elapsed).stage != .done) {
         drawStartup(width, height);
     } else {
-        drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = height - 48 }, colors.panel);
+        drawSynthwaveBackground(width, height);
+        drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 104 }, colors.panel);
         drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 6 }, colors.pink);
         drawText(44, 50, colors.yellow, "M64 RETROARCH SYNC", .{});
         drawText(44, 78, colors.dim, "Automatic RetroArch -> SummerCart workflow", .{});
@@ -324,8 +339,7 @@ export fn frame() void {
         drawButton(layout.sdSync(width), if (canSyncSd() and !busy) colors.yellow else colors.border, "SYNC TO SD (FAST)");
         drawButton(layout.usbSync(width), if (canSyncUsb() and !busy) colors.orange else colors.border, "SYNC OVER USB (SLOW)");
 
-        drawRetroArchPanel(width);
-        drawDestinationPanels(width);
+        drawWorkflowStrip(width);
         drawStatus();
         drawTitles(width, height);
     }
@@ -335,6 +349,44 @@ export fn frame() void {
     sdtx.draw();
     sg.endPass();
     sg.commit();
+}
+
+fn drawSynthwaveBackground(width: f32, height: f32) void {
+    const bands: usize = 32;
+    const top = Color{ .r = 16, .g = 6, .b = 38 };
+    const bottom = Color{ .r = 68, .g = 18, .b = 86 };
+    for (0..bands) |index| {
+        const t = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(bands - 1));
+        const y0 = height * @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(bands));
+        const y1 = height * @as(f32, @floatFromInt(index + 1)) / @as(f32, @floatFromInt(bands));
+        drawRect(.{ .x = 0, .y = y0, .w = width, .h = y1 - y0 }, .{
+            .r = @intFromFloat(@round(@as(f32, @floatFromInt(top.r)) + @as(f32, @floatFromInt(bottom.r - top.r)) * t)),
+            .g = @intFromFloat(@round(@as(f32, @floatFromInt(top.g)) + @as(f32, @floatFromInt(bottom.g - top.g)) * t)),
+            .b = @intFromFloat(@round(@as(f32, @floatFromInt(top.b)) + @as(f32, @floatFromInt(bottom.b - top.b)) * t)),
+        });
+    }
+    const bar_height: f32 = 80;
+    const margin: f32 = 40;
+    const span = height + bar_height + margin;
+    const travel = @mod(@as(f32, @floatCast(state.startup_elapsed * 60.0)), span);
+    const bar_y = height + margin - travel;
+    for (0..16) |index| {
+        const half: usize = 8;
+        const distance = if (index < half) index else 15 - index;
+        const alpha = (@as(f32, @floatFromInt(distance)) * 56.0 / @as(f32, @floatFromInt(half))) / 255.0;
+        if (alpha <= 0) continue;
+        const y = bar_y + @as(f32, @floatFromInt(index)) * 5;
+        if (y + 5 <= 0 or y >= height) continue;
+        const t = std.math.clamp((y + 2.5) / height, 0, 1);
+        const base_r = 16.0 + 52.0 * t;
+        const base_g = 6.0 + 12.0 * t;
+        const base_b = 38.0 + 48.0 * t;
+        drawRect(.{ .x = 0, .y = @max(0, y), .w = width, .h = @min(height, y + 5) - @max(0, y) }, .{
+            .r = @intFromFloat(@round(base_r + (168.0 - base_r) * alpha)),
+            .g = @intFromFloat(@round(base_g + (132.0 - base_g) * alpha)),
+            .b = @intFromFloat(@round(base_b + (220.0 - base_b) * alpha)),
+        });
+    }
 }
 
 fn drawStartup(width: f32, height: f32) void {
@@ -411,87 +463,80 @@ fn dimColor(color: Color, intensity: f32) Color {
     };
 }
 
-fn drawRetroArchPanel(width: f32) void {
-    const panel = Rect{ .x = 44, .y = 112, .w = width - 88, .h = 170 };
+fn drawWorkflowStrip(width: f32) void {
+    const panel = Rect{ .x = 44, .y = page_layout.workflow_y, .w = width - 88, .h = page_layout.workflow_height };
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
+    const gap: f32 = 12;
+    const column_width = (panel.w - 32 - gap * 2) / 3;
+    const library_x = panel.x + 16;
+    const sd_x = library_x + column_width + gap;
+    const usb_x = sd_x + column_width + gap;
+    drawCompactLibrary(library_x, panel.y + 14);
+    drawCompactSd(sd_x, panel.y + 14);
+    drawCompactUsb(usb_x, panel.y + 14);
+}
+
+fn drawCompactLibrary(x: f32, y: f32) void {
+    drawText(x, y, colors.pink, "GAME LIBRARY", .{});
     if (state.scan) |scan| {
         const preview = scan.preview();
         const coverage = artworkCoverage(preview.*);
-        drawText(60, 128, colors.pink, "GAME LIBRARY", .{});
-        drawText(60, 160, colors.white, "{d} GAMES READY", .{preview.titles.len});
-        drawText(260, 160, if (coverage == preview.titles.len) colors.good else colors.orange, "{d} WITH ARTWORK", .{coverage});
-        drawText(60, 194, colors.dim, "SOURCE", .{});
-        drawText(228, 194, if (state.active_source_kind == .automatic) colors.good else colors.orange, "{s}", .{switch (scan) {
-            .retroarch => if (state.active_source_kind == .automatic) "RETROARCH (FOUND AUTOMATICALLY)" else "RETROARCH PLAYLIST",
-            .directory => "DROPPED FOLDER",
-        }});
-        if (coverage != preview.titles.len) drawText(60, 226, colors.orange, "{d} GAME(S) NEED ARTWORK", .{preview.titles.len - coverage});
-        drawText(60, 256, colors.dim, "Drop another ROM folder or RetroArch playlist to change the library.", .{});
+        drawText(x, y + 28, colors.white, "{d} GAMES", .{preview.titles.len});
+        drawText(x + 104, y + 28, if (coverage == preview.titles.len) colors.good else colors.orange, "{d} ART", .{coverage});
     } else {
-        drawText(60, 128, colors.pink, "GAME LIBRARY", .{});
-        drawText(60, 166, colors.dim, "Looking for your RetroArch Nintendo 64 games...", .{});
-        drawText(60, 206, colors.orange, "You can also drop a ROM folder or RetroArch playlist here.", .{});
+        drawText(x, y + 28, colors.dim, "LOOKING FOR GAMES...", .{});
     }
 }
 
-fn drawDestinationPanels(width: f32) void {
-    const gap: f32 = 12;
-    const panel_width = (width - 88 - gap) / 2;
-    drawCardPanel(.{ .x = 44, .y = 298, .w = panel_width, .h = 144 });
-    drawUsbPanel(.{ .x = 44 + panel_width + gap, .y = 298, .w = panel_width, .h = 144 });
-}
-
-fn drawCardPanel(panel: Rect) void {
-    drawRect(panel, colors.inset);
-    drawOutline(panel, colors.border, 2);
-    drawText(panel.x + 16, 314, colors.pink, "SD CARD (FASTEST)", .{});
+fn drawCompactSd(x: f32, y: f32) void {
+    drawText(x, y, colors.pink, "SD CARD", .{});
     if (state.card) |card| {
-        drawText(panel.x + 16, 348, colors.good, "READY TO SYNC", .{});
-        if (card.library) |library| {
-            drawText(panel.x + 16, 378, colors.dim, "{d} GAMES CURRENTLY ON CARD", .{library.titles.len});
-            drawDiff(panel.x + 16, 414, libraryDiffFor(library.titles));
-        } else {
-            drawText(panel.x + 16, 382, colors.orange, "Could not read the current game list.", .{});
-        }
+        drawText(x, y + 28, colors.good, "READY", .{});
+        if (card.library) |library| drawCompactDiff(x + 72, y + 28, libraryDiffFor(library.titles));
     } else {
-        drawText(panel.x + 16, 350, colors.dim, "No SummerCart SD card found.", .{});
-        drawText(panel.x + 16, 388, colors.orange, "Insert the card for the fastest sync.", .{});
+        drawText(x, y + 28, colors.dim, "NOT CONNECTED", .{});
     }
 }
 
-fn drawUsbPanel(panel: Rect) void {
-    drawRect(panel, colors.inset);
-    drawOutline(panel, colors.border, 2);
-    drawText(panel.x + 16, 314, colors.pink, "USB CART", .{});
+fn drawCompactUsb(x: f32, y: f32) void {
+    drawText(x, y, colors.pink, "USB CART", .{});
     if (state.device) |device| {
-        const power_color = switch (device.power) {
+        const color = switch (device.power) {
             .off => colors.good,
             .on => colors.bad,
             .unknown => colors.orange,
         };
-        drawText(panel.x + 16, 348, power_color, "{s}", .{powerLabel(device.power)});
-        if (device.library) |library| {
-            drawText(panel.x + 16, 378, colors.dim, "{d} GAMES CURRENTLY ON CART", .{library.titles.len});
-            drawDiff(panel.x + 16, 414, libraryDiffFor(library.titles));
-        } else {
-            drawText(panel.x + 16, 382, colors.orange, "Could not read the current game list.", .{});
-        }
+        drawText(x, y + 28, color, "{s}", .{switch (device.power) {
+            .off => "READY",
+            .on => "POWER OFF CONSOLE",
+            .unknown => "CHECK CONNECTION",
+        }});
+        if (device.power == .off) if (device.library) |library| drawCompactDiff(x + 72, y + 28, libraryDiffFor(library.titles));
     } else {
-        drawText(panel.x + 16, 350, colors.dim, "No USB cart found.", .{});
-        drawText(panel.x + 16, 388, colors.dim, "Connect the cart to sync without removing the SD card.", .{});
+        drawText(x, y + 28, colors.dim, "NOT CONNECTED", .{});
     }
 }
 
-fn drawDiff(x: f32, y: f32, diff: UiLibraryDiff) void {
-    drawText(x, y, colors.good, "+{d} ADD", .{diff.add});
-    drawText(x + 96, y, colors.white, "{d} KEEP", .{diff.keep});
-    drawText(x + 192, y, colors.orange, "{d} UPDATE", .{diff.update});
-    drawText(x + 304, y, colors.bad, "-{d} REMOVE", .{diff.remove});
+fn drawCompactDiff(x: f32, y: f32, diff: UiLibraryDiff) void {
+    var offset: f32 = 0;
+    if (diff.add != 0) {
+        drawText(x + offset, y, colors.good, "+{d} ADD", .{diff.add});
+        offset += 88;
+    }
+    if (diff.update != 0) {
+        drawText(x + offset, y, colors.orange, "{d} UPDATE", .{diff.update});
+        offset += 104;
+    }
+    if (diff.remove != 0) {
+        drawText(x + offset, y, colors.bad, "-{d} REMOVE", .{diff.remove});
+        offset += 104;
+    }
+    if (offset == 0) drawText(x, y, colors.dim, "NO CHANGES", .{});
 }
 
 fn drawTitles(width: f32, height: f32) void {
-    const top: f32 = 510;
+    const top: f32 = page_layout.library_top;
     const bottom_margin: f32 = 36;
     if (height <= top + 100) return;
     drawText(44, top, colors.white, "LIBRARY", .{});
@@ -505,7 +550,7 @@ fn drawTitles(width: f32, height: f32) void {
     state.preview_scroll = @min(state.preview_scroll, titles.len - 1);
 
     const area_x: f32 = 44;
-    const area_y = top + 38;
+    const area_y = page_layout.grid_y;
     const area_width: f32 = @min(544, width - 88);
     const area_height = height - area_y - bottom_margin;
     const metrics = grid.layout(area_width, area_height);
@@ -537,7 +582,7 @@ fn drawTitles(width: f32, height: f32) void {
 }
 
 fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
-    const panel = Rect{ .x = 616, .y = top, .w = @max(0, width - 660), .h = 236 };
+    const panel = Rect{ .x = page_layout.detail_x, .y = top, .w = @max(0, width - 660), .h = 236 };
     if (panel.w < 180) return;
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
@@ -756,7 +801,7 @@ fn handleClick(x: f32, y: f32) void {
 }
 
 fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
-    if (width < 840 or x < 632 or x > width - 44) return false;
+    if (width < 840 or x < page_layout.detail_content_x or x > width - 44) return false;
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
@@ -765,7 +810,7 @@ fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
     const count = registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches);
     const shown = @min(count, @min(matches.len, 3));
     for (0..shown) |row| {
-        const row_y = 684 + @as(f32, @floatFromInt(row)) * 20;
+        const row_y = page_layout.mod_first_y + @as(f32, @floatFromInt(row)) * page_layout.mod_row_height;
         if (y >= row_y - 8 and y <= row_y + 12) {
             state.selected_mod = row;
             return true;
@@ -775,7 +820,7 @@ fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
 }
 
 fn downloadSelectedMod(width: f32, x: f32, y: f32) bool {
-    if (width < 840 or !contains(.{ .x = 632, .y = 746, .w = 196, .h = 30 }, x, y)) return false;
+    if (width < 840 or !contains(.{ .x = page_layout.detail_content_x, .y = page_layout.mod_button_y, .w = 196, .h = 30 }, x, y)) return false;
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
@@ -802,7 +847,7 @@ fn searchMissingArtwork(width: f32, x: f32, y: f32) bool {
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
     const title = titles[state.preview_scroll];
     if (title.artwork_path != null) return false;
-    const button = Rect{ .x = 632, .y = 736, .w = 196, .h = 30 };
+    const button = Rect{ .x = page_layout.detail_content_x, .y = page_layout.artwork_button_y, .w = 196, .h = 30 };
     if (width < 840 or !contains(button, x, y)) return false;
     launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, title.display_name) catch |err| {
         setStatus(false, "Could not open LaunchBox search: {s}.", .{@errorName(err)});
@@ -817,7 +862,7 @@ fn selectGridTitle(width: f32, height: f32, x: f32, y: f32) bool {
     const titles = scan.preview().titles;
     if (titles.len == 0 or height <= 610) return false;
     const area_x: f32 = 44;
-    const area_y: f32 = 548;
+    const area_y: f32 = page_layout.grid_y;
     const area_width: f32 = @min(544, width - 88);
     const area_height = height - area_y - 36;
     const metrics = grid.layout(area_width, area_height);
@@ -1496,14 +1541,6 @@ fn syncStateDescription(sync_state: TitleSyncState) []const u8 {
     };
 }
 
-fn powerLabel(power: PowerState) []const u8 {
-    return switch (power) {
-        .unknown => "CART FOUND - CHECK POWER",
-        .off => "READY TO SYNC",
-        .on => "TURN CONSOLE OFF TO SYNC",
-    };
-}
-
 fn artworkCoverage(scan: importer.ScanResult) usize {
     var count: usize = 0;
     for (scan.titles) |title| if (title.artwork_path != null) {
@@ -1564,7 +1601,7 @@ fn setStatus(good: bool, comptime format: []const u8, args: anytype) void {
 fn drawStatus() void {
     lockWorker();
     defer unlockWorker();
-    drawText(44, 470, if (state.status_good) colors.good else colors.bad, "{s}", .{state.status[0..state.status_len]});
+    drawText(44, page_layout.status_y, if (state.status_good) colors.good else colors.bad, "{s}", .{state.status[0..state.status_len]});
 }
 
 fn head(value: []const u8, maximum: usize) []const u8 {
