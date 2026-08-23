@@ -401,44 +401,20 @@ fn drawRetroArchPanel(width: f32) void {
     if (state.scan) |scan| {
         const preview = scan.preview();
         const coverage = artworkCoverage(preview.*);
-        drawText(60, 128, colors.pink, "{s}", .{switch (scan) {
-            .retroarch => "RETROARCH N64 LIBRARY",
-            .directory => "DROPPED ROM DIRECTORY",
+        drawText(60, 128, colors.pink, "GAME LIBRARY", .{});
+        drawText(60, 160, colors.white, "{d} GAMES READY", .{preview.titles.len});
+        drawText(260, 160, if (coverage == preview.titles.len) colors.good else colors.orange, "{d} WITH ARTWORK", .{coverage});
+        drawText(60, 194, colors.dim, "SOURCE", .{});
+        drawText(228, 194, if (state.active_source_kind == .automatic) colors.good else colors.orange, "{s}", .{switch (scan) {
+            .retroarch => if (state.active_source_kind == .automatic) "RETROARCH (FOUND AUTOMATICALLY)" else "RETROARCH PLAYLIST",
+            .directory => "DROPPED FOLDER",
         }});
-        drawLabelValue(60, 156, "SOURCE", tail(scan.sourcePath(), 108), colors.white);
-        switch (scan) {
-            .retroarch => |retroarch| {
-                drawLabelValue(60, 180, "SYSTEM", retroarch.source.system_name, colors.white);
-                drawText(60, 204, colors.dim, "PLAYLIST ENTRIES", .{});
-                drawText(228, 204, colors.white, "{d}", .{retroarch.source.playlist_entries});
-                drawText(330, 204, colors.dim, "RESOLVED", .{});
-                drawText(426, 204, colors.white, "{d}", .{retroarch.source.resolved_entries});
-                if (retroarch.source.unsupported_entries != 0) drawText(760, 204, colors.bad, "{d} UNSUPPORTED", .{retroarch.source.unsupported_entries});
-            },
-            .directory => {
-                drawText(60, 180, colors.dim, "SCAN", .{});
-                drawText(228, 180, colors.white, "RECURSIVE .Z64 / .V64 / .N64", .{});
-                drawText(60, 204, colors.dim, "ROMS FOUND", .{});
-                drawText(228, 204, colors.white, "{d}", .{preview.titles.len});
-            },
-        }
-        drawText(520, 204, colors.dim, "SELECTED", .{});
-        drawText(616, 204, colors.yellow, "{d}", .{preview.titles.len});
-        drawText(60, 232, colors.dim, "ARTWORK COVERAGE", .{});
-        drawText(228, 232, if (coverage == preview.titles.len) colors.good else colors.orange, "{d}/{d}", .{ coverage, preview.titles.len });
-        drawText(330, 232, colors.dim, "MODE", .{});
-        drawText(426, 232, if (state.active_source_kind == .automatic) colors.good else colors.orange, "{s}", .{switch (state.active_source_kind) {
-            .automatic => "AUTO DETECTED",
-            .playlist => "DROPPED FALLBACK",
-            .directory => "DROPPED DIRECTORY",
-        }});
-        drawText(60, 256, colors.dim, "Drop a ROM directory to scan recursively, or an .lpl playlist as fallback.", .{});
+        if (coverage != preview.titles.len) drawText(60, 226, colors.orange, "{d} GAME(S) NEED ARTWORK", .{preview.titles.len - coverage});
+        drawText(60, 256, colors.dim, "Drop another ROM folder or RetroArch playlist to change the library.", .{});
     } else {
-        drawText(60, 128, colors.pink, "N64 LIBRARY", .{});
-        drawText(60, 164, colors.dim, "Playlist path: not detected", .{});
-        drawText(60, 192, colors.dim, "System: unavailable", .{});
-        drawText(60, 220, colors.dim, "Playlist entries: 0   Resolved: 0   Selected: 0", .{});
-        drawText(60, 248, colors.orange, "Drop a ROM directory, or an .lpl playlist as fallback.", .{});
+        drawText(60, 128, colors.pink, "GAME LIBRARY", .{});
+        drawText(60, 166, colors.dim, "Looking for your RetroArch Nintendo 64 games...", .{});
+        drawText(60, 206, colors.orange, "You can also drop a ROM folder or RetroArch playlist here.", .{});
     }
 }
 
@@ -452,61 +428,49 @@ fn drawDestinationPanels(width: f32) void {
 fn drawCardPanel(panel: Rect) void {
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
-    drawText(panel.x + 16, 314, colors.pink, "MOUNTED SD CARD (PREFERRED)", .{});
+    drawText(panel.x + 16, 314, colors.pink, "SD CARD (FASTEST)", .{});
     if (state.card) |card| {
-        drawLabelValue(panel.x + 16, 344, "ROOT", tail(card.root, 42), colors.white);
-        drawText(panel.x + 16, 370, colors.dim, "MENU ROM", .{});
-        drawText(panel.x + 184, 370, if (card.has_menu_rom) colors.good else colors.orange, "{s}", .{if (card.has_menu_rom) "PRESENT" else "MISSING"});
-        drawText(panel.x + 16, 396, colors.dim, "INSTALLED", .{});
+        drawText(panel.x + 16, 348, colors.good, "READY TO SYNC", .{});
         if (card.library) |library| {
-            drawText(panel.x + 184, 396, colors.white, "{d}", .{library.titles.len});
-            drawDiff(panel.x + 16, 420, library.titles.len, libraryDiffFor(library.titles));
+            drawText(panel.x + 16, 378, colors.dim, "{d} GAMES CURRENTLY ON CARD", .{library.titles.len});
+            drawDiff(panel.x + 16, 414, libraryDiffFor(library.titles));
         } else {
-            drawText(panel.x + 184, 396, colors.orange, "UNAVAILABLE", .{});
+            drawText(panel.x + 16, 382, colors.orange, "Could not read the current game list.", .{});
         }
-        if (card.detected_count > 1) drawText(panel.x + panel.w - 146, 314, colors.orange, "USING 1 OF {d}", .{card.detected_count});
     } else {
-        drawText(panel.x + 16, 346, colors.dim, "ROOT       NOT DETECTED", .{});
-        drawText(panel.x + 16, 372, colors.dim, "MENU ROM   UNAVAILABLE", .{});
-        drawText(panel.x + 16, 398, colors.dim, "INSTALLED  0", .{});
-        drawText(panel.x + 16, 420, colors.orange, "INSERT OR MOUNT A SUMMERCART SD CARD", .{});
+        drawText(panel.x + 16, 350, colors.dim, "No SummerCart SD card found.", .{});
+        drawText(panel.x + 16, 388, colors.orange, "Insert the card for the fastest sync.", .{});
     }
 }
 
 fn drawUsbPanel(panel: Rect) void {
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
-    drawText(panel.x + 16, 314, colors.pink, "USB SUMMERCART", .{});
+    drawText(panel.x + 16, 314, colors.pink, "USB CART", .{});
     if (state.device) |device| {
-        drawLabelValue(panel.x + 16, 344, "SERIAL", device.serial, colors.white);
-        drawLabelValue(panel.x + 16, 370, "PORT", tail(device.port, 42), colors.white);
-        drawText(panel.x + 16, 396, colors.dim, "POWER", .{});
         const power_color = switch (device.power) {
             .off => colors.good,
             .on => colors.bad,
             .unknown => colors.orange,
         };
-        drawText(panel.x + 184, 396, power_color, "{s}", .{powerLabel(device.power)});
+        drawText(panel.x + 16, 348, power_color, "{s}", .{powerLabel(device.power)});
         if (device.library) |library| {
-            drawDiff(panel.x + 16, 420, library.titles.len, libraryDiffFor(library.titles));
+            drawText(panel.x + 16, 378, colors.dim, "{d} GAMES CURRENTLY ON CART", .{library.titles.len});
+            drawDiff(panel.x + 16, 414, libraryDiffFor(library.titles));
         } else {
-            drawText(panel.x + 16, 420, colors.orange, "INSTALLED LIBRARY UNAVAILABLE", .{});
+            drawText(panel.x + 16, 382, colors.orange, "Could not read the current game list.", .{});
         }
-        if (device.detected_count > 1) drawText(panel.x + panel.w - 146, 314, colors.orange, "USING 1 OF {d}", .{device.detected_count});
     } else {
-        drawText(panel.x + 16, 346, colors.dim, "SERIAL     NOT DETECTED", .{});
-        drawText(panel.x + 16, 372, colors.dim, "PORT       UNAVAILABLE", .{});
-        drawText(panel.x + 16, 398, colors.bad, "POWER      UNAVAILABLE", .{});
-        drawText(panel.x + 16, 420, colors.dim, "INSTALLED  0", .{});
+        drawText(panel.x + 16, 350, colors.dim, "No USB cart found.", .{});
+        drawText(panel.x + 16, 388, colors.dim, "Connect the cart to sync without removing the SD card.", .{});
     }
 }
 
-fn drawDiff(x: f32, y: f32, installed: usize, diff: UiLibraryDiff) void {
-    drawText(x, y, colors.dim, "{d} INST", .{installed});
-    drawText(x + 80, y, colors.good, "+{d} ADD", .{diff.add});
-    drawText(x + 176, y, colors.white, "{d} KEEP", .{diff.keep});
-    drawText(x + 272, y, colors.orange, "{d} UPDATE", .{diff.update});
-    drawText(x + 384, y, colors.bad, "-{d} HIDE", .{diff.remove});
+fn drawDiff(x: f32, y: f32, diff: UiLibraryDiff) void {
+    drawText(x, y, colors.good, "+{d} ADD", .{diff.add});
+    drawText(x + 96, y, colors.white, "{d} KEEP", .{diff.keep});
+    drawText(x + 192, y, colors.orange, "{d} UPDATE", .{diff.update});
+    drawText(x + 304, y, colors.bad, "-{d} REMOVE", .{diff.remove});
 }
 
 fn drawTitles(width: f32, height: f32) void {
@@ -562,16 +526,14 @@ fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
     drawOutline(panel, colors.border, 2);
     drawText(panel.x + 16, panel.y + 18, colors.pink, "SELECTED GAME", .{});
     drawText(panel.x + 16, panel.y + 48, if (title.artwork_path == null) colors.orange else colors.white, "{s}", .{head(title.display_name, 46)});
-    drawText(panel.x + 16, panel.y + 80, colors.dim, "ID", .{});
-    drawText(panel.x + 112, panel.y + 80, colors.yellow, "{s}", .{importer.titleIdSlice(&title.id)});
     const sync_state = titleSyncState(title);
-    drawText(panel.x + 16, panel.y + 106, colors.dim, "SYNC", .{});
-    drawText(panel.x + 112, panel.y + 106, syncStateColor(sync_state), "{s}", .{@tagName(sync_state)});
-    drawText(panel.x + 16, panel.y + 132, colors.dim, "ARTWORK", .{});
-    drawText(panel.x + 112, panel.y + 132, if (title.artwork_path == null) colors.orange else colors.good, "{s}", .{if (title.artwork_path == null) "MISSING" else @tagName(title.artwork_status)});
+    drawText(panel.x + 16, panel.y + 88, syncStateColor(sync_state), "{s}", .{syncStateDescription(sync_state)});
     if (title.artwork_path == null) {
-        drawText(panel.x + 16, panel.y + 164, colors.dim, "No image was found beside this ROM.", .{});
-        drawButton(.{ .x = panel.x + 16, .y = panel.y + 188, .w = 196, .h = 30 }, colors.yellow, "SEARCH LAUNCHBOX");
+        drawText(panel.x + 16, panel.y + 126, colors.orange, "ARTWORK NEEDED", .{});
+        drawText(panel.x + 16, panel.y + 152, colors.dim, "No image was found for this game.", .{});
+        drawButton(.{ .x = panel.x + 16, .y = panel.y + 188, .w = 196, .h = 30 }, colors.yellow, "FIND ARTWORK");
+    } else {
+        drawText(panel.x + 16, panel.y + 126, colors.good, "ARTWORK READY", .{});
     }
 }
 
@@ -1269,25 +1231,25 @@ fn harvestRefresh(result: *RefreshResult) void {
     state.preview_destination = if (state.card != null) .direct_sd else .usb;
 
     if (result.override_target_blocked) {
-        setStatus(false, "Playlist fallback failed: core can only target {s}; exact arbitrary .lpl targeting is unavailable.", .{expected_playlist_name});
+        setStatus(false, "That playlist could not be used. Drop {s} or a ROM folder instead.", .{expected_playlist_name});
     } else if (state.scan == null) {
-        setStatus(false, "RetroArch detection failed: {s}. SD: {s}; USB: {s}.", .{ state.scan_error orelse "UnknownError", cardSummary(), deviceSummary() });
+        setStatus(false, "No Nintendo 64 games found. Drop a ROM folder or RetroArch playlist to continue.", .{});
     } else if (state.card != null) {
         if (state.card_error) |name| {
             setStatus(false, "Mounted SD detected, but its installed library could not be read: {s}.", .{name});
         } else {
-            setStatus(true, "Ready for fast direct SD sync of {d} title(s).", .{state.scan.?.preview().titles.len});
+            setStatus(true, "Ready to sync {d} games directly to the SD card.", .{state.scan.?.preview().titles.len});
         }
     } else if (state.device == null) {
         setStatus(false, "N64 library ready; no mounted SD or USB SummerCart detected.", .{});
     } else if (state.device.?.power == .on) {
         setStatus(false, "USB SummerCart detected, but sync is blocked while the console is powered on.", .{});
     } else if (state.device.?.power == .unknown) {
-        setStatus(false, "USB SummerCart detected, but power probe failed: {s}.", .{state.device_error orelse "UnknownError"});
+        setStatus(false, "USB cart found, but its power state could not be checked. Reconnect it and Refresh.", .{});
     } else if (state.device_error != null) {
         setStatus(false, "USB is available, but its installed library could not be read: {s}.", .{state.device_error.?});
     } else {
-        setStatus(true, "Ready to sync {d} title(s) over USB.", .{state.scan.?.preview().titles.len});
+        setStatus(true, "Ready to sync {d} games over USB.", .{state.scan.?.preview().titles.len});
     }
 }
 
@@ -1313,16 +1275,6 @@ fn harvestSync(result: SyncResult) void {
             runRefresh();
         }
     }
-}
-
-fn cardSummary() []const u8 {
-    if (state.card) |card| return card.root;
-    return state.card_error orelse "not detected";
-}
-
-fn deviceSummary() []const u8 {
-    if (state.device) |device| return powerLabel(device.power);
-    return state.device_error orelse "not detected";
 }
 
 fn canSyncSd() bool {
@@ -1391,11 +1343,19 @@ fn syncStateColor(sync_state: TitleSyncState) Color {
     };
 }
 
+fn syncStateDescription(sync_state: TitleSyncState) []const u8 {
+    return switch (sync_state) {
+        .ADD => "WILL BE ADDED",
+        .KEEP => "ALREADY ON CART",
+        .UPDATE => "WILL BE UPDATED",
+    };
+}
+
 fn powerLabel(power: PowerState) []const u8 {
     return switch (power) {
-        .unknown => "UNKNOWN (SYNC BLOCKED)",
-        .off => "OFF (SAFE TO SYNC)",
-        .on => "ON (SYNC BLOCKED)",
+        .unknown => "CART FOUND - CHECK POWER",
+        .off => "READY TO SYNC",
+        .on => "TURN CONSOLE OFF TO SYNC",
     };
 }
 
@@ -1460,15 +1420,6 @@ fn drawStatus() void {
     lockWorker();
     defer unlockWorker();
     drawText(44, 470, if (state.status_good) colors.good else colors.bad, "{s}", .{state.status[0..state.status_len]});
-}
-
-fn drawLabelValue(x: f32, y: f32, label: []const u8, value: []const u8, value_color: Color) void {
-    drawText(x, y, colors.dim, "{s}", .{label});
-    drawText(x + 168, y, value_color, "{s}", .{value});
-}
-
-fn tail(value: []const u8, maximum: usize) []const u8 {
-    return if (value.len > maximum) value[value.len - maximum ..] else value;
 }
 
 fn head(value: []const u8, maximum: usize) []const u8 {
