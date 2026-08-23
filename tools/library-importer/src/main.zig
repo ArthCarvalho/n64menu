@@ -2,6 +2,7 @@ const std = @import("std");
 const sokol = @import("sokol");
 const importer = @import("importer");
 const deployer = @import("deployer");
+const grid = @import("grid");
 const icon = @import("icon.zig");
 const launchbox = @import("launchbox");
 const sdcard = @import("sdcard");
@@ -58,6 +59,15 @@ const SyncDestination = enum { direct_sd, usb };
 const SourceKind = enum { automatic, playlist, directory };
 const TitleSyncState = enum { ADD, KEEP, UPDATE };
 const UiLibraryDiff = struct { add: usize = 0, keep: usize = 0, update: usize = 0, remove: usize = 0 };
+
+const ArtworkTexture = struct {
+    title_index: usize = std.math.maxInt(usize),
+    failed: bool = false,
+    image: sg.Image = .{},
+    view: sg.View = .{},
+    width: f32 = 0,
+    height: f32 = 0,
+};
 
 const CardSnapshot = struct {
     root: []u8,
@@ -183,6 +193,8 @@ const state = struct {
     var threaded: std.Io.Threaded = undefined;
     var io_ready = false;
     var pass_action: sg.PassAction = .{};
+    var artwork_sampler: sg.Sampler = .{};
+    var artwork_textures: [16]ArtworkTexture = @splat(.{});
     var scan: ?LibraryScan = null;
     var card: ?CardSnapshot = null;
     var device: ?DeviceSnapshot = null;
@@ -218,10 +230,6 @@ const layout = struct {
     fn usbSync(width: f32) Rect {
         return .{ .x = width - 234, .y = 50, .w = 190, .h = 38 };
     }
-
-    fn launchBox(width: f32, y: f32) Rect {
-        return .{ .x = width - 116, .y = y, .w = 72, .h = 18 };
-    }
 };
 
 export fn init() void {
@@ -229,6 +237,13 @@ export fn init() void {
     state.io_ready = true;
     sg.setup(.{ .environment = sglue.environment(), .logger = .{ .func = slog.func } });
     sgl.setup(.{ .max_vertices = 131_072, .max_commands = 16_384, .logger = .{ .func = slog.func } });
+    state.artwork_sampler = sg.makeSampler(.{
+        .min_filter = .LINEAR,
+        .mag_filter = .LINEAR,
+        .wrap_u = .CLAMP_TO_EDGE,
+        .wrap_v = .CLAMP_TO_EDGE,
+        .label = "importer-artwork-sampler",
+    });
     sdtx.setup(.{
         .fonts = blk: {
             var fonts: [8]sdtx.FontDesc = @splat(.{});
@@ -257,6 +272,8 @@ export fn cleanup() void {
         state.worker = null;
     }
     harvestWorker();
+    clearArtworkTextures();
+    if (state.artwork_sampler.id != sg.invalid_id) sg.destroySampler(state.artwork_sampler);
     clearScan();
     clearCard();
     clearDevice();
@@ -494,34 +511,201 @@ fn drawDiff(x: f32, y: f32, installed: usize, diff: UiLibraryDiff) void {
 
 fn drawTitles(width: f32, height: f32) void {
     const top: f32 = 510;
-    if (height <= top + 40) return;
-    drawText(44, top, colors.white, "SELECTED TITLES", .{});
-    drawText(width - 360, top, colors.dim, "SYNC", .{});
-    drawText(width - 282, top, colors.dim, "ARTWORK STATUS", .{});
+    const bottom_margin: f32 = 36;
+    if (height <= top + 100) return;
+    drawText(44, top, colors.white, "LIBRARY", .{});
     drawRect(.{ .x = 44, .y = top + 22, .w = width - 88, .h = 2 }, colors.border);
-    if (state.scan) |scan| {
-        const titles = scan.preview().titles;
-        const available = height - top - 48;
-        if (available <= 0) return;
-        const rows = @max(@as(usize, 1), @as(usize, @intFromFloat(available / 24)));
-        const end = @min(titles.len, state.preview_scroll + rows);
-        for (titles[state.preview_scroll..end], 0..) |title, row| {
-            const y = top + 36 + @as(f32, @floatFromInt(row)) * 24;
-            drawText(44, y, colors.yellow, "{s}", .{importer.titleIdSlice(&title.id)});
-            const missing_artwork = title.artwork_path == null;
-            drawText(100, y, if (missing_artwork) colors.orange else colors.white, "{s}", .{head(title.display_name, 82)});
-            const sync_state = titleSyncState(title);
-            drawText(width - 360, y, syncStateColor(sync_state), "{s}", .{@tagName(sync_state)});
-            if (missing_artwork) {
-                drawText(width - 282, y, colors.orange, "MISSING", .{});
-                drawButton(layout.launchBox(width, y - 7), colors.yellow, "SEARCH");
-            } else {
-                drawText(width - 282, y, colors.good, "{s}", .{@tagName(title.artwork_status)});
+    const scan = state.scan orelse {
+        drawText(44, top + 42, colors.dim, "No resolved N64 titles.", .{});
+        return;
+    };
+    const titles = scan.preview().titles;
+    if (titles.len == 0) return;
+    state.preview_scroll = @min(state.preview_scroll, titles.len - 1);
+
+    const area_x: f32 = 44;
+    const area_y = top + 38;
+    const area_width: f32 = @min(544, width - 88);
+    const area_height = height - area_y - bottom_margin;
+    const metrics = grid.layout(area_width, area_height);
+    const first_row = grid.firstVisibleRow(state.preview_scroll, titles.len, metrics.visible_rows);
+    const first_index = first_row * grid.columns;
+    const end_index = @min(titles.len, (first_row + metrics.visible_rows) * grid.columns);
+    syncArtworkTextures(titles, first_index, end_index);
+
+    for (titles[first_index..end_index], first_index..) |_, index| {
+        if (index == state.preview_scroll) continue;
+        const card = fromGridRect(grid.cardRect(area_x, area_y, metrics, first_row, index));
+        drawCover(card, textureForTitle(index), titles[index].display_name, false);
+    }
+    const selected_index = state.preview_scroll;
+    if (selected_index >= first_index and selected_index < end_index) {
+        const title = titles[selected_index];
+        var card = fromGridRect(grid.cardRect(area_x, area_y, metrics, first_row, selected_index));
+        const growth = @min(8.0, metrics.card_height * 0.1);
+        const scale = (metrics.card_height + growth) / metrics.card_height;
+        const grown_width = metrics.card_width * scale;
+        card.x -= (grown_width - card.w) * 0.5;
+        card.y -= growth * 0.5;
+        card.w = grown_width;
+        card.h += growth;
+        drawCover(card, textureForTitle(selected_index), title.display_name, true);
+    }
+
+    drawSelectedTitle(width, area_y, titles[state.preview_scroll]);
+}
+
+fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
+    const panel = Rect{ .x = 616, .y = top, .w = @max(0, width - 660), .h = 236 };
+    if (panel.w < 180) return;
+    drawRect(panel, colors.inset);
+    drawOutline(panel, colors.border, 2);
+    drawText(panel.x + 16, panel.y + 18, colors.pink, "SELECTED GAME", .{});
+    drawText(panel.x + 16, panel.y + 48, if (title.artwork_path == null) colors.orange else colors.white, "{s}", .{head(title.display_name, 46)});
+    drawText(panel.x + 16, panel.y + 80, colors.dim, "ID", .{});
+    drawText(panel.x + 112, panel.y + 80, colors.yellow, "{s}", .{importer.titleIdSlice(&title.id)});
+    const sync_state = titleSyncState(title);
+    drawText(panel.x + 16, panel.y + 106, colors.dim, "SYNC", .{});
+    drawText(panel.x + 112, panel.y + 106, syncStateColor(sync_state), "{s}", .{@tagName(sync_state)});
+    drawText(panel.x + 16, panel.y + 132, colors.dim, "ARTWORK", .{});
+    drawText(panel.x + 112, panel.y + 132, if (title.artwork_path == null) colors.orange else colors.good, "{s}", .{if (title.artwork_path == null) "MISSING" else @tagName(title.artwork_status)});
+    if (title.artwork_path == null) {
+        drawText(panel.x + 16, panel.y + 164, colors.dim, "No image was found beside this ROM.", .{});
+        drawButton(.{ .x = panel.x + 16, .y = panel.y + 188, .w = 196, .h = 30 }, colors.yellow, "SEARCH LAUNCHBOX");
+    }
+}
+
+fn drawCover(rect: Rect, texture: ?*const ArtworkTexture, display_name: []const u8, selected: bool) void {
+    drawRect(rect, colors.background);
+    if (texture) |artwork| {
+        const scale = @min(rect.w / artwork.width, rect.h / artwork.height);
+        const width = artwork.width * scale;
+        const height = artwork.height * scale;
+        const x = rect.x + (rect.w - width) * 0.5;
+        const y = rect.y + (rect.h - height) * 0.5;
+        const brightness: u8 = if (selected) 255 else 102;
+        sgl.enableTexture();
+        sgl.texture(artwork.view, state.artwork_sampler);
+        sgl.beginQuads();
+        sgl.v2fT2fC3b(x, y, 0, 0, brightness, brightness, brightness);
+        sgl.v2fT2fC3b(x + width, y, 1, 0, brightness, brightness, brightness);
+        sgl.v2fT2fC3b(x + width, y + height, 1, 1, brightness, brightness, brightness);
+        sgl.v2fT2fC3b(x, y + height, 0, 1, brightness, brightness, brightness);
+        sgl.end();
+        sgl.disableTexture();
+    } else {
+        drawRect(rect, colors.inset);
+        drawCoverName(rect, display_name);
+    }
+    if (selected) {
+        drawOutline(.{ .x = rect.x - 3, .y = rect.y - 3, .w = rect.w + 6, .h = rect.h + 6 }, colors.yellow, 2);
+        drawMarker(rect.x - 17, rect.y + rect.h * 0.5 - 6, 11, colors.yellow);
+    }
+}
+
+fn drawCoverName(rect: Rect, display_name: []const u8) void {
+    const maximum = @max(@as(usize, 8), @as(usize, @intFromFloat((rect.w - 20) / 8)));
+    var offset: usize = 0;
+    var lines: [3][]const u8 = @splat("");
+    var count: usize = 0;
+    while (offset < display_name.len and count < lines.len) : (count += 1) {
+        const remaining = display_name[offset..];
+        var length = @min(maximum, remaining.len);
+        if (length < remaining.len) {
+            if (std.mem.lastIndexOfScalar(u8, remaining[0..length], ' ')) |space| {
+                if (space != 0) length = space;
             }
         }
-    } else {
-        drawText(44, top + 36, colors.dim, "No resolved N64 titles.", .{});
+        lines[count] = remaining[0..length];
+        offset += length;
+        while (offset < display_name.len and display_name[offset] == ' ') offset += 1;
     }
+    const visible_count = @min(count, lines.len);
+    const first_y = rect.y + (rect.h - @as(f32, @floatFromInt(visible_count)) * 16) * 0.5 + 4;
+    for (lines[0..visible_count], 0..) |line, index| {
+        const width = @as(f32, @floatFromInt(line.len * 8));
+        drawText(rect.x + (rect.w - width) * 0.5, first_y + @as(f32, @floatFromInt(index)) * 16, colors.orange, "{s}", .{line});
+    }
+}
+
+fn syncArtworkTextures(titles: []const importer.Title, first: usize, end: usize) void {
+    for (&state.artwork_textures) |*texture| {
+        if (texture.title_index == std.math.maxInt(usize)) continue;
+        if (texture.title_index < first or texture.title_index >= end or titles[texture.title_index].artwork_path == null) destroyArtworkTexture(texture);
+    }
+    for (first..end) |index| {
+        const path = titles[index].artwork_path orelse continue;
+        if (textureForTitle(index) != null) continue;
+        var slot: ?*ArtworkTexture = null;
+        for (&state.artwork_textures) |*texture| if (texture.title_index == std.math.maxInt(usize)) {
+            slot = texture;
+            break;
+        };
+        const texture = slot orelse return;
+        texture.title_index = index;
+        var decoded = importer.decodeArtwork(std.heap.c_allocator, state.threaded.io(), path) catch {
+            texture.failed = true;
+            continue;
+        };
+        defer decoded.deinit(std.heap.c_allocator);
+        var mip_levels: [sg.max_mipmaps]sg.Range = @splat(.{});
+        mip_levels[0] = .{ .ptr = decoded.pixels.ptr, .size = decoded.pixels.len };
+        const image = sg.makeImage(.{
+            .width = @intCast(decoded.width),
+            .height = @intCast(decoded.height),
+            .pixel_format = .RGBA8,
+            .data = .{ .mip_levels = mip_levels },
+            .label = "importer-artwork",
+        });
+        if (sg.queryImageState(image) != .VALID) {
+            sg.destroyImage(image);
+            texture.failed = true;
+            continue;
+        }
+        const view = sg.makeView(.{ .texture = .{ .image = image }, .label = "importer-artwork-view" });
+        if (sg.queryViewState(view) != .VALID) {
+            sg.destroyView(view);
+            sg.destroyImage(image);
+            texture.failed = true;
+            continue;
+        }
+        texture.* = .{
+            .title_index = index,
+            .image = image,
+            .view = view,
+            .width = @floatFromInt(decoded.width),
+            .height = @floatFromInt(decoded.height),
+        };
+    }
+}
+
+fn textureForTitle(index: usize) ?*const ArtworkTexture {
+    for (&state.artwork_textures) |*texture| if (texture.title_index == index) return if (texture.failed) null else texture;
+    return null;
+}
+
+fn clearArtworkTextures() void {
+    for (&state.artwork_textures) |*texture| destroyArtworkTexture(texture);
+}
+
+fn destroyArtworkTexture(texture: *ArtworkTexture) void {
+    if (texture.title_index == std.math.maxInt(usize)) return;
+    if (texture.view.id != sg.invalid_id) sg.destroyView(texture.view);
+    if (texture.image.id != sg.invalid_id) sg.destroyImage(texture.image);
+    texture.* = .{};
+}
+
+fn fromGridRect(rect: grid.Rect) Rect {
+    return .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h };
+}
+
+fn drawMarker(x: f32, y: f32, size: f32, color: Color) void {
+    sgl.beginTriangles();
+    sgl.c3b(color.r, color.g, color.b);
+    sgl.v2f(x, y);
+    sgl.v2f(x + size, y + size * 0.5);
+    sgl.v2f(x, y + size);
+    sgl.end();
 }
 
 export fn event(event_ptr: [*c]const sapp.Event) void {
@@ -534,6 +718,10 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
         .KEY_DOWN => if (!input.key_repeat) switch (input.key_code) {
             .F5 => runRefresh(),
             .ENTER => runPreferredSync(),
+            .LEFT => moveTitleSelection(-1),
+            .RIGHT => moveTitleSelection(1),
+            .UP => moveTitleSelection(-@as(isize, @intCast(grid.columns))),
+            .DOWN => moveTitleSelection(@intCast(grid.columns)),
             .ESCAPE => sapp.requestQuit(),
             else => {},
         },
@@ -544,8 +732,10 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
 
 fn handleClick(x: f32, y: f32) void {
     if (isBusy()) return;
-    const width = ui_scale.metrics(sapp.widthf(), sapp.heightf()).width;
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    const width = metrics.width;
     if (searchMissingArtwork(width, x, y)) return;
+    if (selectGridTitle(width, metrics.height, x, y)) return;
     if (contains(layout.refresh(width), x, y)) {
         runRefresh();
     } else if (contains(layout.sdSync(width), x, y)) {
@@ -560,23 +750,36 @@ fn handleClick(x: f32, y: f32) void {
 fn searchMissingArtwork(width: f32, x: f32, y: f32) bool {
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
-    const top: f32 = 510;
-    const height = ui_scale.metrics(sapp.widthf(), sapp.heightf()).height;
-    if (height <= top + 40) return false;
-    const available = height - top - 48;
-    if (available <= 0) return false;
-    const rows = @max(@as(usize, 1), @as(usize, @intFromFloat(available / 24)));
-    const end = @min(titles.len, state.preview_scroll + rows);
-    for (titles[state.preview_scroll..end], 0..) |title, row| {
-        if (title.artwork_path != null) continue;
-        const row_y = top + 36 + @as(f32, @floatFromInt(row)) * 24;
-        if (!contains(layout.launchBox(width, row_y - 7), x, y)) continue;
-        launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, title.display_name) catch |err| {
-            setStatus(false, "Could not open LaunchBox search: {s}.", .{@errorName(err)});
-            return true;
-        };
-        setStatus(true, "Opened LaunchBox search for {s}.", .{title.display_name});
+    if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
+    const title = titles[state.preview_scroll];
+    if (title.artwork_path != null) return false;
+    const button = Rect{ .x = 632, .y = 736, .w = 196, .h = 30 };
+    if (width < 840 or !contains(button, x, y)) return false;
+    launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, title.display_name) catch |err| {
+        setStatus(false, "Could not open LaunchBox search: {s}.", .{@errorName(err)});
         return true;
+    };
+    setStatus(true, "Opened LaunchBox search for {s}.", .{title.display_name});
+    return true;
+}
+
+fn selectGridTitle(width: f32, height: f32, x: f32, y: f32) bool {
+    const scan = state.scan orelse return false;
+    const titles = scan.preview().titles;
+    if (titles.len == 0 or height <= 610) return false;
+    const area_x: f32 = 44;
+    const area_y: f32 = 548;
+    const area_width: f32 = @min(544, width - 88);
+    const area_height = height - area_y - 36;
+    const metrics = grid.layout(area_width, area_height);
+    const first_row = grid.firstVisibleRow(state.preview_scroll, titles.len, metrics.visible_rows);
+    const first_index = first_row * grid.columns;
+    const end_index = @min(titles.len, (first_row + metrics.visible_rows) * grid.columns);
+    for (first_index..end_index) |index| {
+        if (contains(fromGridRect(grid.cardRect(area_x, area_y, metrics, first_row, index)), x, y)) {
+            state.preview_scroll = index;
+            return true;
+        }
     }
     return false;
 }
@@ -609,8 +812,18 @@ fn handleDrop() void {
 
 fn scrollTitles(delta: f32) void {
     const scan = state.scan orelse return;
-    if (delta < 0 and state.preview_scroll + 1 < scan.preview().titles.len) state.preview_scroll += 1;
-    if (delta > 0 and state.preview_scroll > 0) state.preview_scroll -= 1;
+    const titles = scan.preview().titles;
+    if (titles.len == 0) return;
+    if (delta < 0) state.preview_scroll = @min(titles.len - 1, state.preview_scroll + grid.columns);
+    if (delta > 0) state.preview_scroll -|= @min(state.preview_scroll, grid.columns);
+}
+
+fn moveTitleSelection(delta: isize) void {
+    const scan = state.scan orelse return;
+    const titles = scan.preview().titles;
+    if (titles.len == 0) return;
+    const current: isize = @intCast(state.preview_scroll);
+    state.preview_scroll = @intCast(std.math.clamp(current + delta, 0, @as(isize, @intCast(titles.len - 1))));
 }
 
 fn runRefresh() void {
@@ -1206,6 +1419,7 @@ fn libraryFingerprint(titles: []const importer.Title) [32]u8 {
 }
 
 fn clearScan() void {
+    clearArtworkTextures();
     if (state.scan) |*scan| scan.deinit(std.heap.c_allocator);
     state.scan = null;
 }
