@@ -94,13 +94,14 @@ See [BUILDING.md](BUILDING.md).
 `m64importer` is a native Zig/Sokol application for Windows, Linux and macOS. It
 automatically finds RetroArch's Nintendo 64 playlist, resolves playlist ROM paths,
 reuses RetroArch's `Named_Boxarts` or `Named_Snaps`, and synchronizes the generated
-library directly to a powered-off SummerCart64 over USB.
+library directly to a powered-off SummerCart64 over USB. A ROM directory can also
+be dropped onto the window for recursive `.n64`, `.v64`, and `.z64` discovery.
 
-The importer reads the playlist rather than scanning arbitrary folders. Playlist
-labels become menu names, Android `/storage/<volume>/...` paths are remapped to
-mounted desktop drives when possible, and `.n64`, `.v64` and `.z64` entries are
-normalized before stable IDs are generated. Unsupported playlist formats are shown
-in the UI instead of silently imported.
+Playlist labels become menu names and Android `/storage/<volume>/...` paths are
+remapped to mounted desktop drives when possible. For dropped directories, filenames
+become menu names and images beside each ROM are selected automatically. ROMs without
+artwork are highlighted and include a button that opens a LaunchBox Games Database
+search. All supported ROM byte orders are normalized before stable IDs are generated.
 
 On refresh, the importer also reads the existing SummerCart `title.csv` and name
 sidecars. The UI shows the current installed library and a sync plan containing
@@ -129,9 +130,12 @@ mise run importer-run
 The app detects RetroArch, mounted SummerCart SD cards and USB carts automatically.
 Use **Refresh** to repeat detection, **Sync to SD (Fast)** for the recommended direct
 copy, or **Sync over USB (Slow)** when removing the card is inconvenient. USB sync is
-blocked unless the cart reports that the console is powered off. An `.lpl` file may
-be dropped onto the window only as a fallback when automatic playlist discovery
-cannot find the intended installation.
+blocked unless the cart reports that the console is powered off. Drop a directory to
+use it as the active recursive ROM source. An `.lpl` file may be dropped as a fallback
+when automatic playlist discovery cannot find the intended installation.
+
+The menu loads cover art only for visible rows and supports large catalogs without
+a fixed title-count limit.
 
 Development commands:
 

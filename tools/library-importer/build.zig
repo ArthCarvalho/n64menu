@@ -26,6 +26,11 @@ pub fn build(b: *std.Build) void {
     });
     app.addImport("sokol", sokol.module("sokol"));
     app.addImport("importer", core);
+    app.addImport("launchbox", b.createModule(.{
+        .root_source_file = b.path("src/launchbox.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     app.addImport("sdcard", sdcard);
     app.addImport("startup", b.createModule(.{
         .root_source_file = b.path("src/startup.zig"),
@@ -89,6 +94,17 @@ pub fn build(b: *std.Build) void {
     run_sdcard_tests.step.dependOn(&run_deployer_tests.step);
     test_step.dependOn(&run_sdcard_tests.step);
 
+    const launchbox_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/launchbox.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_launchbox_tests = b.addRunArtifact(launchbox_tests);
+    run_launchbox_tests.step.dependOn(&run_sdcard_tests.step);
+    test_step.dependOn(&run_launchbox_tests.step);
+
     const startup_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/startup.zig"),
@@ -97,7 +113,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_startup_tests = b.addRunArtifact(startup_tests);
-    run_startup_tests.step.dependOn(&run_sdcard_tests.step);
+    run_startup_tests.step.dependOn(&run_launchbox_tests.step);
     test_step.dependOn(&run_startup_tests.step);
 
     const ui_scale_tests = b.addTest(.{

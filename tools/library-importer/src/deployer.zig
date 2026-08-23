@@ -3,12 +3,17 @@ const builtin = @import("builtin");
 
 const executable_name = if (builtin.os.tag == .windows) "sc64deployer.exe" else "sc64deployer";
 const output_limit = 4 * 1024 * 1024;
-const title_csv_limit = 64 * 1024;
+const title_csv_limit = 16 * 1024 * 1024;
 const title_name_limit = 4 * 1024;
+pub const TitleId = [7]u8;
 
 pub const InstalledTitle = struct {
-    id: [5]u8,
+    id: TitleId,
     name: []u8,
+
+    pub fn idSlice(self: *const InstalledTitle) []const u8 {
+        return self.id[0 .. std.mem.indexOfScalar(u8, &self.id, 0) orelse self.id.len];
+    }
 };
 
 pub const ReadInstalledOptions = struct {
@@ -185,18 +190,21 @@ pub fn parseConsolePoweredOn(output: []const u8) !bool {
     return error.InvalidDeviceInfo;
 }
 
-/// Parses the comma-delimited five-byte IDs written to menu/title.csv.
-pub fn parseTitleCsv(allocator: std.mem.Allocator, bytes: []const u8) ![][5]u8 {
-    var ids: std.ArrayList([5]u8) = .empty;
+/// Parses comma-delimited IDs while retaining existing five-character catalogs.
+pub fn parseTitleCsv(allocator: std.mem.Allocator, bytes: []const u8) ![]TitleId {
+    var ids: std.ArrayList(TitleId) = .empty;
     errdefer ids.deinit(allocator);
 
     var offset: usize = 0;
     while (offset < bytes.len and bytes[offset] != 0) {
-        if (bytes.len - offset < 5) return error.InvalidTitleCsv;
-        const id = bytes[offset..][0..5].*;
-        for (id) |byte| if (!isTitleIdByte(byte)) return error.InvalidTitleCsv;
+        const end = std.mem.indexOfAnyPos(u8, bytes, offset, ",\x00") orelse bytes.len;
+        const length = end - offset;
+        if (length == 0 or length > 7) return error.InvalidTitleCsv;
+        var id: TitleId = @splat(0);
+        @memcpy(id[0..length], bytes[offset..end]);
+        for (id[0..length]) |byte| if (!isTitleIdByte(byte)) return error.InvalidTitleCsv;
         try ids.append(allocator, id);
-        offset += 5;
+        offset = end;
 
         if (offset == bytes.len or bytes[offset] == 0) break;
         if (bytes[offset] != ',') return error.InvalidTitleCsv;
@@ -264,9 +272,10 @@ pub fn readInstalledLibraryOptions(
         titles.deinit(allocator);
     }
     for (ids) |id| {
-        const sd_name_path = try std.fmt.allocPrint(allocator, "/menu/title/{s}/{s}_e.name", .{ id, id });
+        const id_slice = id[0 .. std.mem.indexOfScalar(u8, &id, 0) orelse id.len];
+        const sd_name_path = try std.fmt.allocPrint(allocator, "/menu/title/{s}/{s}_e.name", .{ id_slice, id_slice });
         defer allocator.free(sd_name_path);
-        const local_name_path = try std.fmt.allocPrint(allocator, "{s}/{s}.name", .{ temp_root, id });
+        const local_name_path = try std.fmt.allocPrint(allocator, "{s}/{s}.name", .{ temp_root, id_slice });
         defer allocator.free(local_name_path);
 
         var name: []u8 = undefined;
@@ -274,9 +283,9 @@ pub fn readInstalledLibraryOptions(
             const raw_name = try cwd.readFileAlloc(io, local_name_path, allocator, .limited(title_name_limit));
             defer allocator.free(raw_name);
             const trimmed = std.mem.trimEnd(u8, raw_name, "\x00\r\n");
-            name = if (trimmed.len == 0) try allocator.dupe(u8, &id) else try allocator.dupe(u8, trimmed);
+            name = if (trimmed.len == 0) try allocator.dupe(u8, id_slice) else try allocator.dupe(u8, trimmed);
         } else |err| switch (err) {
-            error.DownloadNotFound => name = try allocator.dupe(u8, &id),
+            error.DownloadNotFound => name = try allocator.dupe(u8, id_slice),
             else => return err,
         }
         errdefer allocator.free(name);
@@ -292,7 +301,7 @@ pub fn diffLibrary(desired: []const InstalledTitle, installed: []const Installed
         const found = findTitle(installed, title.id);
         if (found == null) {
             result.add += 1;
-        } else if (std.mem.eql(u8, found.?.name, &found.?.id) or storedNameEqual(found.?.name, title.name)) {
+        } else if (std.mem.eql(u8, found.?.name, found.?.idSlice()) or storedNameEqual(found.?.name, title.name)) {
             // Libraries created before .name sidecars use the ID as their fallback
             // display name. A matching ID is already installed and should not be
             // presented as an update merely because that old metadata is absent.
@@ -385,8 +394,9 @@ fn isMissingRemoteFile(output: []const u8) bool {
         containsIgnoreCase(output, "no such file");
 }
 
-fn findTitle(titles: []const InstalledTitle, id: [5]u8) ?*const InstalledTitle {
-    for (titles) |*title| if (std.mem.eql(u8, &title.id, &id)) return title;
+fn findTitle(titles: []const InstalledTitle, id: TitleId) ?*const InstalledTitle {
+    const id_slice = id[0 .. std.mem.indexOfScalar(u8, &id, 0) orelse id.len];
+    for (titles) |*title| if (std.mem.eql(u8, title.idSlice(), id_slice)) return title;
     return null;
 }
 
@@ -519,8 +529,8 @@ test "title CSV parser accepts generated and legacy-ish terminators" {
         const ids = try parseTitleCsv(allocator, bytes);
         defer allocator.free(ids);
         try std.testing.expectEqual(@as(usize, 2), ids.len);
-        try std.testing.expectEqualSlices(u8, "ABCDE", &ids[0]);
-        try std.testing.expectEqualSlices(u8, "12345", &ids[1]);
+        try std.testing.expectEqualSlices(u8, "ABCDE", ids[0][0..5]);
+        try std.testing.expectEqualSlices(u8, "12345", ids[1][0..5]);
     }
 }
 
@@ -530,7 +540,12 @@ test "title CSV parser accepts empty input and rejects malformed IDs" {
     defer allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
-    try std.testing.expectError(error.InvalidTitleCsv, parseTitleCsv(allocator, "ABCD,"));
+    const short = try parseTitleCsv(allocator, "ABCD,");
+    defer allocator.free(short);
+    try std.testing.expectEqualSlices(u8, "ABCD", short[0][0..4]);
+    const extended = try parseTitleCsv(allocator, "ABCDEF,ABCDEFG,");
+    defer allocator.free(extended);
+    try std.testing.expectEqual(@as(usize, 2), extended.len);
     try std.testing.expectError(error.InvalidTitleCsv, parseTitleCsv(allocator, "ABCDE,,12345"));
     try std.testing.expectError(error.InvalidTitleCsv, parseTitleCsv(allocator, "ABC/E,12345"));
     try std.testing.expectError(error.InvalidTitleCsv, parseTitleCsv(allocator, "ABCDE\x00junk"));
@@ -538,18 +553,18 @@ test "title CSV parser accepts empty input and rejects malformed IDs" {
 
 test "library diff compares IDs and names" {
     const desired = [_]InstalledTitle{
-        .{ .id = "AAAAA".*, .name = @constCast("Same") },
-        .{ .id = "BBBBB".*, .name = @constCast("Renamed") },
-        .{ .id = "CCCCC".*, .name = @constCast("New") },
+        .{ .id = "AAAAA\x00\x00".*, .name = @constCast("Same") },
+        .{ .id = "BBBBB\x00\x00".*, .name = @constCast("Renamed") },
+        .{ .id = "CCCCC\x00\x00".*, .name = @constCast("New") },
     };
     const installed = [_]InstalledTitle{
-        .{ .id = "AAAAA".*, .name = @constCast("Same") },
-        .{ .id = "BBBBB".*, .name = @constCast("Old name") },
-        .{ .id = "DDDDD".*, .name = @constCast("Removed") },
+        .{ .id = "AAAAA\x00\x00".*, .name = @constCast("Same") },
+        .{ .id = "BBBBB\x00\x00".*, .name = @constCast("Old name") },
+        .{ .id = "DDDDD\x00\x00".*, .name = @constCast("Removed") },
     };
     try std.testing.expectEqual(LibraryDiff{ .add = 1, .keep = 1, .update = 1, .remove = 1 }, diffLibrary(&desired, &installed));
 
-    const legacy = [_]InstalledTitle{.{ .id = "AAAAA".*, .name = @constCast("AAAAA") }};
+    const legacy = [_]InstalledTitle{.{ .id = "AAAAA\x00\x00".*, .name = @constCast("AAAAA") }};
     try std.testing.expectEqual(LibraryDiff{ .add = 2, .keep = 1, .update = 0, .remove = 0 }, diffLibrary(&desired, &legacy));
 }
 

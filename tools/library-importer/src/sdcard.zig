@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const title_csv_limit = 64 * 1024;
+const title_csv_limit = 16 * 1024 * 1024;
 const title_name_limit = 4 * 1024;
+pub const TitleId = [7]u8;
 
 pub const Card = struct {
     root: []u8,
@@ -21,8 +22,12 @@ pub const CardList = struct {
 };
 
 pub const InstalledTitle = struct {
-    id: [5]u8,
+    id: TitleId,
     name: []u8,
+
+    pub fn idSlice(self: *const InstalledTitle) []const u8 {
+        return self.id[0 .. std.mem.indexOfScalar(u8, &self.id, 0) orelse self.id.len];
+    }
 };
 
 pub const InstalledLibrary = struct {
@@ -147,7 +152,7 @@ pub fn detectCardsFromRoots(
 }
 
 /// Reads menu/title.csv and each optional menu/title/ID/ID_e.name sidecar.
-/// Missing or blank sidecars fall back to the five-byte title ID.
+/// Missing or blank sidecars fall back to the title ID.
 pub fn readInstalledLibrary(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -170,10 +175,11 @@ pub fn readInstalledLibrary(
         titles.deinit(allocator);
     }
     for (ids) |id| {
+        const id_slice = id[0 .. std.mem.indexOfScalar(u8, &id, 0) orelse id.len];
         const name_path = try std.fmt.allocPrint(
             allocator,
             "{s}{c}menu{c}title{c}{s}{c}{s}_e.name",
-            .{ card_root, std.fs.path.sep, std.fs.path.sep, std.fs.path.sep, id, std.fs.path.sep, id },
+            .{ card_root, std.fs.path.sep, std.fs.path.sep, std.fs.path.sep, id_slice, std.fs.path.sep, id_slice },
         );
         defer allocator.free(name_path);
 
@@ -184,8 +190,8 @@ pub fn readInstalledLibrary(
         defer if (raw_name) |bytes| allocator.free(bytes);
         const name = if (raw_name) |bytes| blk: {
             const trimmed = std.mem.trimEnd(u8, bytes, "\x00\r\n");
-            break :blk try allocator.dupe(u8, if (trimmed.len == 0) &id else trimmed);
-        } else try allocator.dupe(u8, &id);
+            break :blk try allocator.dupe(u8, if (trimmed.len == 0) id_slice else trimmed);
+        } else try allocator.dupe(u8, id_slice);
         errdefer allocator.free(name);
         try titles.append(allocator, .{ .id = id, .name = name });
     }
@@ -266,16 +272,19 @@ pub fn syncFromStaging(
     }
 }
 
-fn parseTitleCsv(allocator: std.mem.Allocator, bytes: []const u8) ![][5]u8 {
-    var ids: std.ArrayList([5]u8) = .empty;
+fn parseTitleCsv(allocator: std.mem.Allocator, bytes: []const u8) ![]TitleId {
+    var ids: std.ArrayList(TitleId) = .empty;
     errdefer ids.deinit(allocator);
     var offset: usize = 0;
     while (offset < bytes.len and bytes[offset] != 0) {
-        if (bytes.len - offset < 5) return error.InvalidTitleCsv;
-        const id = bytes[offset..][0..5].*;
-        for (id) |byte| if (!std.ascii.isAlphanumeric(byte)) return error.InvalidTitleCsv;
+        const end = std.mem.indexOfAnyPos(u8, bytes, offset, ",\x00") orelse bytes.len;
+        const length = end - offset;
+        if (length == 0 or length > 7) return error.InvalidTitleCsv;
+        var id: TitleId = @splat(0);
+        @memcpy(id[0..length], bytes[offset..end]);
+        for (id[0..length]) |byte| if (!std.ascii.isAlphanumeric(byte)) return error.InvalidTitleCsv;
         try ids.append(allocator, id);
-        offset += 5;
+        offset = end;
         if (offset == bytes.len or bytes[offset] == 0) break;
         if (bytes[offset] != ',') return error.InvalidTitleCsv;
         offset += 1;
