@@ -57,6 +57,33 @@ pub const ScanResult = struct {
     }
 };
 
+pub const DecodedArtwork = struct {
+    width: usize,
+    height: usize,
+    pixels: []u8,
+
+    pub fn deinit(self: *DecodedArtwork, allocator: std.mem.Allocator) void {
+        allocator.free(self.pixels);
+        self.* = undefined;
+    }
+};
+
+pub fn decodeArtwork(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !DecodedArtwork {
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var image = try zigimg.Image.fromFilePath(allocator, io, path, &read_buffer);
+    defer image.deinit(allocator);
+    try image.convert(allocator, .rgba32);
+    const pixels = image.pixels.rgba32;
+    const bytes = try allocator.alloc(u8, pixels.len * 4);
+    for (pixels, 0..) |pixel, index| {
+        bytes[index * 4] = pixel.r;
+        bytes[index * 4 + 1] = pixel.g;
+        bytes[index * 4 + 2] = pixel.b;
+        bytes[index * 4 + 3] = pixel.a;
+    }
+    return .{ .width = image.width, .height = image.height, .pixels = bytes };
+}
+
 pub const RetroArchPlaylistEntry = struct {
     path: []u8,
     label: []u8,
