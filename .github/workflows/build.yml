@@ -1,17 +1,37 @@
 name: Build
 
-# Every run verifies the clean-machine build and uploads a workflow artifact.
-# Version tags additionally publish that exact artifact as a GitHub Release.
+# Pull requests expose an explicit approval gate; add the `run-ci` label to run builds.
+# Manually dispatched runs verify the selected branch and upload workflow artifacts.
+# Version tags still build and publish that exact artifact as a GitHub Release.
 
 on:
-  push:
+  workflow_dispatch:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  approval:
+    name: CI approval
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require run-ci label
+        if: github.event_name == 'pull_request' && !(github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+        run: |
+          echo "Remove and re-add the run-ci label to approve this PR head."
+          exit 1
+
   importer:
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     needs: windows
     strategy:
       fail-fast: false
@@ -82,6 +102,8 @@ jobs:
           if-no-files-found: error
 
   windows:
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    needs: approval
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -122,6 +144,22 @@ jobs:
           name: sc64menu
           path: zig-out/bin/sc64menu.n64
           if-no-files-found: error
+
+  required:
+    name: CI
+    if: always()
+    needs: [approval, windows, importer]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify approved build matrix
+        env:
+          APPROVAL_RESULT: ${{ needs.approval.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          IMPORTER_RESULT: ${{ needs.importer.result }}
+        run: |
+          test "$APPROVAL_RESULT" = success
+          test "$WINDOWS_RESULT" = success
+          test "$IMPORTER_RESULT" = success
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
