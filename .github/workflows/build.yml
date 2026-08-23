@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: build-${{ github.event.pull_request.number || github.ref }}
@@ -26,20 +25,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Require run-ci label
-        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
+        if: github.event_name == 'pull_request' && !(github.event.action == 'labeled' && github.event.label.name == 'run-ci')
         run: |
-          echo "Add the run-ci label to approve the build matrix."
+          echo "Remove and re-add the run-ci label to approve this PR head."
           exit 1
-      - name: Consume run-ci approval
-        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh api --method DELETE
-          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/run-ci"
 
   importer:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     needs: windows
     strategy:
       fail-fast: false
@@ -110,7 +102,7 @@ jobs:
           if-no-files-found: error
 
   windows:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     needs: approval
     runs-on: windows-latest
     steps:
