@@ -231,6 +231,18 @@ const ModArtworkResult = struct {
     err: ?[]const u8 = null,
 };
 
+const ModArtworkSlot = struct {
+    registry_index: usize = std.math.maxInt(usize),
+    texture: ArtworkTexture = .{},
+    loading: bool = false,
+};
+
+const ModBrowserData = struct {
+    catalog: *registry.Registry,
+    matches: [registry.maximum_variants_per_title]usize,
+    count: usize,
+};
+
 const WorkerResult = union(enum) {
     refresh: RefreshResult,
     sync: SyncResult,
@@ -244,12 +256,12 @@ const state = struct {
     var pass_action: sg.PassAction = .{};
     var artwork_sampler: sg.Sampler = .{};
     var artwork_textures: [grid.maximum_visible_cards]ArtworkTexture = @splat(.{});
-    var mod_artwork_texture = ArtworkTexture{};
-    var mod_artwork_registry_index: usize = std.math.maxInt(usize);
+    var mod_artwork_slots: [registry.maximum_variants_per_title]ModArtworkSlot = @splat(.{});
     var mod_registry: ?registry.Registry = null;
     var registry_is_demo = true;
     var drop_mode: DropMode = .games;
     var selected_mod: usize = 0;
+    var mod_browser_open = false;
     var scan: ?LibraryScan = null;
     var card: ?CardSnapshot = null;
     var device: ?DeviceSnapshot = null;
@@ -340,7 +352,7 @@ export fn cleanup() void {
     }
     harvestWorker();
     clearArtworkTextures();
-    destroyArtworkTexture(&state.mod_artwork_texture);
+    clearModArtworkSlots();
     if (state.artwork_sampler.id != sg.invalid_id) sg.destroySampler(state.artwork_sampler);
     clearScan();
     clearCard();
@@ -380,7 +392,11 @@ export fn frame() void {
 
         drawWorkflowStrip(width);
         drawStatus();
-        drawTitles(width, height);
+        if (state.mod_browser_open) {
+            drawModBrowser(width, height);
+        } else {
+            drawTitles(width, height);
+        }
     }
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
@@ -616,6 +632,7 @@ fn drawTitles(width: f32, height: f32) void {
         if (index == state.preview_scroll) continue;
         const card = fromGridRect(grid.cardRect(area_x, area_y, metrics, first_row, index));
         drawCover(card, textureForTitle(index), titles[index].display_name, false);
+        drawModsBadge(card, titles[index]);
     }
     const selected_index = state.preview_scroll;
     if (selected_index >= first_index and selected_index < end_index) {
@@ -629,9 +646,18 @@ fn drawTitles(width: f32, height: f32) void {
         card.w = grown_width;
         card.h += growth;
         drawCover(card, textureForTitle(selected_index), title.display_name, true);
+        drawModsBadge(card, title);
     }
 
     drawSelectedTitle(width, area_y, titles[state.preview_scroll]);
+}
+
+fn drawModsBadge(card: Rect, title: importer.Title) void {
+    const count = compatibleModCount(title);
+    if (count == 0) return;
+    const badge = Rect{ .x = card.x + card.w - 54, .y = card.y + 6, .w = 48, .h = 18 };
+    drawRect(badge, colors.pink);
+    drawText(badge.x + 5, badge.y + 5, colors.background, "{d} MOD", .{count});
 }
 
 fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
@@ -645,39 +671,89 @@ fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
     drawText(panel.x + 16, panel.y + 48, if (title.artwork_path == null) colors.orange else colors.white, "{s}", .{head(title.display_name, 46)});
     const sync_state = titleSyncState(title);
     drawText(panel.x + 16, panel.y + 76, syncStateColor(sync_state), "{s}", .{syncStateDescription(sync_state)});
-    drawCompatibleMods(panel, title, mod_count);
+    if (mod_count != 0) {
+        drawText(panel.x + 16, panel.y + 100, colors.yellow, "{d} MOD(S) AVAILABLE", .{mod_count});
+        drawText(panel.x + 16, panel.y + 126, colors.dim, "Click this game again to browse mods.", .{});
+    }
     if (title.artwork_path == null and mod_count == 0) {
         drawText(panel.x + 16, panel.y + 102, colors.orange, "ARTWORK NEEDED", .{});
         drawButton(.{ .x = panel.x + 16, .y = panel.y + 136, .w = 168, .h = 26 }, colors.yellow, "FIND ARTWORK");
     }
 }
 
+fn drawModBrowser(width: f32, height: f32) void {
+    const scan = state.scan orelse return;
+    const titles = scan.preview().titles;
+    if (titles.len == 0 or state.preview_scroll >= titles.len) return;
+    const title = titles[state.preview_scroll];
+    const catalog = if (state.mod_registry) |*value| value else return;
+    var matches: [registry.maximum_variants_per_title]usize = undefined;
+    const mod_count = @min(registry.matching(catalog, title.content_crc32, &title.content_hash, &matches), matches.len);
+    if (mod_count == 0) {
+        state.mod_browser_open = false;
+        return;
+    }
+    drawText(44, page_layout.library_top, colors.white, "{s} - VERSIONS", .{head(title.display_name, 64)});
+    drawButton(.{ .x = width - 184, .y = page_layout.library_top - 10, .w = 140, .h = 30 }, colors.orange, "BACK TO GAMES");
+    drawRect(.{ .x = 44, .y = page_layout.library_top + 22, .w = width - 88, .h = 2 }, colors.border);
+
+    const cards = mod_count + 1;
+    const area = Rect{ .x = 44, .y = page_layout.grid_y, .w = width - 88, .h = height - page_layout.grid_y - 118 };
+    const columns = std.math.clamp(@as(usize, @intFromFloat(@ceil((area.w + 16) / 220))), 2, 5);
+    const gutter: f32 = 16;
+    const card_width = (area.w - gutter * @as(f32, @floatFromInt(columns - 1))) / @as(f32, @floatFromInt(columns));
+    const card_height = @min(220, card_width * 0.72);
+    for (0..cards) |card_index| {
+        const row = card_index / columns;
+        const column = card_index % columns;
+        const rect = Rect{
+            .x = area.x + @as(f32, @floatFromInt(column)) * (card_width + gutter),
+            .y = area.y + @as(f32, @floatFromInt(row)) * (card_height + gutter),
+            .w = card_width,
+            .h = card_height,
+        };
+        const selected = card_index == state.selected_mod;
+        if (card_index == 0) {
+            drawModBrowserCard(rect, textureForTitle(state.preview_scroll), title.display_name, "ORIGINAL", selected);
+        } else {
+            const registry_index = matches[card_index - 1];
+            const entry = catalog.entries()[registry_index];
+            syncModArtwork(registry_index, entry);
+            drawModBrowserCard(rect, textureForMod(registry_index), entry.name, entry.version, selected);
+        }
+    }
+    if (state.selected_mod != 0) {
+        const entry = catalog.entries()[matches[state.selected_mod - 1]];
+        const cached = isModCached(entry);
+        drawButton(.{ .x = 44, .y = height - 74, .w = 168, .h = 30 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else "DOWNLOAD MOD");
+        drawButton(.{ .x = 224, .y = height - 74, .w = 168, .h = 30 }, colors.orange, if (entry.artwork == null) "SEARCH LAUNCHBOX" else "VIEW MOD PAGE");
+        drawText(416, height - 66, colors.dim, "{s} {s}", .{ entry.name, entry.version });
+    } else {
+        drawText(44, height - 66, colors.dim, "Original game", .{});
+    }
+}
+
+fn drawModBrowserCard(rect: Rect, texture: ?*const ArtworkTexture, name: []const u8, version: []const u8, selected: bool) void {
+    drawRect(rect, colors.inset);
+    const image_rect = Rect{ .x = rect.x + 8, .y = rect.y + 8, .w = rect.w - 16, .h = rect.h - 52 };
+    if (texture) |artwork| {
+        drawModArtwork(image_rect, artwork);
+    } else {
+        drawCoverName(image_rect, name);
+    }
+    drawText(rect.x + 10, rect.y + rect.h - 32, selectedColor(selected), "{s}", .{head(name, @max(@as(usize, 8), @as(usize, @intFromFloat((rect.w - 20) / 8))))});
+    drawText(rect.x + 10, rect.y + rect.h - 14, colors.dim, "{s}", .{version});
+    drawOutline(rect, if (selected) colors.yellow else colors.border, if (selected) 3 else 1);
+}
+
+fn selectedColor(selected: bool) Color {
+    return if (selected) colors.yellow else colors.white;
+}
+
 fn compatibleModCount(title: importer.Title) usize {
     const catalog = if (state.mod_registry) |*value| value else return 0;
     var matches: [8]usize = undefined;
     return registry.matching(catalog, title.content_crc32, &title.content_hash, &matches);
-}
-
-fn drawCompatibleMods(panel: Rect, title: importer.Title, count: usize) void {
-    const catalog = if (state.mod_registry) |*value| value else return;
-    var matches: [8]usize = undefined;
-    _ = registry.matching(catalog, title.content_crc32, &title.content_hash, &matches);
-    if (count == 0) return;
-    state.selected_mod = @min(state.selected_mod, @min(count, matches.len) - 1);
-    drawText(panel.x + 16, panel.y + 96, colors.pink, "DEMO MOD CATALOG", .{});
-    const shown = @min(count, @min(matches.len, 3));
-    for (0..shown) |row| {
-        const entry = catalog.entries()[matches[row]];
-        drawText(panel.x + 16, panel.y + 118 + @as(f32, @floatFromInt(row)) * 18, if (row == state.selected_mod) colors.yellow else colors.white, "{s} {s}", .{ head(entry.name, 28), entry.version });
-    }
-    const selected = catalog.entries()[matches[state.selected_mod]];
-    syncSelectedModArtwork(matches[state.selected_mod], selected);
-    if (textureForSelectedMod()) |artwork| {
-        drawModArtwork(.{ .x = panel.x + panel.w - 132, .y = panel.y + 18, .w = 116, .h = 82 }, artwork);
-    }
-    const cached = isModCached(selected);
-    drawButton(.{ .x = panel.x + 16, .y = panel.y + 166, .w = 152, .h = 26 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else "DOWNLOAD MOD");
-    drawButton(.{ .x = panel.x + 176, .y = panel.y + 166, .w = 152, .h = 26 }, colors.orange, if (selected.artwork == null) "SEARCH LAUNCHBOX" else "VIEW MOD PAGE");
 }
 
 fn drawModArtwork(rect: Rect, artwork: *const ArtworkTexture) void {
@@ -816,9 +892,11 @@ fn textureForTitle(index: usize) ?*const ArtworkTexture {
     return null;
 }
 
-fn textureForSelectedMod() ?*const ArtworkTexture {
-    if (state.mod_artwork_texture.title_index == std.math.maxInt(usize) or state.mod_artwork_texture.failed) return null;
-    return &state.mod_artwork_texture;
+fn textureForMod(registry_index: usize) ?*const ArtworkTexture {
+    for (&state.mod_artwork_slots) |*slot| {
+        if (slot.registry_index == registry_index and !slot.texture.failed and slot.texture.title_index != std.math.maxInt(usize)) return &slot.texture;
+    }
+    return null;
 }
 
 fn clearArtworkTextures() void {
@@ -854,12 +932,14 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
         .MOUSE_SCROLL => scrollTitles(input.scroll_y),
         .KEY_DOWN => if (!input.key_repeat) switch (input.key_code) {
             .F5 => runRefresh(),
-            .ENTER => runPreferredSync(),
-            .LEFT => moveTitleSelection(-1),
-            .RIGHT => moveTitleSelection(1),
-            .UP => moveTitleSelection(-@as(isize, @intCast(currentGridLayout().columns))),
-            .DOWN => moveTitleSelection(@intCast(currentGridLayout().columns)),
-            .ESCAPE => sapp.requestQuit(),
+            .ENTER => if (state.mod_browser_open) activateSelectedMod() else runPreferredSync(),
+            .LEFT => if (state.mod_browser_open) moveModBrowserSelection(-1) else moveTitleSelection(-1),
+            .RIGHT => if (state.mod_browser_open) moveModBrowserSelection(1) else moveTitleSelection(1),
+            .UP => if (state.mod_browser_open) moveModBrowserSelection(-@as(isize, @intCast(modBrowserColumns()))) else moveTitleSelection(-@as(isize, @intCast(currentGridLayout().columns))),
+            .DOWN => if (state.mod_browser_open) moveModBrowserSelection(@intCast(modBrowserColumns())) else moveTitleSelection(@intCast(currentGridLayout().columns)),
+            .ESCAPE => if (state.mod_browser_open) {
+                state.mod_browser_open = false;
+            } else sapp.requestQuit(),
             else => {},
         },
         .FILES_DROPPED => handleDrop(),
@@ -867,10 +947,33 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
     }
 }
 
+fn modBrowserColumns() usize {
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    const area_width = metrics.width - 88;
+    return std.math.clamp(@as(usize, @intFromFloat(@ceil((area_width + 16) / 220))), 2, 5);
+}
+
+fn moveModBrowserSelection(delta: isize) void {
+    const data = selectedModBrowserData() orelse return;
+    const maximum: isize = @intCast(data.count);
+    state.selected_mod = @intCast(std.math.clamp(@as(isize, @intCast(state.selected_mod)) + delta, 0, maximum));
+}
+
+fn activateSelectedMod() void {
+    if (state.selected_mod == 0) return;
+    const data = selectedModBrowserData() orelse return;
+    if (state.selected_mod > data.count) return;
+    downloadRegistryIndex(data.matches[state.selected_mod - 1]);
+}
+
 fn handleClick(x: f32, y: f32) void {
     if (isBusy()) return;
     const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
     const width = metrics.width;
+    if (state.mod_browser_open) {
+        handleModBrowserClick(width, metrics.height, x, y);
+        return;
+    }
     if (downloadSelectedMod(width, x, y)) return;
     if (openSelectedModPage(width, x, y)) return;
     if (selectCompatibleMod(width, x, y)) return;
@@ -897,34 +1000,43 @@ fn openSelectedModPage(width: f32, x: f32, y: f32) bool {
     const button = Rect{ .x = page_layout.detailX(width) + page_layout.mod_page_button_offset, .y = page_layout.mod_button_y, .w = 152, .h = 26 };
     if (!contains(button, x, y)) return false;
     const selected = selectedRegistryEntry() orelse return false;
-    if (selected.artwork == null) {
-        launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, selected.name) catch {
-            setStatus(false, "Could not open the LaunchBox search.", .{});
-            return true;
-        };
-        setStatus(true, "Opened a LaunchBox search for {s}.", .{selected.name});
-        return true;
-    }
-    const url = launchbox.attributedUrl(std.heap.c_allocator, selected.projectUrl) catch return true;
-    defer std.heap.c_allocator.free(url);
-    launchbox.openUrl(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, url) catch {
-        setStatus(false, "Could not open the mod project page.", .{});
-        return true;
-    };
-    setStatus(true, "Opened {s}'s project page.", .{selected.name});
+    openRegistryEntryPage(selected);
     return true;
 }
 
+fn openRegistryEntryPage(selected: registry.Entry) void {
+    if (selected.artwork == null) {
+        launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, selected.name) catch {
+            setStatus(false, "Could not open the LaunchBox search.", .{});
+            return;
+        };
+        setStatus(true, "Opened a LaunchBox search for {s}.", .{selected.name});
+        return;
+    }
+    const url = launchbox.attributedUrl(std.heap.c_allocator, selected.projectUrl) catch return;
+    defer std.heap.c_allocator.free(url);
+    launchbox.openUrl(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, url) catch {
+        setStatus(false, "Could not open the mod project page.", .{});
+        return;
+    };
+    setStatus(true, "Opened {s}'s project page.", .{selected.name});
+}
+
 fn selectedRegistryEntry() ?registry.Entry {
+    const data = selectedModBrowserData() orelse return null;
+    if (data.count == 0) return null;
+    const index = @min(state.selected_mod, data.count - 1);
+    return data.catalog.entries()[data.matches[index]];
+}
+
+fn selectedModBrowserData() ?ModBrowserData {
     const scan = state.scan orelse return null;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return null;
     const catalog = if (state.mod_registry) |*value| value else return null;
-    var matches: [8]usize = undefined;
-    const count = registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches);
-    if (count == 0) return null;
-    const shown = @min(count, matches.len);
-    return catalog.entries()[matches[@min(state.selected_mod, shown - 1)]];
+    var matches: [registry.maximum_variants_per_title]usize = undefined;
+    const count = @min(registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches), matches.len);
+    return .{ .catalog = catalog, .matches = matches, .count = count };
 }
 
 fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
@@ -940,7 +1052,6 @@ fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
         const row_y = page_layout.mod_first_y + @as(f32, @floatFromInt(row)) * page_layout.mod_row_height;
         if (y >= row_y - 8 and y <= row_y + 12) {
             state.selected_mod = row;
-            clearSelectedModArtwork();
             return true;
         }
     }
@@ -958,15 +1069,19 @@ fn downloadSelectedMod(width: f32, x: f32, y: f32) bool {
     if (count == 0) return false;
     const shown = @min(count, matches.len);
     state.selected_mod = @min(state.selected_mod, shown - 1);
-    if (!beginWorker()) return true;
-    const config = ModDownloadConfig{ .registry_index = matches[state.selected_mod] };
+    downloadRegistryIndex(matches[state.selected_mod]);
+    return true;
+}
+
+fn downloadRegistryIndex(registry_index: usize) void {
+    if (!beginWorker()) return;
+    const config = ModDownloadConfig{ .registry_index = registry_index };
     state.worker = std.Thread.spawn(.{}, modDownloadWorker, .{config}) catch |err| {
         cancelWorker();
         setStatus(false, "Could not start the mod download: {s}", .{@errorName(err)});
-        return true;
+        return;
     };
     setStatus(true, "Downloading and verifying mod patch...", .{});
-    return true;
 }
 
 fn searchMissingArtwork(width: f32, x: f32, y: f32) bool {
@@ -999,7 +1114,14 @@ fn selectGridTitle(width: f32, height: f32, x: f32, y: f32) bool {
     const end_index = @min(titles.len, (first_row + metrics.visible_rows) * metrics.columns);
     for (first_index..end_index) |index| {
         if (contains(fromGridRect(grid.cardRect(area_x, area_y, metrics, first_row, index)), x, y)) {
+            if (index == state.preview_scroll and compatibleModCount(titles[index]) != 0) {
+                state.mod_browser_open = true;
+                state.selected_mod = 0;
+                clearModArtworkSlots();
+                return true;
+            }
             state.preview_scroll = index;
+            state.selected_mod = 0;
             return true;
         }
     }
@@ -1051,6 +1173,8 @@ fn loadRegistry(path: []const u8) void {
     state.mod_registry = parsed;
     state.registry_is_demo = false;
     state.selected_mod = 0;
+    state.mod_browser_open = false;
+    clearModArtworkSlots();
     state.drop_mode = .games;
     setStatus(true, "Loaded {d} mod catalog entries. Use ADD GAMES or drop another folder to continue.", .{parsed.entries().len});
 }
@@ -1071,6 +1195,8 @@ fn moveTitleSelection(delta: isize) void {
     const current: isize = @intCast(state.preview_scroll);
     state.preview_scroll = @intCast(std.math.clamp(current + delta, 0, @as(isize, @intCast(titles.len - 1))));
     state.selected_mod = 0;
+    state.mod_browser_open = false;
+    clearModArtworkSlots();
 }
 
 fn currentGridLayout() grid.Layout {
@@ -1108,25 +1234,70 @@ fn modDownloadWorker(config: ModDownloadConfig) void {
     finishWorker(.{ .mod_download = .{ .registry_index = config.registry_index, .path = path } });
 }
 
-fn syncSelectedModArtwork(registry_index: usize, entry: registry.Entry) void {
-    if (state.mod_artwork_registry_index == registry_index) return;
-    clearSelectedModArtwork();
-    if (entry.artwork == null) {
-        state.mod_artwork_registry_index = registry_index;
+fn syncModArtwork(registry_index: usize, entry: registry.Entry) void {
+    var empty: ?*ModArtworkSlot = null;
+    for (&state.mod_artwork_slots) |*slot| {
+        if (slot.registry_index == registry_index) return;
+        if (slot.registry_index == std.math.maxInt(usize) and empty == null) empty = slot;
+    }
+    const slot = empty orelse return;
+    slot.registry_index = registry_index;
+    if (entry.artwork == null) return;
+    if (isBusy()) {
+        slot.registry_index = std.math.maxInt(usize);
         return;
     }
-    if (isBusy()) return;
-    state.mod_artwork_registry_index = registry_index;
-    if (!beginWorker()) return;
+    if (!beginWorker()) {
+        slot.registry_index = std.math.maxInt(usize);
+        return;
+    }
+    slot.loading = true;
     state.worker = std.Thread.spawn(.{}, modArtworkWorker, .{registry_index}) catch {
+        slot.* = .{};
         cancelWorker();
         return;
     };
 }
 
-fn clearSelectedModArtwork() void {
-    destroyArtworkTexture(&state.mod_artwork_texture);
-    state.mod_artwork_registry_index = std.math.maxInt(usize);
+fn handleModBrowserClick(width: f32, height: f32, x: f32, y: f32) void {
+    if (contains(.{ .x = width - 184, .y = page_layout.library_top - 10, .w = 140, .h = 30 }, x, y)) {
+        state.mod_browser_open = false;
+        return;
+    }
+    const selected = selectedModBrowserData() orelse return;
+    const cards = selected.count + 1;
+    const area = Rect{ .x = 44, .y = page_layout.grid_y, .w = width - 88, .h = height - page_layout.grid_y - 118 };
+    const columns = std.math.clamp(@as(usize, @intFromFloat(@ceil((area.w + 16) / 220))), 2, 5);
+    const gutter: f32 = 16;
+    const card_width = (area.w - gutter * @as(f32, @floatFromInt(columns - 1))) / @as(f32, @floatFromInt(columns));
+    const card_height = @min(220, card_width * 0.72);
+    for (0..cards) |card_index| {
+        const row = card_index / columns;
+        const column = card_index % columns;
+        const rect = Rect{
+            .x = area.x + @as(f32, @floatFromInt(column)) * (card_width + gutter),
+            .y = area.y + @as(f32, @floatFromInt(row)) * (card_height + gutter),
+            .w = card_width,
+            .h = card_height,
+        };
+        if (contains(rect, x, y)) {
+            state.selected_mod = card_index;
+            return;
+        }
+    }
+    if (state.selected_mod == 0) return;
+    if (contains(.{ .x = 44, .y = height - 74, .w = 168, .h = 30 }, x, y)) {
+        downloadRegistryIndex(selected.matches[state.selected_mod - 1]);
+    } else if (contains(.{ .x = 224, .y = height - 74, .w = 168, .h = 30 }, x, y)) {
+        openRegistryEntryPage(selected.catalog.entries()[selected.matches[state.selected_mod - 1]]);
+    }
+}
+
+fn clearModArtworkSlots() void {
+    for (&state.mod_artwork_slots) |*slot| {
+        destroyArtworkTexture(&slot.texture);
+        slot.* = .{};
+    }
 }
 
 fn modArtworkWorker(registry_index: usize) void {
@@ -1589,7 +1760,13 @@ fn harvestWorker() void {
 
 fn harvestModArtwork(result: ModArtworkResult) void {
     defer if (result.path) |path| std.heap.c_allocator.free(path);
-    if (result.registry_index != state.mod_artwork_registry_index) return;
+    var slot: ?*ModArtworkSlot = null;
+    for (&state.mod_artwork_slots) |*candidate| if (candidate.registry_index == result.registry_index) {
+        slot = candidate;
+        break;
+    };
+    const artwork_slot = slot orelse return;
+    artwork_slot.loading = false;
     const path = result.path orelse return;
     var decoded = importer.decodeArtwork(std.heap.c_allocator, state.threaded.io(), path) catch return;
     defer decoded.deinit(std.heap.c_allocator);
@@ -1608,7 +1785,7 @@ fn harvestModArtwork(result: ModArtworkResult) void {
         sg.destroyImage(image);
         return;
     }
-    state.mod_artwork_texture = .{
+    artwork_slot.texture = .{
         .title_index = result.registry_index,
         .image = image,
         .view = view,
@@ -1648,6 +1825,8 @@ fn harvestRefresh(result: *RefreshResult) void {
     state.device_error = result.device_error;
     state.active_source_kind = result.source_kind;
     state.preview_scroll = 0;
+    state.mod_browser_open = false;
+    clearModArtworkSlots();
     state.preview_destination = if (state.card != null) .direct_sd else .usb;
 
     if (result.override_target_blocked) {
