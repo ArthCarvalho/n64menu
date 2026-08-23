@@ -69,10 +69,10 @@ const page_layout = struct {
     const grid_y: f32 = library_top + 38;
     const detail_x: f32 = 616;
     const detail_content_x: f32 = detail_x + 16;
-    const mod_first_y: f32 = grid_y + 136;
-    const mod_row_height: f32 = 20;
-    const mod_button_y: f32 = grid_y + 198;
-    const artwork_button_y: f32 = grid_y + 188;
+    const mod_first_y: f32 = grid_y + 118;
+    const mod_row_height: f32 = 18;
+    const mod_button_y: f32 = grid_y + 166;
+    const artwork_button_y: f32 = grid_y + 136;
 };
 
 const ArtworkTexture = struct {
@@ -582,40 +582,44 @@ fn drawTitles(width: f32, height: f32) void {
 }
 
 fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
-    const panel = Rect{ .x = page_layout.detail_x, .y = top, .w = @max(0, width - 660), .h = 236 };
+    const mod_count = compatibleModCount(title);
+    const panel_height: f32 = if (mod_count != 0) 208 else if (title.artwork_path == null) 174 else 112;
+    const panel = Rect{ .x = page_layout.detail_x, .y = top, .w = @min(392, @max(0, width - 660)), .h = panel_height };
     if (panel.w < 180) return;
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
     drawText(panel.x + 16, panel.y + 18, colors.pink, "SELECTED GAME", .{});
     drawText(panel.x + 16, panel.y + 48, if (title.artwork_path == null) colors.orange else colors.white, "{s}", .{head(title.display_name, 46)});
     const sync_state = titleSyncState(title);
-    drawText(panel.x + 16, panel.y + 88, syncStateColor(sync_state), "{s}", .{syncStateDescription(sync_state)});
-    const mod_count = drawCompatibleMods(panel, title);
+    drawText(panel.x + 16, panel.y + 76, syncStateColor(sync_state), "{s}", .{syncStateDescription(sync_state)});
+    drawCompatibleMods(panel, title, mod_count);
     if (title.artwork_path == null and mod_count == 0) {
-        drawText(panel.x + 16, panel.y + 126, colors.orange, "ARTWORK NEEDED", .{});
-        drawText(panel.x + 16, panel.y + 152, colors.dim, "No image was found for this game.", .{});
-        drawButton(.{ .x = panel.x + 16, .y = panel.y + 188, .w = 196, .h = 30 }, colors.yellow, "FIND ARTWORK");
-    } else if (mod_count == 0) {
-        drawText(panel.x + 16, panel.y + 126, colors.good, "ARTWORK READY", .{});
+        drawText(panel.x + 16, panel.y + 102, colors.orange, "ARTWORK NEEDED", .{});
+        drawButton(.{ .x = panel.x + 16, .y = panel.y + 136, .w = 168, .h = 26 }, colors.yellow, "FIND ARTWORK");
     }
 }
 
-fn drawCompatibleMods(panel: Rect, title: importer.Title) usize {
+fn compatibleModCount(title: importer.Title) usize {
     const catalog = if (state.mod_registry) |*value| value else return 0;
     var matches: [8]usize = undefined;
-    const count = registry.matching(catalog, title.content_crc32, &title.content_hash, &matches);
-    if (count == 0) return 0;
+    return registry.matching(catalog, title.content_crc32, &title.content_hash, &matches);
+}
+
+fn drawCompatibleMods(panel: Rect, title: importer.Title, count: usize) void {
+    const catalog = if (state.mod_registry) |*value| value else return;
+    var matches: [8]usize = undefined;
+    _ = registry.matching(catalog, title.content_crc32, &title.content_hash, &matches);
+    if (count == 0) return;
     state.selected_mod = @min(state.selected_mod, @min(count, matches.len) - 1);
-    drawText(panel.x + 16, panel.y + 112, colors.pink, "DEMO MOD CATALOG", .{});
+    drawText(panel.x + 16, panel.y + 96, colors.pink, "DEMO MOD CATALOG", .{});
     const shown = @min(count, @min(matches.len, 3));
     for (0..shown) |row| {
         const entry = catalog.entries()[matches[row]];
-        drawText(panel.x + 16, panel.y + 136 + @as(f32, @floatFromInt(row)) * 20, if (row == state.selected_mod) colors.yellow else colors.white, "{s} {s}", .{ head(entry.name, 28), entry.version });
+        drawText(panel.x + 16, panel.y + 118 + @as(f32, @floatFromInt(row)) * 18, if (row == state.selected_mod) colors.yellow else colors.white, "{s} {s}", .{ head(entry.name, 28), entry.version });
     }
     const selected = catalog.entries()[matches[state.selected_mod]];
     const cached = isModCached(selected);
-    drawButton(.{ .x = panel.x + 16, .y = panel.y + 198, .w = 196, .h = 30 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else if (selected.patch.archiveMember == null) "DOWNLOAD PATCH" else "DOWNLOAD ARCHIVE");
-    return count;
+    drawButton(.{ .x = panel.x + 16, .y = panel.y + 166, .w = 168, .h = 26 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else if (selected.patch.archiveMember == null) "DOWNLOAD PATCH" else "DOWNLOAD ARCHIVE");
 }
 
 fn isModCached(entry: registry.Entry) bool {
