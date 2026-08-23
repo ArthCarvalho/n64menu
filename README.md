@@ -137,6 +137,16 @@ when automatic playlist discovery cannot find the intended installation.
 The menu loads cover art only for visible rows and supports large catalogs without
 a fixed title-count limit.
 
+The importer also includes a small demo mod catalog assembled from public metadata
+sources. Compatible BPS and VCDIFF patches are matched locally by normalized ROM
+CRC, downloaded only after user confirmation, and verified against pinned SHA-256
+values. ZIP releases contribute only the registry-pinned patch member; bundled
+executables are ignored. Downloaded mods are applied on the desktop during sync.
+Only base games remain in `title.csv`; generated full-ROM variants are staged under
+`menu/title/<id>/variants/` with a `variants.csv` manifest. In the N64 menu,
+C-Left/C-Right cycles the original game and up to eight variants before launching.
+Variant saves use separate filenames.
+
 Development commands:
 
 ```console

@@ -679,6 +679,22 @@ typedef struct TitleBox_s {
     float screenY;
 } TitleBox;
 
+#define MAX_VARIANTS 8
+#define VARIANT_ID_MAX 31
+#define VARIANT_NAME_MAX 95
+
+typedef struct Variant_s {
+    char id[VARIANT_ID_MAX + 1];
+    char name[VARIANT_NAME_MAX + 1];
+    char rom[VARIANT_ID_MAX + 5];
+    char save_type[20];
+} Variant;
+
+Variant selected_variants[MAX_VARIANTS];
+int selected_variant_count = 0;
+int selected_variant_index = 0;
+TitleBox *variants_title = NULL;
+
 float title_brightness = 1.0f;
 
 TitleBox *title_list = NULL;
@@ -827,7 +843,71 @@ void TitleBox_draw(TitleBox * title) {
 
     if(title->isSelected) {
         focus_draw(offsetX - 3, screenY - 3, scaledWidth + 6, scaledHeight + 6);
+        if(title == selectedTitle && selected_variant_index > 0 && selected_variant_index <= selected_variant_count) {
+            Variant *variant = &selected_variants[selected_variant_index - 1];
+            rdpq_set_scissor(offsetX, screenY, offsetX + scaledWidth, screenY + scaledHeight);
+            rdpq_set_mode_fill(RGBA32(0, 0, 0, 190));
+            rdpq_fill_rectangle(offsetX, screenY + scaledHeight - 28, offsetX + scaledWidth, screenY + scaledHeight);
+            rdpq_text_printf(&(rdpq_textparms_t){
+                .align = ALIGN_CENTER,
+                .width = scaledWidth - 8,
+            }, FONT_SMALL, offsetX + 4, screenY + scaledHeight - 10, "^01%s", variant->name);
+            rdpq_set_scissor(GRID_SCISSOR_X_MIN, GRID_SCISSOR_Y_MIN, GRID_SCISSOR_X_MAX, GRID_SCISSOR_Y_MAX);
+        } else if(title == selectedTitle && selected_variant_count > 0) {
+            rdpq_set_scissor(offsetX, screenY, offsetX + scaledWidth, screenY + scaledHeight);
+            rdpq_set_mode_fill(RGBA32(0, 0, 0, 150));
+            rdpq_fill_rectangle(offsetX, screenY + scaledHeight - 28, offsetX + scaledWidth, screenY + scaledHeight);
+            rdpq_text_printf(&(rdpq_textparms_t){
+                .align = ALIGN_CENTER,
+                .width = scaledWidth - 8,
+            }, FONT_SMALL, offsetX + 4, screenY + scaledHeight - 10, "^01ORIGINAL");
+            rdpq_set_scissor(GRID_SCISSOR_X_MIN, GRID_SCISSOR_Y_MIN, GRID_SCISSOR_X_MAX, GRID_SCISSOR_Y_MAX);
+        }
     }
+}
+
+static void load_variants(TitleBox *title) {
+    if(title == variants_title) return;
+    variants_title = title;
+    selected_variant_count = 0;
+    selected_variant_index = 0;
+    if(title == NULL) return;
+    char path[128];
+    snprintf(path, sizeof(path), "sd:/menu/title/%s/variants.csv", title->id);
+    FILE *f = fopen(path, "r");
+    if(f == NULL) return;
+    char line[192];
+    while(selected_variant_count < MAX_VARIANTS && fgets(line, sizeof(line), f) != NULL) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *first = strchr(line, ',');
+        if(first == NULL) continue;
+        char *second = strchr(first + 1, ',');
+        if(second == NULL) continue;
+        char *third = strchr(second + 1, ',');
+        *first = 0;
+        *second = 0;
+        if(third != NULL) *third = 0;
+        Variant *variant = &selected_variants[selected_variant_count];
+        size_t id_length = strlen(line);
+        size_t name_length = strlen(first + 1);
+        size_t rom_length = strlen(second + 1);
+        if(id_length == 0 || id_length > VARIANT_ID_MAX || name_length == 0 || name_length > VARIANT_NAME_MAX ||
+           rom_length == 0 || rom_length >= sizeof(variant->rom) || strchr(second + 1, '/') != NULL || strchr(second + 1, '\\') != NULL ||
+           strchr(second + 1, ':') != NULL || strstr(second + 1, "..") != NULL) continue;
+        bool id_valid = true;
+        for(size_t i = 0; i < id_length; i++) {
+            char c = line[i];
+            if(!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) id_valid = false;
+        }
+        if(!id_valid) continue;
+        memcpy(variant->id, line, id_length + 1);
+        memcpy(variant->name, first + 1, name_length + 1);
+        memcpy(variant->rom, second + 1, rom_length + 1);
+        variant->save_type[0] = 0;
+        if(third != NULL && strlen(third + 1) < sizeof(variant->save_type)) strcpy(variant->save_type, third + 1);
+        selected_variant_count++;
+    }
+    fclose(f);
 }
 
 static void cover_cache_init(void) {
@@ -1017,20 +1097,15 @@ void setRomPath(char * code) {
     strcpy(rom_path, "sd:/menu/title/");
     strcat(rom_path, code);
     strcat(rom_path, "/");
-    strcat(rom_path, code);
-    strcat(rom_path, "_e.z64");
+    if(selected_variant_index > 0 && selected_variant_index <= selected_variant_count) {
+        strcat(rom_path, "variants/");
+        strcat(rom_path, selected_variants[selected_variant_index - 1].rom);
+    } else {
+        strcat(rom_path, code);
+        strcat(rom_path, "_e.z64");
+    }
 }
-flashcart_save_type_t getSaveType(char * code) {
-    char path[128];
-    char value[32] = {0};
-    snprintf(path, sizeof(path), "sd:/menu/title/%s/%s_e.save", code, code);
-
-    FILE * f = fopen(path, "r");
-    if(f == NULL) return FLASHCART_SAVE_TYPE_NONE;
-    fgets(value, sizeof(value), f);
-    fclose(f);
-    value[strcspn(value, "\r\n")] = 0;
-
+flashcart_save_type_t parseSaveType(char *value) {
     // Older library exports stored the enum as one digit. Keep accepting those
     // persisted sidecars while using names for all new files.
     if(strcmp(value, "none") == 0 || strcmp(value, "0") == 0) return FLASHCART_SAVE_TYPE_NONE;
@@ -1043,6 +1118,20 @@ flashcart_save_type_t getSaveType(char * code) {
     if(strcmp(value, "flashram-pkst2") == 0 || strcmp(value, "7") == 0) return FLASHCART_SAVE_TYPE_FLASHRAM_PKST2;
     return FLASHCART_SAVE_TYPE_NONE;
 }
+flashcart_save_type_t getSaveType(char * code) {
+    if(selected_variant_index > 0 && selected_variant_index <= selected_variant_count && selected_variants[selected_variant_index - 1].save_type[0] != 0) {
+        return parseSaveType(selected_variants[selected_variant_index - 1].save_type);
+    }
+    char path[128];
+    char value[32] = {0};
+    snprintf(path, sizeof(path), "sd:/menu/title/%s/%s_e.save", code, code);
+    FILE * f = fopen(path, "r");
+    if(f == NULL) return FLASHCART_SAVE_TYPE_NONE;
+    fgets(value, sizeof(value), f);
+    fclose(f);
+    value[strcspn(value, "\r\n")] = 0;
+    return parseSaveType(value);
+}
 bool setupRomLoad(TitleBox * title) {
     setRomPath(title->id);
 
@@ -1054,7 +1143,11 @@ bool setupRomLoad(TitleBox * title) {
     } else {
         char save_path[128];
         directory_create("sd:/menu/save");
-        snprintf(save_path, sizeof(save_path), "sd:/menu/save/%s.sav", title->id);
+        if(selected_variant_index > 0 && selected_variant_index <= selected_variant_count) {
+            snprintf(save_path, sizeof(save_path), "sd:/menu/save/%s-%s.sav", title->id, selected_variants[selected_variant_index - 1].id);
+        } else {
+            snprintf(save_path, sizeof(save_path), "sd:/menu/save/%s.sav", title->id);
+        }
         if(flashcart_load_save(save_path, save_type) != FLASHCART_OK) return false;
     }
 
@@ -1310,6 +1403,7 @@ void menu_update() {
             }
             cur->isSelected = 1;
             selectedTitle = cur;
+            load_variants(selectedTitle);
         }
     } else {
         if(selectedTitle != NULL) {
@@ -1331,6 +1425,14 @@ void menu_update() {
     library_position_segment = cursor_y - library_row_window_start;
 
     if(cursor_x >= 0 && selectedTitle && main_state == 3) {
+        if(p1_buttons_press.c_left && selected_variant_count > 0) {
+            selected_variant_index--;
+            if(selected_variant_index < 0) selected_variant_index = selected_variant_count;
+        }
+        if(p1_buttons_press.c_right && selected_variant_count > 0) {
+            selected_variant_index++;
+            if(selected_variant_index > selected_variant_count) selected_variant_index = 0;
+        }
         if(p1_buttons_press.a) {
             main_state = 4;
             selectedTitle->scaleGrow = 0.0f;
@@ -1503,6 +1605,9 @@ void draw(int cur_frame) {
             RGBA32(0, 96, 40, 255), RGBA32(0, 183, 73, 255), RGBA32(55, 235, 120, 255));
         button_letter_draw(527, HINT_Y + 9, "^05B");
         rdpq_text_print(NULL, FONT_SMALL, 546, HINT_Y + 14, "BACK");
+        if(selected_variant_count > 0) {
+            rdpq_text_print(NULL, FONT_SMALL, 300, HINT_Y + 14, "C< / C> VERSION");
+        }
     }
 
 

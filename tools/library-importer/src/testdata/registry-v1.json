@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-23T00:00:00Z",
+  "notice": "Test metadata snapshot. Patch files and artwork are not redistributed.",
+  "entries": [
+    {
+      "id": "rhdc-sm64-green-stars-3.4",
+      "name": "SM64 The Green Stars",
+      "version": "3.4",
+      "authors": ["Kampel125", "Kaze"],
+      "projectUrl": "https://romhacking.com/hack/sm64-the-green-stars",
+      "source": {
+        "provider": "rhdc",
+        "metadataUrl": "https://api.romhacking.com/v3/hacks/hack/sm64-the-green-stars",
+        "retrievedAt": "2026-08-23T00:00:00Z"
+      },
+      "base": {
+        "name": "Super Mario 64",
+        "variant": "US Version",
+        "gameCode": "SM",
+        "normalizedCrc32": "3CE60709",
+        "normalizedSha256": "17CE077343C6133F8C9F2D6D6D9A4AB62C8CD2AA57C40AEA1F490B4C8BB21D91"
+      },
+      "patch": {
+        "format": "bps",
+        "url": "https://api.romhacking.com/game/sm64-the-green-stars/SM64%20The%20Green%20Stars%20v3.4.bps",
+        "size": 9461567,
+        "sha256": "E99EAAABE8F31EEE548EFD071807FD6B2D1B38418338ECB295B133E7B2448AE4",
+        "sourceCrc32": "3CE60709",
+        "targetCrc32": "D5B5980C",
+        "patchCrc32": "6E90F311"
+      },
+      "output": {
+        "sha1": "01A09799E7C36229DCFAA800F80EE030852A60DD"
+      },
+      "compatibility": "excellent",
+      "rights": {
+        "patchRedistributionAllowed": false,
+        "artworkRedistributionAllowed": false
+      }
+    },
+    {
+      "id": "rhdc-zamination-squid-game-64-20220308",
+      "name": "ZAMination Squid Game 64",
+      "version": "2022-03-08",
+      "authors": ["etn_63827"],
+      "projectUrl": "https://romhacking.com/hack/ZAMination-Squid-Game-64",
+      "source": {
+        "provider": "rhdc",
+        "metadataUrl": "https://api.romhacking.com/v3/hacks/hack/ZAMination-Squid-Game-64",
+        "retrievedAt": "2026-08-23T00:00:00Z"
+      },
+      "base": {
+        "name": "Super Mario 64",
+        "variant": "US Version",
+        "gameCode": "SM",
+        "normalizedCrc32": "3CE60709",
+        "normalizedSha256": "17CE077343C6133F8C9F2D6D6D9A4AB62C8CD2AA57C40AEA1F490B4C8BB21D91"
+      },
+      "patch": {
+        "format": "bps",
+        "url": "https://api.romhacking.com/game/ZAMination-Squid-Game-64/zamsquid64-build-202203081020.bps",
+        "size": 3175564,
+        "sha256": "B04774699D5B4DA90C8DC893B89C766BB8A967E1AD9689A7E06BEDED748C2AD1",
+        "sourceCrc32": "3CE60709",
+        "targetCrc32": "EAEB6C1B",
+        "patchCrc32": "A0806828"
+      },
+      "output": {
+        "sha1": "1AE98BA63E95874C46187A7233FFD7B73A068D5E"
+      },
+      "compatibility": "unknown",
+      "rights": {
+        "patchRedistributionAllowed": false,
+        "artworkRedistributionAllowed": false
+      }
+    },
+    {
+      "id": "official-smash-remix-2.0.1-ntsc",
+      "name": "Smash Remix",
+      "version": "2.0.1",
+      "authors": ["Smash Remix Team"],
+      "projectUrl": "https://smashremix.net/",
+      "source": {
+        "provider": "official-manifest",
+        "metadataUrl": "https://smashremix.net/patcher/patches/releases.json",
+        "retrievedAt": "2026-08-23T00:00:00Z"
+      },
+      "base": {
+        "name": "Super Smash Bros.",
+        "variant": "USA",
+        "normalizedCrc32": "EB97929E",
+        "normalizedSha256": "15592E79D3C5295CEF4371D4992F0BD25BEC2102FC29644C93E682F7EA99EF3D"
+      },
+      "patch": {
+        "format": "vcdiff",
+        "url": "https://smashremix.net/patcher/patches/releases/smashremix2.0.1.xdelta",
+        "size": 35204600,
+        "sha256": "2E9A36AC89705327726C5693105DB7240CAD757DDF27CB44A62372987F5556DA"
+      },
+      "output": {},
+      "compatibility": "official-console-release",
+      "rights": {
+        "patchRedistributionAllowed": false,
+        "artworkRedistributionAllowed": false
+      }
+    },
+    {
+      "id": "github-mario-builder-64-1.0.0",
+      "name": "Mario Builder 64",
+      "version": "1.0.0",
+      "authors": ["Mario Builder 64 Team"],
+      "projectUrl": "https://github.com/arthurtilly/Mario-Builder-64/releases/tag/1.0",
+      "source": {
+        "provider": "github-release",
+        "metadataUrl": "https://api.github.com/repos/arthurtilly/Mario-Builder-64/releases/156393558",
+        "retrievedAt": "2026-08-23T00:00:00Z"
+      },
+      "base": {
+        "name": "Super Mario 64",
+        "variant": "US Version",
+        "normalizedCrc32": "3CE60709",
+        "normalizedSha256": "17CE077343C6133F8C9F2D6D6D9A4AB62C8CD2AA57C40AEA1F490B4C8BB21D91"
+      },
+      "patch": {
+        "format": "bps",
+        "url": "https://github.com/arthurtilly/Mario-Builder-64/releases/download/1.0/mb64_v1_0_0.zip",
+        "size": 2916285,
+        "sha256": "22A340C0F93652401F9101DCF5853B175365F5E443E1AF6B91E5D8ADA6869EBC",
+        "archiveMember": "mb64_v1_0_0/mb64_v1_0_0.bps",
+        "memberSize": 3061336,
+        "memberSha256": "3A662212B9A6AA5E95DF6D344B1D7DB64D974B4B8F88F1DFB2BE8DE758FBC9E0",
+        "sourceCrc32": "3CE60709",
+        "targetCrc32": "9186387D",
+        "patchCrc32": "17542BB5"
+      },
+      "output": {},
+      "compatibility": "unknown",
+      "rights": {
+        "patchRedistributionAllowed": false,
+        "artworkRedistributionAllowed": false
+      }
+    }
+  ]
+}

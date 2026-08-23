@@ -5,6 +5,7 @@ const deployer = @import("deployer");
 const grid = @import("grid");
 const icon = @import("icon.zig");
 const launchbox = @import("launchbox");
+const registry = @import("registry");
 const sdcard = @import("sdcard");
 const startup = @import("startup");
 const ui_scale = @import("ui_scale");
@@ -157,6 +158,10 @@ const SyncConfig = struct {
     port: FixedText,
 };
 
+const ModDownloadConfig = struct {
+    registry_index: usize,
+};
+
 const CardOutcome = struct {
     card: ?CardSnapshot = null,
     err: ?[]const u8 = null,
@@ -184,9 +189,16 @@ const SyncResult = struct {
     cleanup_error: ?[]const u8 = null,
 };
 
+const ModDownloadResult = struct {
+    registry_index: usize,
+    path: ?[]u8 = null,
+    err: ?[]const u8 = null,
+};
+
 const WorkerResult = union(enum) {
     refresh: RefreshResult,
     sync: SyncResult,
+    mod_download: ModDownloadResult,
 };
 
 const state = struct {
@@ -195,6 +207,8 @@ const state = struct {
     var pass_action: sg.PassAction = .{};
     var artwork_sampler: sg.Sampler = .{};
     var artwork_textures: [16]ArtworkTexture = @splat(.{});
+    var mod_registry: ?registry.Registry = null;
+    var selected_mod: usize = 0;
     var scan: ?LibraryScan = null;
     var card: ?CardSnapshot = null;
     var device: ?DeviceSnapshot = null;
@@ -244,6 +258,7 @@ export fn init() void {
         .wrap_v = .CLAMP_TO_EDGE,
         .label = "importer-artwork-sampler",
     });
+    state.mod_registry = registry.parse(std.heap.c_allocator, registry.bundled_registry) catch null;
     sdtx.setup(.{
         .fonts = blk: {
             var fonts: [8]sdtx.FontDesc = @splat(.{});
@@ -277,6 +292,8 @@ export fn cleanup() void {
     clearScan();
     clearCard();
     clearDevice();
+    if (state.mod_registry) |*catalog| catalog.deinit();
+    state.mod_registry = null;
     sdtx.shutdown();
     sgl.shutdown();
     sg.shutdown();
@@ -528,13 +545,40 @@ fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
     drawText(panel.x + 16, panel.y + 48, if (title.artwork_path == null) colors.orange else colors.white, "{s}", .{head(title.display_name, 46)});
     const sync_state = titleSyncState(title);
     drawText(panel.x + 16, panel.y + 88, syncStateColor(sync_state), "{s}", .{syncStateDescription(sync_state)});
-    if (title.artwork_path == null) {
+    const mod_count = drawCompatibleMods(panel, title);
+    if (title.artwork_path == null and mod_count == 0) {
         drawText(panel.x + 16, panel.y + 126, colors.orange, "ARTWORK NEEDED", .{});
         drawText(panel.x + 16, panel.y + 152, colors.dim, "No image was found for this game.", .{});
         drawButton(.{ .x = panel.x + 16, .y = panel.y + 188, .w = 196, .h = 30 }, colors.yellow, "FIND ARTWORK");
-    } else {
+    } else if (mod_count == 0) {
         drawText(panel.x + 16, panel.y + 126, colors.good, "ARTWORK READY", .{});
     }
+}
+
+fn drawCompatibleMods(panel: Rect, title: importer.Title) usize {
+    const catalog = if (state.mod_registry) |*value| value else return 0;
+    var matches: [8]usize = undefined;
+    const count = registry.matching(catalog, title.content_crc32, &title.content_hash, &matches);
+    if (count == 0) return 0;
+    state.selected_mod = @min(state.selected_mod, @min(count, matches.len) - 1);
+    drawText(panel.x + 16, panel.y + 112, colors.pink, "DEMO MOD CATALOG", .{});
+    const shown = @min(count, @min(matches.len, 3));
+    for (0..shown) |row| {
+        const entry = catalog.entries()[matches[row]];
+        drawText(panel.x + 16, panel.y + 136 + @as(f32, @floatFromInt(row)) * 20, if (row == state.selected_mod) colors.yellow else colors.white, "{s} {s}", .{ head(entry.name, 28), entry.version });
+    }
+    const selected = catalog.entries()[matches[state.selected_mod]];
+    const cached = isModCached(selected);
+    drawButton(.{ .x = panel.x + 16, .y = panel.y + 198, .w = 196, .h = 30 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else if (selected.patch.archiveMember == null) "DOWNLOAD PATCH" else "DOWNLOAD ARCHIVE");
+    return count;
+}
+
+fn isModCached(entry: registry.Entry) bool {
+    const cache = registryCachePath(std.heap.c_allocator) catch return false;
+    defer std.heap.c_allocator.free(cache);
+    const path = registry.cachedArtifactPath(std.heap.c_allocator, entry, cache) catch return false;
+    defer std.heap.c_allocator.free(path);
+    return registry.cachedArtifactExists(state.threaded.io(), path, entry);
 }
 
 fn drawCover(rect: Rect, texture: ?*const ArtworkTexture, display_name: []const u8, selected: bool) void {
@@ -696,6 +740,8 @@ fn handleClick(x: f32, y: f32) void {
     if (isBusy()) return;
     const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
     const width = metrics.width;
+    if (downloadSelectedMod(width, x, y)) return;
+    if (selectCompatibleMod(width, x, y)) return;
     if (searchMissingArtwork(width, x, y)) return;
     if (selectGridTitle(width, metrics.height, x, y)) return;
     if (contains(layout.refresh(width), x, y)) {
@@ -707,6 +753,47 @@ fn handleClick(x: f32, y: f32) void {
         state.preview_destination = .usb;
         runSync(.usb);
     }
+}
+
+fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
+    if (width < 840 or x < 632 or x > width - 44) return false;
+    const scan = state.scan orelse return false;
+    const titles = scan.preview().titles;
+    if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
+    const catalog = if (state.mod_registry) |*value| value else return false;
+    var matches: [8]usize = undefined;
+    const count = registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches);
+    const shown = @min(count, @min(matches.len, 3));
+    for (0..shown) |row| {
+        const row_y = 684 + @as(f32, @floatFromInt(row)) * 20;
+        if (y >= row_y - 8 and y <= row_y + 12) {
+            state.selected_mod = row;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn downloadSelectedMod(width: f32, x: f32, y: f32) bool {
+    if (width < 840 or !contains(.{ .x = 632, .y = 746, .w = 196, .h = 30 }, x, y)) return false;
+    const scan = state.scan orelse return false;
+    const titles = scan.preview().titles;
+    if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
+    const catalog = if (state.mod_registry) |*value| value else return false;
+    var matches: [8]usize = undefined;
+    const count = registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches);
+    if (count == 0) return false;
+    const shown = @min(count, matches.len);
+    state.selected_mod = @min(state.selected_mod, shown - 1);
+    if (!beginWorker()) return true;
+    const config = ModDownloadConfig{ .registry_index = matches[state.selected_mod] };
+    state.worker = std.Thread.spawn(.{}, modDownloadWorker, .{config}) catch |err| {
+        cancelWorker();
+        setStatus(false, "Could not start the mod download: {s}", .{@errorName(err)});
+        return true;
+    };
+    setStatus(true, "Downloading and verifying mod patch...", .{});
+    return true;
 }
 
 fn searchMissingArtwork(width: f32, x: f32, y: f32) bool {
@@ -786,6 +873,7 @@ fn moveTitleSelection(delta: isize) void {
     if (titles.len == 0) return;
     const current: isize = @intCast(state.preview_scroll);
     state.preview_scroll = @intCast(std.math.clamp(current + delta, 0, @as(isize, @intCast(titles.len - 1))));
+    state.selected_mod = 0;
 }
 
 fn runRefresh() void {
@@ -798,6 +886,33 @@ fn runRefresh() void {
         return;
     };
     setStatus(true, "Detecting RetroArch and SummerCart...", .{});
+}
+
+fn modDownloadWorker(config: ModDownloadConfig) void {
+    const allocator = std.heap.c_allocator;
+    const catalog = &(state.mod_registry orelse {
+        finishWorker(.{ .mod_download = .{ .registry_index = config.registry_index, .err = "RegistryUnavailable" } });
+        return;
+    });
+    const cache = registryCachePath(allocator) catch |err| {
+        finishWorker(.{ .mod_download = .{ .registry_index = config.registry_index, .err = @errorName(err) } });
+        return;
+    };
+    defer allocator.free(cache);
+    const path = registry.download(allocator, state.threaded.io(), catalog.entries()[config.registry_index], cache) catch |err| {
+        finishWorker(.{ .mod_download = .{ .registry_index = config.registry_index, .err = @errorName(err) } });
+        return;
+    };
+    finishWorker(.{ .mod_download = .{ .registry_index = config.registry_index, .path = path } });
+}
+
+fn registryCachePath(allocator: std.mem.Allocator) ![]u8 {
+    const environ = state.threaded.environ.process_environ;
+    const root = std.process.Environ.getAlloc(environ, allocator, if (@import("builtin").os.tag == .windows) "LOCALAPPDATA" else "XDG_CACHE_HOME") catch
+        std.process.Environ.getAlloc(environ, allocator, "HOME") catch
+        try allocator.dupe(u8, ".");
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "m64menu", "patches" });
 }
 
 fn runPreferredSync() void {
@@ -1055,6 +1170,7 @@ fn syncFromStaging(
     staging: []const u8,
     config: *const SyncConfig,
 ) !void {
+    var imported_titles: []const importer.Title = &.{};
     switch (config.source_kind) {
         .directory => {
             var imported = try importer.importLibrary(allocator, io, .{
@@ -1064,6 +1180,8 @@ fn syncFromStaging(
             }, .{ .context = null, .callback = importProgress });
             defer imported.deinit(allocator);
             if (!std.mem.eql(u8, &libraryFingerprint(imported.titles), &config.source_fingerprint)) return error.SourceChanged;
+            imported_titles = imported.titles;
+            try stageCachedMods(allocator, io, staging, imported_titles);
         },
         .automatic, .playlist => {
             const playlist_path = config.source_path.slice();
@@ -1077,6 +1195,8 @@ fn syncFromStaging(
             defer imported.deinit(allocator);
             if (!std.ascii.eqlIgnoreCase(imported.source.playlist_path, playlist_path)) return error.PlaylistChanged;
             if (!std.mem.eql(u8, &libraryFingerprint(imported.preview.titles), &config.source_fingerprint)) return error.SourceChanged;
+            imported_titles = imported.preview.titles;
+            try stageCachedMods(allocator, io, staging, imported_titles);
         },
     }
 
@@ -1102,6 +1222,14 @@ fn syncFromStaging(
             }, .{ .context = null, .callback = deployProgress });
         },
     }
+}
+
+fn stageCachedMods(allocator: std.mem.Allocator, io: std.Io, staging: []const u8, titles: []const importer.Title) !void {
+    const catalog = &(state.mod_registry orelse return);
+    const cache = try registryCachePath(allocator);
+    defer allocator.free(cache);
+    const count = try importer.stageCachedVariants(allocator, io, staging, titles, catalog, cache);
+    if (count != 0) setStatus(true, "Staged {d} downloaded mod(s).", .{count});
 }
 
 fn findMenuRom(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
@@ -1210,6 +1338,23 @@ fn harvestWorker() void {
     switch (result) {
         .refresh => |*refresh| harvestRefresh(refresh),
         .sync => |sync_result| harvestSync(sync_result),
+        .mod_download => |download_result| harvestModDownload(download_result),
+    }
+}
+
+fn harvestModDownload(result: ModDownloadResult) void {
+    defer if (result.path) |path| std.heap.c_allocator.free(path);
+    if (result.err) |_| {
+        setStatus(false, "The mod patch could not be downloaded or verified.", .{});
+        return;
+    }
+    const catalog = if (state.mod_registry) |*value| value else return;
+    if (result.registry_index >= catalog.entries().len) return;
+    const entry = catalog.entries()[result.registry_index];
+    if (entry.patch.archiveMember != null) {
+        setStatus(true, "Downloaded and verified {s}. Safe archive extraction is the next step.", .{entry.name});
+    } else {
+        setStatus(true, "Downloaded and verified {s}. Ready for patch application.", .{entry.name});
     }
 }
 
