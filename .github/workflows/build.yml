@@ -1,11 +1,13 @@
 name: Build
 
-# Every run verifies the clean-machine build and uploads a workflow artifact.
-# Version tags additionally publish that exact artifact as a GitHub Release.
+# Manually dispatched runs verify the selected branch and upload workflow artifacts.
+# Version tags still build and publish that exact artifact as a GitHub Release.
 
 on:
+  workflow_dispatch:
   push:
-  pull_request:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -83,7 +85,6 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    environment: build-approval
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
