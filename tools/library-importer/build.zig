@@ -13,6 +13,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core.addImport("zigimg", zigimg.module("zigimg"));
+    const bps_mod = b.createModule(.{
+        .root_source_file = b.path("src/bps.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const registry_mod = b.createModule(.{
+        .root_source_file = b.path("src/registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const vcdiff_mod = b.createModule(.{
+        .root_source_file = b.path("src/vcdiff.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core.addImport("bps", bps_mod);
+    core.addImport("registry", registry_mod);
+    core.addImport("vcdiff", vcdiff_mod);
     const sdcard = b.createModule(.{
         .root_source_file = b.path("src/sdcard.zig"),
         .target = target,
@@ -36,6 +54,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }));
+    app.addImport("registry", registry_mod);
+    app.addImport("bps", bps_mod);
     app.addImport("sdcard", sdcard);
     app.addImport("startup", b.createModule(.{
         .root_source_file = b.path("src/startup.zig"),
@@ -70,6 +90,9 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
     tests_mod.addImport("zigimg", zigimg.module("zigimg"));
+    tests_mod.addImport("bps", bps_mod);
+    tests_mod.addImport("registry", registry_mod);
+    tests_mod.addImport("vcdiff", vcdiff_mod);
     const tests = b.addTest(.{ .root_module = tests_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run importer core tests");
@@ -121,6 +144,39 @@ pub fn build(b: *std.Build) void {
     run_launchbox_tests.step.dependOn(&run_grid_tests.step);
     test_step.dependOn(&run_launchbox_tests.step);
 
+    const registry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/registry.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_registry_tests = b.addRunArtifact(registry_tests);
+    run_registry_tests.step.dependOn(&run_launchbox_tests.step);
+    test_step.dependOn(&run_registry_tests.step);
+
+    const bps_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bps.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_bps_tests = b.addRunArtifact(bps_tests);
+    run_bps_tests.step.dependOn(&run_registry_tests.step);
+    test_step.dependOn(&run_bps_tests.step);
+
+    const vcdiff_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vcdiff.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_vcdiff_tests = b.addRunArtifact(vcdiff_tests);
+    run_vcdiff_tests.step.dependOn(&run_bps_tests.step);
+    test_step.dependOn(&run_vcdiff_tests.step);
+
     const startup_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/startup.zig"),
@@ -129,7 +185,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_startup_tests = b.addRunArtifact(startup_tests);
-    run_startup_tests.step.dependOn(&run_launchbox_tests.step);
+    run_startup_tests.step.dependOn(&run_vcdiff_tests.step);
     test_step.dependOn(&run_startup_tests.step);
 
     const ui_scale_tests = b.addTest(.{

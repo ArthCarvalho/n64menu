@@ -1,6 +1,9 @@
 const std = @import("std");
 const zigimg = @import("zigimg");
 const builtin = @import("builtin");
+const bps = @import("bps");
+const registry = @import("registry");
+const vcdiff = @import("vcdiff");
 
 pub const maximum_rom_size = 78 * 1024 * 1024;
 pub const sprite_width = 256;
@@ -37,6 +40,7 @@ pub const Title = struct {
     display_name: []u8,
     id: TitleId,
     content_hash: [32]u8 = @splat(0),
+    content_crc32: u32 = 0,
     artwork_path: ?[]u8,
     artwork_status: ArtworkStatus,
 
@@ -153,6 +157,81 @@ pub const Progress = struct {
     callback: *const fn (?*anyopaque, ProgressEvent) void,
 };
 
+pub fn stageCachedVariants(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output_root: []const u8,
+    titles: []const Title,
+    catalog: *const registry.Registry,
+    cache_directory: []const u8,
+) !usize {
+    var staged: usize = 0;
+    for (titles) |title| {
+        var matches: [registry.maximum_variants_per_title]usize = undefined;
+        const count = @min(registry.matching(catalog, title.content_crc32, &title.content_hash, &matches), matches.len);
+        if (count == 0) continue;
+        const base_rom = try readNormalizedRom(allocator, io, title.rom_path);
+        defer allocator.free(base_rom);
+        var manifest: std.Io.Writer.Allocating = .init(allocator);
+        defer manifest.deinit();
+        for (matches[0..count]) |registry_index| {
+            const entry = catalog.entries()[registry_index];
+            const patch_path = try registry.cachedArtifactPath(allocator, entry, cache_directory);
+            defer allocator.free(patch_path);
+            if (!(try registry.cachedArtifactReady(io, patch_path, entry))) continue;
+            const patch = registry.readPatchBytes(allocator, io, patch_path, entry) catch continue;
+            defer allocator.free(patch);
+            const target = (switch (entry.patch.format) {
+                .bps => bps.apply(allocator, base_rom, patch),
+                .vcdiff => vcdiff.apply(allocator, base_rom, patch),
+            }) catch continue;
+            defer allocator.free(target);
+            if (entry.output.sha1) |expected| {
+                var digest: [20]u8 = undefined;
+                std.crypto.hash.Sha1.hash(target, &digest, .{});
+                const actual = std.fmt.bytesToHex(digest, .upper);
+                if (!std.ascii.eqlIgnoreCase(&actual, expected)) continue;
+            }
+            const title_id = titleIdSlice(&title.id);
+            const variants_root = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants" });
+            defer allocator.free(variants_root);
+            try std.Io.Dir.cwd().createDirPath(io, variants_root);
+            const variant_id = try variantId(allocator, entry.id);
+            defer allocator.free(variant_id);
+            const rom_path = try std.fs.path.join(allocator, &.{ variants_root, variant_id });
+            defer allocator.free(rom_path);
+            const rom_filename = try std.fmt.allocPrint(allocator, "{s}.z64", .{rom_path});
+            defer allocator.free(rom_filename);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rom_filename, .data = target });
+            const variant_name = try asciiText(allocator, entry.name);
+            defer allocator.free(variant_name);
+            try manifest.writer.print("{s},{s},{s}.z64,{s}\n", .{ variant_id, variant_name, variant_id, entry.saveType orelse "" });
+            staged += 1;
+        }
+        if (manifest.written().len != 0) {
+            const title_id = titleIdSlice(&title.id);
+            const manifest_path = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants.csv" });
+            defer allocator.free(manifest_path);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest.written() });
+        }
+    }
+    return staged;
+}
+
+fn variantId(allocator: std.mem.Allocator, registry_id: []const u8) ![]u8 {
+    const prefix_length = @min(registry_id.len, 22);
+    const result = try allocator.alloc(u8, prefix_length + 1 + 8);
+    for (registry_id[0..prefix_length], result[0..prefix_length]) |source, *destination| {
+        destination.* = if (std.ascii.isAlphanumeric(source) or source == '-' or source == '_') source else '-';
+    }
+    result[prefix_length] = '-';
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(registry_id, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    @memcpy(result[prefix_length + 1 ..], hex[0..8]);
+    return result;
+}
+
 const Match = struct {
     path: []const u8,
     status: ArtworkStatus,
@@ -210,6 +289,7 @@ pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !Sc
             .display_name = display_name,
             .id = assigned.id,
             .content_hash = assigned.digest,
+            .content_crc32 = std.hash.crc.Crc32.hash(normalized),
             .artwork_path = if (match) |found| @constCast(found.path) else null,
             .artwork_status = if (match) |found| found.status else .generated,
         });
@@ -617,6 +697,7 @@ fn scanRetroArchPlaylist(
             .display_name = try allocator.dupe(u8, if (entry.label.len != 0) entry.label else basenameWithoutExtension(rom_path)),
             .id = assigned.id,
             .content_hash = assigned.digest,
+            .content_crc32 = std.hash.crc.Crc32.hash(normalized),
             .artwork_path = if (artwork) |match| @constCast(match.path) else null,
             .artwork_status = if (artwork) |match| match.status else .generated,
         });
@@ -1406,6 +1487,13 @@ test "recursive scan supports more than forty ROMs and adjacent artwork" {
     }
     try std.testing.expectEqual(@as(usize, 1), exact);
     try std.testing.expectEqual(@as(usize, 40), missing);
+}
+
+test "variant IDs are manifest-safe" {
+    const id = try variantId(std.testing.allocator, "github-mario-builder-64-1.0.0");
+    defer std.testing.allocator.free(id);
+    try std.testing.expect(std.mem.startsWith(u8, id, "github-mario-builder-"));
+    try std.testing.expectEqual(@as(usize, 31), id.len);
 }
 
 fn tempPath(allocator: std.mem.Allocator, temp: std.testing.TmpDir, child: []const u8) ![]u8 {
