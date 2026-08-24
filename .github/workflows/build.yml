@@ -80,7 +80,6 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item -LiteralPath tools/library-importer/THIRD_PARTY.md -Destination tools/library-importer/zig-out/bin/THIRD_PARTY.md
-          Copy-Item -LiteralPath tools/library-importer/sc64deployer-batch-sync.patch -Destination tools/library-importer/zig-out/bin/sc64deployer-batch-sync.patch
 
       - name: Package importer (Windows)
         if: runner.os == 'Windows'
@@ -93,7 +92,6 @@ jobs:
         run: >-
           tar -czf ../${{ matrix.artifact }}.tar.gz
           m64importer sc64deployer sc64menu.n64 THIRD_PARTY.md SC64DEPLOYER_LICENSE.txt
-          sc64deployer-batch-sync.patch
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

@@ -22,6 +22,7 @@ pub const Config = struct {
     image_root: ?[]const u8 = null,
     /// May point either at Named_Boxarts or at its parent directory.
     retroarch_thumbnail_root: ?[]const u8 = null,
+    artwork_cache_root: ?[]const u8 = null,
     recursive: bool = false,
 };
 
@@ -32,7 +33,21 @@ pub const ArtworkStatus = enum {
     image_root_normalized,
     retroarch_exact,
     retroarch_normalized,
+    downloaded,
     generated,
+};
+
+pub const LocalRevision = struct {
+    rom_path: []u8,
+    name: []u8,
+    revision: u8,
+    content_hash: [32]u8,
+    content_crc32: u32,
+
+    fn deinit(self: *LocalRevision, allocator: std.mem.Allocator) void {
+        allocator.free(self.rom_path);
+        allocator.free(self.name);
+    }
 };
 
 pub const Title = struct {
@@ -43,11 +58,17 @@ pub const Title = struct {
     content_crc32: u32 = 0,
     artwork_path: ?[]u8,
     artwork_status: ArtworkStatus,
+    artwork_options: usize = 0,
+    cartridge_identity: [4]u8 = @splat(0),
+    revision: u8 = 0,
+    local_revisions: []LocalRevision = &.{},
 
     fn deinit(self: *Title, allocator: std.mem.Allocator) void {
         allocator.free(self.rom_path);
         allocator.free(self.display_name);
         if (self.artwork_path) |path| allocator.free(path);
+        for (self.local_revisions) |*revision| revision.deinit(allocator);
+        if (self.local_revisions.len != 0) allocator.free(self.local_revisions);
     }
 };
 
@@ -73,6 +94,7 @@ pub const DecodedArtwork = struct {
 };
 
 pub fn decodeArtwork(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !DecodedArtwork {
+    if (std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".bmp")) return decodeBmpArtwork(allocator, io, path);
     var read_buffer: [64 * 1024]u8 = undefined;
     var image = try zigimg.Image.fromFilePath(allocator, io, path, &read_buffer);
     defer image.deinit(allocator);
@@ -86,6 +108,70 @@ pub fn decodeArtwork(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
         bytes[index * 4 + 3] = pixel.a;
     }
     return .{ .width = image.width, .height = image.height, .pixels = bytes };
+}
+
+fn decodeBmpArtwork(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !DecodedArtwork {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
+    defer allocator.free(bytes);
+    if (bytes.len < 54 or !std.mem.eql(u8, bytes[0..2], "BM")) return error.InvalidBmp;
+    const pixel_offset = std.mem.readInt(u32, bytes[10..14], .little);
+    const width_signed = std.mem.readInt(i32, bytes[18..22], .little);
+    const height_signed = std.mem.readInt(i32, bytes[22..26], .little);
+    if (width_signed <= 0 or height_signed == 0 or std.mem.readInt(u16, bytes[26..28], .little) != 1 or std.mem.readInt(u16, bytes[28..30], .little) != 24 or std.mem.readInt(u32, bytes[30..34], .little) != 0) return error.UnsupportedBmp;
+    const width: usize = @intCast(width_signed);
+    const height: usize = @intCast(if (height_signed < 0) -height_signed else height_signed);
+    const row_bytes = std.math.mul(usize, width, 3) catch return error.InvalidBmp;
+    const row_size = (std.math.add(usize, row_bytes, 3) catch return error.InvalidBmp) & ~@as(usize, 3);
+    const pixel_size = std.math.mul(usize, row_size, height) catch return error.InvalidBmp;
+    if (pixel_offset > bytes.len or pixel_size > bytes.len - pixel_offset) return error.InvalidBmp;
+    const pixel_count = std.math.mul(usize, width, height) catch return error.InvalidBmp;
+    const pixels = try allocator.alloc(u8, std.math.mul(usize, pixel_count, 4) catch return error.InvalidBmp);
+    errdefer allocator.free(pixels);
+    for (0..height) |y| {
+        const source_y = if (height_signed > 0) height - 1 - y else y;
+        for (0..width) |x| {
+            const source = @as(usize, pixel_offset) + source_y * row_size + x * 3;
+            const destination = (y * width + x) * 4;
+            pixels[destination] = bytes[source + 2];
+            pixels[destination + 1] = bytes[source + 1];
+            pixels[destination + 2] = bytes[source];
+            pixels[destination + 3] = 255;
+        }
+    }
+    return .{ .width = width, .height = height, .pixels = pixels };
+}
+
+pub fn convertMenuSpriteToBmp(allocator: std.mem.Allocator, io: std.Io, source: []const u8, destination: []const u8) !void {
+    const expected_size = 8 + sprite_width * sprite_height * 2;
+    const sprite = try std.Io.Dir.cwd().readFileAlloc(io, source, allocator, .limited(expected_size + 1));
+    defer allocator.free(sprite);
+    if (sprite.len != expected_size) return error.InvalidMenuSprite;
+    const row_size = (sprite_width * 3 + 3) & ~@as(usize, 3);
+    const pixel_size = row_size * sprite_height;
+    const bmp = try allocator.alloc(u8, 54 + pixel_size);
+    defer allocator.free(bmp);
+    @memset(bmp, 0);
+    bmp[0..2].* = "BM".*;
+    std.mem.writeInt(u32, bmp[2..6], @intCast(bmp.len), .little);
+    std.mem.writeInt(u32, bmp[10..14], 54, .little);
+    std.mem.writeInt(u32, bmp[14..18], 40, .little);
+    std.mem.writeInt(i32, bmp[18..22], sprite_width, .little);
+    std.mem.writeInt(i32, bmp[22..26], sprite_height, .little);
+    std.mem.writeInt(u16, bmp[26..28], 1, .little);
+    std.mem.writeInt(u16, bmp[28..30], 24, .little);
+    std.mem.writeInt(u32, bmp[34..38], @intCast(pixel_size), .little);
+    for (0..sprite_height) |output_y| {
+        const source_y = sprite_height - 1 - output_y;
+        for (0..sprite_width) |x| {
+            const source_offset = 8 + (source_y * sprite_width + x) * 2;
+            const value = std.mem.readInt(u16, sprite[source_offset..][0..2], .big);
+            const destination_offset = 54 + output_y * row_size + x * 3;
+            bmp[destination_offset] = @intCast(((value >> 1) & 0x1f) * 255 / 31);
+            bmp[destination_offset + 1] = @intCast(((value >> 6) & 0x1f) * 255 / 31);
+            bmp[destination_offset + 2] = @intCast(((value >> 11) & 0x1f) * 255 / 31);
+        }
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = destination, .data = bmp });
 }
 
 pub const RetroArchPlaylistEntry = struct {
@@ -144,6 +230,7 @@ pub const RetroArchDiscoveryOptions = struct {
     mounted_roots: []const []const u8 = &.{},
     maximum_search_depth: usize = 7,
     environ: std.process.Environ = .empty,
+    artwork_cache_root: ?[]const u8 = null,
 };
 
 pub const ProgressEvent = struct {
@@ -157,6 +244,65 @@ pub const Progress = struct {
     callback: *const fn (?*anyopaque, ProgressEvent) void,
 };
 
+pub fn matchingRegistryVariants(title: Title, catalog: *const registry.Registry, output: []usize) usize {
+    var count = registry.matching(catalog, title.content_crc32, &title.content_hash, output);
+    for (title.local_revisions) |revision| {
+        if (count >= output.len) break;
+        var matches: [registry.maximum_variants_per_title]usize = undefined;
+        const found = registry.matching(catalog, revision.content_crc32, &revision.content_hash, &matches);
+        for (matches[0..@min(found, matches.len)]) |index| {
+            var duplicate = false;
+            for (output[0..count]) |existing| if (existing == index) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) {
+                output[count] = index;
+                count += 1;
+                if (count == output.len) break;
+            }
+        }
+    }
+    return count;
+}
+
+pub fn stageLocalRevisions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output_root: []const u8,
+    titles: []const Title,
+) !usize {
+    var staged: usize = 0;
+    for (titles) |title| {
+        if (title.local_revisions.len == 0) continue;
+        const title_id = titleIdSlice(&title.id);
+        const variants_root = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants" });
+        defer allocator.free(variants_root);
+        try std.Io.Dir.cwd().createDirPath(io, variants_root);
+        var manifest: std.Io.Writer.Allocating = .init(allocator);
+        defer manifest.deinit();
+        for (title.local_revisions[0..@min(title.local_revisions.len, registry.maximum_variants_per_title)]) |revision| {
+            const id = try std.fmt.allocPrint(allocator, "revision-{d}", .{revision.revision});
+            defer allocator.free(id);
+            const filename = try std.fmt.allocPrint(allocator, "{s}.z64", .{id});
+            defer allocator.free(filename);
+            const destination = try std.fs.path.join(allocator, &.{ variants_root, filename });
+            defer allocator.free(destination);
+            const rom = try readNormalizedRom(allocator, io, revision.rom_path);
+            defer allocator.free(rom);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = destination, .data = rom });
+            const name = try manifestText(allocator, revision.name);
+            defer allocator.free(name);
+            try manifest.writer.print("{s},{s},{s},\n", .{ id, name, filename });
+            staged += 1;
+        }
+        const manifest_path = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants.csv" });
+        defer allocator.free(manifest_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest.written() });
+    }
+    return staged;
+}
+
 pub fn stageCachedVariants(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -168,14 +314,23 @@ pub fn stageCachedVariants(
     var staged: usize = 0;
     for (titles) |title| {
         var matches: [registry.maximum_variants_per_title]usize = undefined;
-        const count = @min(registry.matching(catalog, title.content_crc32, &title.content_hash, &matches), matches.len);
+        const count = @min(matchingRegistryVariants(title, catalog, &matches), matches.len);
         if (count == 0) continue;
-        const base_rom = try readNormalizedRom(allocator, io, title.rom_path);
-        defer allocator.free(base_rom);
         var manifest: std.Io.Writer.Allocating = .init(allocator);
         defer manifest.deinit();
+        const title_id = titleIdSlice(&title.id);
+        const manifest_path = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants.csv" });
+        defer allocator.free(manifest_path);
+        const existing = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(64 * 1024)) catch null;
+        defer if (existing) |bytes| allocator.free(bytes);
+        if (existing) |bytes| try manifest.writer.writeAll(bytes);
+        var used = countManifestEntries(manifest.written());
         for (matches[0..count]) |registry_index| {
+            if (used >= registry.maximum_variants_per_title) break;
             const entry = catalog.entries()[registry_index];
+            const base_path = matchingRevisionPath(title, entry.base.normalizedCrc32, entry.base.normalizedSha256) orelse continue;
+            const base_rom = try readNormalizedRom(allocator, io, base_path);
+            defer allocator.free(base_rom);
             const patch_path = try registry.cachedArtifactPath(allocator, entry, cache_directory);
             defer allocator.free(patch_path);
             if (!(try registry.cachedArtifactReady(io, patch_path, entry))) continue;
@@ -192,7 +347,6 @@ pub fn stageCachedVariants(
                 const actual = std.fmt.bytesToHex(digest, .upper);
                 if (!std.ascii.eqlIgnoreCase(&actual, expected)) continue;
             }
-            const title_id = titleIdSlice(&title.id);
             const variants_root = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants" });
             defer allocator.free(variants_root);
             try std.Io.Dir.cwd().createDirPath(io, variants_root);
@@ -207,15 +361,35 @@ pub fn stageCachedVariants(
             defer allocator.free(variant_name);
             try manifest.writer.print("{s},{s},{s}.z64,{s}\n", .{ variant_id, variant_name, variant_id, entry.saveType orelse "" });
             staged += 1;
+            used += 1;
         }
         if (manifest.written().len != 0) {
-            const title_id = titleIdSlice(&title.id);
-            const manifest_path = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants.csv" });
-            defer allocator.free(manifest_path);
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest.written() });
         }
     }
     return staged;
+}
+
+fn matchingRevisionPath(title: Title, expected_crc32: []const u8, expected_sha256: []const u8) ?[]const u8 {
+    var crc_buffer: [8]u8 = undefined;
+    const base_crc = std.fmt.bufPrint(&crc_buffer, "{X:0>8}", .{title.content_crc32}) catch return null;
+    const base_hash = std.fmt.bytesToHex(title.content_hash, .upper);
+    if (std.ascii.eqlIgnoreCase(base_crc, expected_crc32) and std.ascii.eqlIgnoreCase(&base_hash, expected_sha256)) return title.rom_path;
+    for (title.local_revisions) |revision| {
+        const crc = std.fmt.bufPrint(&crc_buffer, "{X:0>8}", .{revision.content_crc32}) catch return null;
+        const hash = std.fmt.bytesToHex(revision.content_hash, .upper);
+        if (std.ascii.eqlIgnoreCase(crc, expected_crc32) and std.ascii.eqlIgnoreCase(&hash, expected_sha256)) return revision.rom_path;
+    }
+    return null;
+}
+
+fn countManifestEntries(bytes: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| if (std.mem.trim(u8, line, " \t\r").len != 0) {
+        count += 1;
+    };
+    return count;
 }
 
 fn variantId(allocator: std.mem.Allocator, registry_id: []const u8) ![]u8 {
@@ -235,9 +409,76 @@ fn variantId(allocator: std.mem.Allocator, registry_id: []const u8) ![]u8 {
 const Match = struct {
     path: []const u8,
     status: ArtworkStatus,
+    options: usize = 0,
 };
 
 const ByteOrder = enum { z64, v64, n64 };
+
+fn cartridgeIdentity(normalized: []const u8) [4]u8 {
+    if (normalized.len < 0x40) return @splat(0);
+    return .{ normalized[0x3b], normalized[0x3c], normalized[0x3d], normalized[0x3e] };
+}
+
+fn romRevision(normalized: []const u8) u8 {
+    return if (normalized.len > 0x3f) normalized[0x3f] else 0;
+}
+
+fn appendGroupedTitle(allocator: std.mem.Allocator, titles: *std.ArrayList(Title), candidate_value: Title) !void {
+    var candidate = candidate_value;
+    const candidate_group = try withoutRevision(allocator, candidate.display_name);
+    defer allocator.free(candidate_group);
+    for (titles.items) |*existing| {
+        const empty_identity: [4]u8 = @splat(0);
+        if (std.mem.eql(u8, &candidate.cartridge_identity, &empty_identity) or !std.mem.eql(u8, &existing.cartridge_identity, &candidate.cartridge_identity)) continue;
+        const existing_group = try withoutRevision(allocator, existing.display_name);
+        defer allocator.free(existing_group);
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, existing_group, " \t"), std.mem.trim(u8, candidate_group, " \t"))) continue;
+        if (candidate.revision == existing.revision) continue;
+        if (candidate.revision > existing.revision) {
+            const older = LocalRevision{ .rom_path = existing.rom_path, .name = existing.display_name, .revision = existing.revision, .content_hash = existing.content_hash, .content_crc32 = existing.content_crc32 };
+            const revisions = try appendRevisionOwned(allocator, existing.local_revisions, older);
+            existing.rom_path = candidate.rom_path;
+            existing.display_name = candidate.display_name;
+            existing.id = candidate.id;
+            existing.content_hash = candidate.content_hash;
+            existing.content_crc32 = candidate.content_crc32;
+            existing.cartridge_identity = candidate.cartridge_identity;
+            existing.revision = candidate.revision;
+            if (candidate.artwork_path != null) {
+                if (existing.artwork_path) |path| allocator.free(path);
+                existing.artwork_path = candidate.artwork_path;
+                existing.artwork_status = candidate.artwork_status;
+                existing.artwork_options = candidate.artwork_options;
+            }
+            existing.local_revisions = revisions;
+        } else {
+            const revisions = try appendRevisionOwned(allocator, existing.local_revisions, .{
+                .rom_path = candidate.rom_path,
+                .name = candidate.display_name,
+                .revision = candidate.revision,
+                .content_hash = candidate.content_hash,
+                .content_crc32 = candidate.content_crc32,
+            });
+            if (candidate.artwork_path) |path| allocator.free(path);
+            existing.local_revisions = revisions;
+        }
+        return;
+    }
+    try titles.append(allocator, candidate);
+}
+
+fn appendRevisionOwned(allocator: std.mem.Allocator, existing: []LocalRevision, revision: LocalRevision) ![]LocalRevision {
+    const result = try allocator.alloc(LocalRevision, existing.len + 1);
+    @memcpy(result[0..existing.len], existing);
+    result[existing.len] = revision;
+    if (existing.len != 0) allocator.free(existing);
+    std.mem.sort(LocalRevision, result, {}, struct {
+        fn lessThan(_: void, a: LocalRevision, b: LocalRevision) bool {
+            return a.revision > b.revision;
+        }
+    }.lessThan);
+    return result;
+}
 
 pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !ScanResult {
     try validateDirectory(io, config.rom_root);
@@ -282,9 +523,11 @@ pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !Sc
 
         const display_name = try allocator.dupe(u8, basenameWithoutExtension(rom_path));
         errdefer allocator.free(display_name);
-        const match = try findArtwork(allocator, io, rom_path, images.items, retro_images.items);
+        const match = (try findCustomCachedArtwork(allocator, io, config.artwork_cache_root, &assigned.digest)) orelse
+            (try findArtwork(allocator, io, rom_path, images.items, retro_images.items)) orelse
+            try findCachedArtwork(allocator, io, config.artwork_cache_root, &assigned.digest);
         errdefer if (match) |found| allocator.free(found.path);
-        try titles.append(allocator, .{
+        try appendGroupedTitle(allocator, &titles, .{
             .rom_path = try allocator.dupe(u8, rom_path),
             .display_name = display_name,
             .id = assigned.id,
@@ -292,6 +535,9 @@ pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !Sc
             .content_crc32 = std.hash.crc.Crc32.hash(normalized),
             .artwork_path = if (match) |found| @constCast(found.path) else null,
             .artwork_status = if (match) |found| found.status else .generated,
+            .artwork_options = if (match) |found| found.options else 0,
+            .cartridge_identity = cartridgeIdentity(normalized),
+            .revision = romRevision(normalized),
         });
     }
     return .{ .titles = try titles.toOwnedSlice(allocator) };
@@ -367,7 +613,7 @@ pub fn scanRetroArchLibrary(
     errdefer source.deinit(allocator);
     return .{
         .source = source,
-        .preview = try scanRetroArchPlaylist(allocator, io, source, mounted_roots),
+        .preview = try scanRetroArchPlaylist(allocator, io, source, mounted_roots, options.artwork_cache_root),
     };
 }
 
@@ -666,6 +912,7 @@ fn scanRetroArchPlaylist(
     io: std.Io,
     source: RetroArchSource,
     mounted_roots: []const []const u8,
+    artwork_cache_root: ?[]const u8,
 ) !ScanResult {
     var playlist = try readRetroArchPlaylist(allocator, io, source.playlist_path);
     defer playlist.deinit(allocator);
@@ -690,9 +937,11 @@ fn scanRetroArchPlaylist(
         const normalized = try readNormalizedRom(allocator, io, rom_path);
         defer allocator.free(normalized);
         const assigned = try uniqueNormalizedId(normalized, titles.items);
-        const artwork = try findRetroArchPlaylistArtwork(allocator, entry, rom_path, boxarts.items, snaps.items);
+        const artwork = (try findCustomCachedArtwork(allocator, io, artwork_cache_root, &assigned.digest)) orelse
+            (try findRetroArchPlaylistArtwork(allocator, entry, rom_path, boxarts.items, snaps.items)) orelse
+            try findCachedArtwork(allocator, io, artwork_cache_root, &assigned.digest);
         errdefer if (artwork) |match| allocator.free(match.path);
-        try titles.append(allocator, .{
+        try appendGroupedTitle(allocator, &titles, .{
             .rom_path = rom_path,
             .display_name = try allocator.dupe(u8, if (entry.label.len != 0) entry.label else basenameWithoutExtension(rom_path)),
             .id = assigned.id,
@@ -700,6 +949,9 @@ fn scanRetroArchPlaylist(
             .content_crc32 = std.hash.crc.Crc32.hash(normalized),
             .artwork_path = if (artwork) |match| @constCast(match.path) else null,
             .artwork_status = if (artwork) |match| match.status else .generated,
+            .artwork_options = if (artwork) |match| match.options else 0,
+            .cartridge_identity = cartridgeIdentity(normalized),
+            .revision = romRevision(normalized),
         });
     }
     if (titles.items.len == 0) return error.NoRomsFound;
@@ -893,6 +1145,44 @@ pub fn retroArchThumbnailName(allocator: std.mem.Allocator, name: []const u8) ![
     return result;
 }
 
+pub fn findRetroArchArtwork(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    display_name: []const u8,
+) !?[]u8 {
+    var roots: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &roots);
+    try appendDefaultSearchRoots(allocator, io, environ, &roots);
+    const names = [_][]const u8{ display_name, try shortTitleName(allocator, display_name) };
+    defer allocator.free(names[1]);
+    for (roots.items) |root| {
+        const candidates = [_][]const []const u8{
+            &.{ root, "thumbnails", "Nintendo - Nintendo 64", "Named_Boxarts" },
+            &.{ root, "thumbnails", "Nintendo - Nintendo 64", "Named_Snaps" },
+            &.{ root, "RetroArch", "thumbnails", "Nintendo - Nintendo 64", "Named_Boxarts" },
+            &.{ root, "RetroArch", "thumbnails", "Nintendo - Nintendo 64", "Named_Snaps" },
+        };
+        for (candidates) |parts| {
+            const directory = try std.fs.path.join(allocator, parts);
+            defer allocator.free(directory);
+            if (!directoryExists(io, directory)) continue;
+            for (names) |name| {
+                const sanitized = try retroArchThumbnailName(allocator, name);
+                defer allocator.free(sanitized);
+                for (image_extensions) |extension| {
+                    const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ sanitized, extension });
+                    defer allocator.free(filename);
+                    const path = try std.fs.path.join(allocator, &.{ directory, filename });
+                    if (fileExists(io, path)) return path;
+                    allocator.free(path);
+                }
+            }
+        }
+    }
+    return null;
+}
+
 fn shortTitleName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     var end = name.len;
     while (end != 0) {
@@ -1001,6 +1291,76 @@ fn findArtwork(
     if (try indexedMatch(allocator, names[0..name_count], images, .image_root_exact, .image_root_normalized)) |match| return match;
     if (try indexedMatch(allocator, names[0..name_count], retro_images, .retroarch_exact, .retroarch_normalized)) |match| return match;
     return null;
+}
+
+fn findCachedArtwork(allocator: std.mem.Allocator, io: std.Io, root: ?[]const u8, digest: *const [32]u8) !?Match {
+    const directory = root orelse return null;
+    const hash = std.fmt.bytesToHex(digest.*, .lower);
+    const extensions = [_][]const u8{ ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff" };
+    var options: usize = 0;
+    for (0..6) |index| {
+        var found = false;
+        for (extensions) |extension| {
+            const filename = try std.fmt.allocPrint(allocator, "{s}-{d}{s}", .{ &hash, index, extension });
+            defer allocator.free(filename);
+            const path = try std.fs.path.join(allocator, &.{ directory, filename });
+            const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+                allocator.free(path);
+                continue;
+            };
+            allocator.free(path);
+            if (stat.kind == .file and stat.size != 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) break;
+        options += 1;
+    }
+    for (extensions) |extension| {
+        const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ &hash, extension });
+        defer allocator.free(filename);
+        const path = try std.fs.path.join(allocator, &.{ directory, filename });
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        if (stat.kind == .file and stat.size >= 8) {
+            var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
+                allocator.free(path);
+                continue;
+            };
+            defer file.close(io);
+            var read_buffer: [64]u8 = undefined;
+            var bytes: [8]u8 = undefined;
+            var reader = file.readerStreaming(io, &read_buffer);
+            reader.interface.readSliceAll(&bytes) catch {
+                allocator.free(path);
+                continue;
+            };
+            const valid = if (std.ascii.eqlIgnoreCase(extension, ".png"))
+                std.mem.eql(u8, &bytes, "\x89PNG\r\n\x1a\n")
+            else if (std.ascii.eqlIgnoreCase(extension, ".jpg") or std.ascii.eqlIgnoreCase(extension, ".jpeg"))
+                std.mem.eql(u8, bytes[0..3], "\xff\xd8\xff")
+            else
+                true;
+            if (valid) return .{ .path = path, .status = .downloaded, .options = options };
+        }
+        allocator.free(path);
+    }
+    return null;
+}
+
+fn findCustomCachedArtwork(allocator: std.mem.Allocator, io: std.Io, root: ?[]const u8, digest: *const [32]u8) !?Match {
+    const directory = root orelse return null;
+    const hash = std.fmt.bytesToHex(digest.*, .lower);
+    const filename = try std.fmt.allocPrint(allocator, "{s}.custom", .{&hash});
+    defer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ directory, filename });
+    defer allocator.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    if (stat.kind != .file) return null;
+    return findCachedArtwork(allocator, io, root, digest);
 }
 
 fn indexedMatch(
@@ -1163,6 +1523,14 @@ fn asciiText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return result;
 }
 
+fn manifestText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const result = try asciiText(allocator, text);
+    for (result) |*byte| if (byte.* == ',' or byte.* == '\r' or byte.* == '\n') {
+        byte.* = ' ';
+    };
+    return result;
+}
+
 fn titleCsvBytes(allocator: std.mem.Allocator, titles: []const Title) ![]u8 {
     var size: usize = 1;
     for (titles) |title| size += titleIdSlice(&title.id).len + 1;
@@ -1182,14 +1550,12 @@ fn titleCsvBytes(allocator: std.mem.Allocator, titles: []const Title) ![]u8 {
 const Rgba = struct { r: u8, g: u8, b: u8, a: u8 };
 
 fn writeArtworkSprite(allocator: std.mem.Allocator, io: std.Io, source: []const u8, destination: []const u8) !void {
-    var read_buffer: [64 * 1024]u8 = undefined;
-    var image = try zigimg.Image.fromFilePath(allocator, io, source, &read_buffer);
+    var image = try decodeArtwork(allocator, io, source);
     defer image.deinit(allocator);
-    try image.convert(allocator, .rgba32);
     const canvas = try allocator.alloc(Rgba, sprite_width * sprite_height);
     defer allocator.free(canvas);
     @memset(canvas, .{ .r = 48, .g = 48, .b = 48, .a = 255 });
-    containFit(image.width, image.height, image.pixels.rgba32, canvas);
+    containFit(image.width, image.height, std.mem.bytesAsSlice(Rgba, image.pixels), canvas);
     try writeSprite(allocator, io, canvas, destination);
 }
 
@@ -1293,6 +1659,31 @@ test "byte-order conversion equivalence and normalized ID stability" {
     std.crypto.hash.sha2.Sha256.hash(&n64, &n64_digest, .{});
     try std.testing.expectEqual(normalizedId(z64_digest, 5), normalizedId(v64_digest, 5));
     try std.testing.expectEqual(normalizedId(z64_digest, 5), normalizedId(n64_digest, 5));
+}
+
+test "installed menu sprite converts to desktop BMP" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const sprite = try allocator.alloc(u8, 8 + sprite_width * sprite_height * 2);
+    defer allocator.free(sprite);
+    sprite[0..8].* = .{ 0x01, 0x00, 0x00, 0xB3, 2, 0, 1, 1 };
+    @memset(sprite[8..], 0xff);
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "cover.sprite", .data = sprite });
+    const source = try tempPath(allocator, temp, "cover.sprite");
+    defer allocator.free(source);
+    const destination = try tempPath(allocator, temp, "cover.bmp");
+    defer allocator.free(destination);
+    try convertMenuSpriteToBmp(allocator, std.testing.io, source, destination);
+    const bmp = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, destination, allocator, .limited(54 + sprite_width * sprite_height * 3 + 1));
+    defer allocator.free(bmp);
+    try std.testing.expectEqualSlices(u8, "BM", bmp[0..2]);
+    try std.testing.expectEqual(@as(u32, sprite_width), std.mem.readInt(u32, bmp[18..22], .little));
+    try std.testing.expectEqual(@as(u32, sprite_height), std.mem.readInt(u32, bmp[22..26], .little));
+    var decoded = try decodeArtwork(allocator, std.testing.io, destination);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, sprite_width), decoded.width);
+    try std.testing.expectEqual(@as(usize, sprite_height), decoded.height);
 }
 
 test "normalized name matching" {
@@ -1487,6 +1878,72 @@ test "recursive scan supports more than forty ROMs and adjacent artwork" {
     }
     try std.testing.expectEqual(@as(usize, 1), exact);
     try std.testing.expectEqual(@as(usize, 40), missing);
+}
+
+test "scan reuses downloaded artwork by normalized ROM hash" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "roms");
+    try temp.dir.createDirPath(std.testing.io, "artwork");
+    const rom = [_]u8{ 0x80, 0x37, 0x12, 0x40, 0, 0, 0, 0 };
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "roms/Game.z64", .data = &rom });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&rom, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    var filename_buffer: [80]u8 = undefined;
+    const filename = try std.fmt.bufPrint(&filename_buffer, "artwork/{s}.jpg", .{&hash});
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = "\xff\xd8\xff12345" });
+
+    const rom_root = try tempPath(allocator, temp, "roms");
+    defer allocator.free(rom_root);
+    const artwork_root = try tempPath(allocator, temp, "artwork");
+    defer allocator.free(artwork_root);
+    var result = try scanLibrary(allocator, std.testing.io, .{ .rom_root = rom_root, .artwork_cache_root = artwork_root });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(ArtworkStatus.downloaded, result.titles[0].artwork_status);
+    try std.testing.expect(result.titles[0].artwork_path != null);
+}
+
+test "latest N64 revision becomes base and older revisions become variants" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "roms");
+    for ([_]u8{ 0, 2, 1 }) |revision| {
+        var rom: [64]u8 = @splat(0);
+        rom[0..4].* = .{ 0x80, 0x37, 0x12, 0x40 };
+        rom[0x3b..0x3f].* = .{ 'N', 'S', 'M', 'E' };
+        rom[0x3f] = revision;
+        var name_buffer: [64]u8 = undefined;
+        const name = if (revision == 0)
+            "roms/Game.z64"
+        else
+            try std.fmt.bufPrint(&name_buffer, "roms/Game (Rev {c}).z64", .{'A' + revision - 1});
+        try temp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = &rom });
+    }
+    const root = try tempPath(allocator, temp, "roms");
+    defer allocator.free(root);
+    var result = try scanLibrary(allocator, std.testing.io, .{ .rom_root = root });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), result.titles.len);
+    try std.testing.expectEqual(@as(u8, 2), result.titles[0].revision);
+    try std.testing.expectEqualStrings("Game (Rev B)", result.titles[0].display_name);
+    try std.testing.expectEqual(@as(usize, 2), result.titles[0].local_revisions.len);
+    try std.testing.expectEqual(@as(u8, 1), result.titles[0].local_revisions[0].revision);
+    try std.testing.expectEqual(@as(u8, 0), result.titles[0].local_revisions[1].revision);
+
+    const output = try tempPath(allocator, temp, "output");
+    defer allocator.free(output);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, output);
+    try stageTitles(allocator, std.testing.io, output, result.titles, null);
+    try std.testing.expectEqual(@as(usize, 2), try stageLocalRevisions(allocator, std.testing.io, output, result.titles));
+    const manifest_path = try std.fs.path.join(allocator, &.{ output, "menu", "title", titleIdSlice(&result.titles[0].id), "variants.csv" });
+    defer allocator.free(manifest_path);
+    const manifest = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, allocator, .limited(1024));
+    defer allocator.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "revision-1,Game (Rev A),revision-1.z64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "revision-0,Game,revision-0.z64") != null);
 }
 
 test "variant IDs are manifest-safe" {

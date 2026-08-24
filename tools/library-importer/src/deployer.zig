@@ -99,15 +99,15 @@ pub fn locate(
     defer allocator.free(application_dir);
     const bundled = try std.fs.path.join(allocator, &.{ application_dir, executable_name });
     defer allocator.free(bundled);
-    if (isFile(io, bundled) and executableWorks(allocator, io, bundled) catch false) return allocator.dupe(u8, bundled);
+    if (isFile(io, bundled) and supportsBatchedSync(allocator, io, bundled) catch false) return allocator.dupe(u8, bundled);
 
-    if (try executableWorks(allocator, io, executable_name)) {
+    if (try supportsBatchedSync(allocator, io, executable_name)) {
         return allocator.dupe(u8, executable_name);
     }
     if (explicit_path) |path| {
-        if (isFile(io, path)) return allocator.dupe(u8, path);
+        if (isFile(io, path) and try supportsBatchedSync(allocator, io, path)) return allocator.dupe(u8, path);
     }
-    return error.DeployerNotFound;
+    return error.BatchedDeployerNotFound;
 }
 
 pub fn detectDevices(
@@ -384,6 +384,17 @@ fn download(
     }
 }
 
+pub fn downloadFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    deployer_path: []const u8,
+    port: []const u8,
+    sd_path: []const u8,
+    local_path: []const u8,
+) !void {
+    return download(allocator, io, deployer_path, port, sd_path, local_path);
+}
+
 fn isTitleIdByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte);
 }
@@ -424,6 +435,16 @@ fn executableWorks(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
     };
     defer freeRunResult(allocator, result);
     return termSucceeded(result.term);
+}
+
+fn supportsBatchedSync(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
+    if (!(try executableWorks(allocator, io, path))) return false;
+    const result = run(allocator, io, &.{ path, "sd", "sync", "--help" }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer freeRunResult(allocator, result);
+    return termSucceeded(result.term) and std.mem.indexOf(u8, result.stdout, "sd sync") != null;
 }
 
 fn isFile(io: std.Io, path: []const u8) bool {
