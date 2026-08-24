@@ -1331,8 +1331,9 @@ fn findCachedArtwork(allocator: std.mem.Allocator, io: std.Io, root: ?[]const u8
                 continue;
             };
             defer file.close(io);
+            var read_buffer: [64]u8 = undefined;
             var bytes: [8]u8 = undefined;
-            var reader = file.readerStreaming(io, &bytes);
+            var reader = file.readerStreaming(io, &read_buffer);
             reader.interface.readSliceAll(&bytes) catch {
                 allocator.free(path);
                 continue;

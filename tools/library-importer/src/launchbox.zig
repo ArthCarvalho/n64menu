@@ -359,10 +359,11 @@ fn usableCachedArtwork(io: std.Io, path: []const u8) bool {
     if (stat.kind != .file or stat.size < 8 or stat.size > maximum_artwork_size) return false;
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
     defer file.close(io);
-    var buffer: [8]u8 = undefined;
-    var reader = file.readerStreaming(io, &buffer);
-    reader.interface.readSliceAll(&buffer) catch return false;
-    return validArtworkBytes(&buffer, std.fs.path.extension(path));
+    var read_buffer: [64]u8 = undefined;
+    var signature: [8]u8 = undefined;
+    var reader = file.readerStreaming(io, &read_buffer);
+    reader.interface.readSliceAll(&signature) catch return false;
+    return validArtworkBytes(&signature, std.fs.path.extension(path));
 }
 
 fn validArtworkBytes(bytes: []const u8, extension: []const u8) bool {
