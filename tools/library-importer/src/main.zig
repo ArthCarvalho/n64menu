@@ -77,6 +77,7 @@ const page_layout = struct {
     const mod_button_y: f32 = grid_y + 166;
     const mod_page_button_offset: f32 = 176;
     const artwork_button_y: f32 = grid_y + 136;
+    const artwork_cycle_y: f32 = grid_y + 112;
 
     fn detailX(width: f32) f32 {
         return @max(616, width - right_margin - detail_width);
@@ -165,6 +166,13 @@ const LibraryScan = union(enum) {
         };
     }
 
+    fn previewMut(self: *LibraryScan) *importer.ScanResult {
+        return switch (self.*) {
+            .retroarch => |*scan| &scan.preview,
+            .directory => |*scan| &scan.preview,
+        };
+    }
+
     fn sourcePath(self: *const LibraryScan) []const u8 {
         return switch (self.*) {
             .retroarch => |scan| scan.source.playlist_path,
@@ -190,6 +198,12 @@ const SyncConfig = struct {
 
 const ModDownloadConfig = struct {
     registry_index: usize,
+};
+
+const ArtworkDownloadConfig = struct {
+    title_index: usize,
+    display_name: FixedText,
+    content_hash: [32]u8,
 };
 
 const CardOutcome = struct {
@@ -228,6 +242,17 @@ const ModDownloadResult = struct {
 const ModArtworkResult = struct {
     registry_index: usize,
     path: ?[]u8 = null,
+    gallery_index: usize = 0,
+    gallery_count: usize = 0,
+    err: ?[]const u8 = null,
+};
+
+const ArtworkDownloadResult = struct {
+    title_index: usize,
+    content_hash: [32]u8,
+    path: ?[]u8 = null,
+    gallery_index: usize = 0,
+    gallery_count: usize = 0,
     err: ?[]const u8 = null,
 };
 
@@ -235,11 +260,16 @@ const ModArtworkSlot = struct {
     registry_index: usize = std.math.maxInt(usize),
     texture: ArtworkTexture = .{},
     loading: bool = false,
+    gallery_index: usize = 0,
+    gallery_count: usize = 0,
+    failed: bool = false,
 };
 
 const ModBrowserData = struct {
-    catalog: *registry.Registry,
+    catalog: ?*registry.Registry,
     matches: [registry.maximum_variants_per_title]usize,
+    local_count: usize,
+    registry_count: usize,
     count: usize,
 };
 
@@ -248,6 +278,7 @@ const WorkerResult = union(enum) {
     sync: SyncResult,
     mod_download: ModDownloadResult,
     mod_artwork: ModArtworkResult,
+    artwork_download: ArtworkDownloadResult,
 };
 
 const state = struct {
@@ -662,7 +693,7 @@ fn drawModsBadge(card: Rect, title: importer.Title) void {
 
 fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
     const mod_count = compatibleModCount(title);
-    const panel_height: f32 = if (mod_count != 0) 208 else if (title.artwork_path == null) 174 else 112;
+    const panel_height: f32 = if (mod_count != 0) 238 else if (title.artwork_path == null) 174 else if (title.artwork_options > 1) 154 else 112;
     const panel = Rect{ .x = page_layout.detailX(width), .y = top, .w = @min(page_layout.detail_width, @max(0, width - page_layout.detailX(width) - page_layout.right_margin)), .h = panel_height };
     if (panel.w < 180) return;
     drawRect(panel, colors.inset);
@@ -672,13 +703,12 @@ fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
     const sync_state = titleSyncState(title);
     drawText(panel.x + 16, panel.y + 76, syncStateColor(sync_state), "{s}", .{syncStateDescription(sync_state)});
     if (mod_count != 0) {
-        drawText(panel.x + 16, panel.y + 100, colors.yellow, "{d} MOD(S) AVAILABLE", .{mod_count});
-        drawText(panel.x + 16, panel.y + 126, colors.dim, "Click this game again to browse mods.", .{});
+        drawText(panel.x + 16, panel.y + 100, colors.yellow, "{d} VERSION(S) AVAILABLE", .{mod_count});
+        drawText(panel.x + 16, panel.y + 126, colors.dim, "Click this game again to browse versions.", .{});
     }
-    if (title.artwork_path == null and mod_count == 0) {
-        drawText(panel.x + 16, panel.y + 102, colors.orange, "ARTWORK NEEDED", .{});
-        drawButton(.{ .x = panel.x + 16, .y = panel.y + 136, .w = 168, .h = 26 }, colors.yellow, "FIND ARTWORK");
-    }
+    const artwork_y = if (mod_count == 0) panel.y + 112 else panel.y + 202;
+    if (title.artwork_path == null) drawText(panel.x + 16, artwork_y - 28, colors.orange, "ARTWORK NEEDED", .{});
+    drawButton(.{ .x = panel.x + 16, .y = artwork_y, .w = 168, .h = 26 }, if (title.artwork_path == null) colors.yellow else colors.orange, "NEXT ART");
 }
 
 fn drawModBrowser(width: f32, height: f32) void {
@@ -686,10 +716,8 @@ fn drawModBrowser(width: f32, height: f32) void {
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return;
     const title = titles[state.preview_scroll];
-    const catalog = if (state.mod_registry) |*value| value else return;
-    var matches: [registry.maximum_variants_per_title]usize = undefined;
-    const mod_count = @min(registry.matching(catalog, title.content_crc32, &title.content_hash, &matches), matches.len);
-    if (mod_count == 0) {
+    const data = selectedModBrowserData() orelse return;
+    if (data.count == 0) {
         state.mod_browser_open = false;
         return;
     }
@@ -697,7 +725,7 @@ fn drawModBrowser(width: f32, height: f32) void {
     drawButton(.{ .x = width - 184, .y = page_layout.library_top - 10, .w = 140, .h = 30 }, colors.orange, "BACK TO GAMES");
     drawRect(.{ .x = 44, .y = page_layout.library_top + 22, .w = width - 88, .h = 2 }, colors.border);
 
-    const cards = mod_count + 1;
+    const cards = data.count + 1;
     const area = Rect{ .x = 44, .y = page_layout.grid_y, .w = width - 88, .h = height - page_layout.grid_y - 118 };
     const columns = std.math.clamp(@as(usize, @intFromFloat(@ceil((area.w + 16) / 220))), 2, 5);
     const gutter: f32 = 16;
@@ -714,23 +742,46 @@ fn drawModBrowser(width: f32, height: f32) void {
         };
         const selected = card_index == state.selected_mod;
         if (card_index == 0) {
-            drawModBrowserCard(rect, textureForTitle(state.preview_scroll), title.display_name, "ORIGINAL", selected);
+            drawModBrowserCard(rect, textureForTitle(state.preview_scroll), title.display_name, "LATEST / BASE", selected);
+        } else if (card_index <= data.local_count) {
+            const revision = title.local_revisions[card_index - 1];
+            drawModBrowserCard(rect, textureForTitle(state.preview_scroll), revision.name, revisionLabel(revision.revision), selected);
         } else {
-            const registry_index = matches[card_index - 1];
-            const entry = catalog.entries()[registry_index];
-            syncModArtwork(registry_index, entry);
+            const registry_index = data.matches[card_index - 1 - data.local_count];
+            const entry = data.catalog.?.entries()[registry_index];
+            syncModArtwork(registry_index);
             drawModBrowserCard(rect, textureForMod(registry_index), entry.name, entry.version, selected);
         }
     }
     if (state.selected_mod != 0) {
-        const entry = catalog.entries()[matches[state.selected_mod - 1]];
+        if (state.selected_mod <= data.local_count) {
+            const revision = title.local_revisions[state.selected_mod - 1];
+            drawButton(.{ .x = 44, .y = height - 74, .w = 168, .h = 30 }, colors.good, "READY FOR SYNC");
+            drawText(224, height - 66, colors.dim, "{s} - {s}", .{ revision.name, revisionLabel(revision.revision) });
+            return;
+        }
+        const registry_index = data.matches[state.selected_mod - 1 - data.local_count];
+        const entry = data.catalog.?.entries()[registry_index];
         const cached = isModCached(entry);
         drawButton(.{ .x = 44, .y = height - 74, .w = 168, .h = 30 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else "DOWNLOAD MOD");
-        drawButton(.{ .x = 224, .y = height - 74, .w = 168, .h = 30 }, colors.orange, if (entry.artwork == null) "SEARCH LAUNCHBOX" else "VIEW MOD PAGE");
-        drawText(416, height - 66, colors.dim, "{s} {s}", .{ entry.name, entry.version });
+        const artwork_slot = modArtworkSlot(registry_index);
+        const has_gallery = artwork_slot != null and artwork_slot.?.gallery_count > 1;
+        drawButton(.{ .x = 224, .y = height - 74, .w = 168, .h = 30 }, colors.orange, if (has_gallery) "NEXT ART" else "VIEW MOD PAGE");
+        if (has_gallery) drawButton(.{ .x = 404, .y = height - 74, .w = 148, .h = 30 }, colors.border, "VIEW MOD PAGE");
+        drawText(if (has_gallery) 572 else 416, height - 66, colors.dim, "{s} {s}", .{ entry.name, entry.version });
     } else {
         drawText(44, height - 66, colors.dim, "Original game", .{});
     }
+}
+
+fn revisionLabel(revision: u8) []const u8 {
+    return switch (revision) {
+        0 => "REV 0",
+        1 => "REV A",
+        2 => "REV B",
+        3 => "REV C",
+        else => "OLDER REVISION",
+    };
 }
 
 fn drawModBrowserCard(rect: Rect, texture: ?*const ArtworkTexture, name: []const u8, version: []const u8, selected: bool) void {
@@ -751,9 +802,9 @@ fn selectedColor(selected: bool) Color {
 }
 
 fn compatibleModCount(title: importer.Title) usize {
-    const catalog = if (state.mod_registry) |*value| value else return 0;
+    const catalog = if (state.mod_registry) |*value| value else return title.local_revisions.len;
     var matches: [8]usize = undefined;
-    return registry.matching(catalog, title.content_crc32, &title.content_hash, &matches);
+    return title.local_revisions.len + importer.matchingRegistryVariants(title, catalog, &matches);
 }
 
 fn drawModArtwork(rect: Rect, artwork: *const ArtworkTexture) void {
@@ -900,6 +951,11 @@ fn textureForMod(registry_index: usize) ?*const ArtworkTexture {
     return null;
 }
 
+fn modArtworkSlot(registry_index: usize) ?*ModArtworkSlot {
+    for (&state.mod_artwork_slots) |*slot| if (slot.registry_index == registry_index) return slot;
+    return null;
+}
+
 fn clearArtworkTextures() void {
     for (&state.artwork_textures) |*texture| destroyArtworkTexture(texture);
 }
@@ -963,8 +1019,8 @@ fn moveModBrowserSelection(delta: isize) void {
 fn activateSelectedMod() void {
     if (state.selected_mod == 0) return;
     const data = selectedModBrowserData() orelse return;
-    if (state.selected_mod > data.count) return;
-    downloadRegistryIndex(data.matches[state.selected_mod - 1]);
+    if (state.selected_mod > data.count or state.selected_mod <= data.local_count) return;
+    downloadRegistryIndex(data.matches[state.selected_mod - 1 - data.local_count]);
 }
 
 fn handleClick(x: f32, y: f32) void {
@@ -978,7 +1034,7 @@ fn handleClick(x: f32, y: f32) void {
     if (downloadSelectedMod(width, x, y)) return;
     if (openSelectedModPage(width, x, y)) return;
     if (selectCompatibleMod(width, x, y)) return;
-    if (searchMissingArtwork(width, x, y)) return;
+    if (advanceSelectedGameArtwork(width, x, y)) return;
     if (selectGridTitle(width, metrics.height, x, y)) return;
     if (contains(layout.refresh(width), x, y)) {
         runRefresh();
@@ -1025,19 +1081,20 @@ fn openRegistryEntryPage(selected: registry.Entry) void {
 
 fn selectedRegistryEntry() ?registry.Entry {
     const data = selectedModBrowserData() orelse return null;
-    if (data.count == 0) return null;
-    const index = @min(state.selected_mod, data.count - 1);
-    return data.catalog.entries()[data.matches[index]];
+    if (state.selected_mod <= data.local_count or state.selected_mod > data.count) return null;
+    const catalog = data.catalog orelse return null;
+    return catalog.entries()[data.matches[state.selected_mod - 1 - data.local_count]];
 }
 
 fn selectedModBrowserData() ?ModBrowserData {
     const scan = state.scan orelse return null;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return null;
-    const catalog = if (state.mod_registry) |*value| value else return null;
+    const catalog = if (state.mod_registry) |*value| value else null;
     var matches: [registry.maximum_variants_per_title]usize = undefined;
-    const count = @min(registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches), matches.len);
-    return .{ .catalog = catalog, .matches = matches, .count = count };
+    const registry_count = if (catalog) |value| @min(importer.matchingRegistryVariants(titles[state.preview_scroll], value, &matches), matches.len) else 0;
+    const local_count = @min(titles[state.preview_scroll].local_revisions.len, registry.maximum_variants_per_title);
+    return .{ .catalog = catalog, .matches = matches, .local_count = local_count, .registry_count = registry_count, .count = @min(local_count + registry_count, registry.maximum_variants_per_title) };
 }
 
 fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
@@ -1045,14 +1102,12 @@ fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
-    const catalog = if (state.mod_registry) |*value| value else return false;
-    var matches: [8]usize = undefined;
-    const count = registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches);
-    const shown = @min(count, @min(matches.len, 3));
+    const data = selectedModBrowserData() orelse return false;
+    const shown = @min(data.count, 3);
     for (0..shown) |row| {
         const row_y = page_layout.mod_first_y + @as(f32, @floatFromInt(row)) * page_layout.mod_row_height;
         if (y >= row_y - 8 and y <= row_y + 12) {
-            state.selected_mod = row;
+            state.selected_mod = row + 1;
             return true;
         }
     }
@@ -1064,13 +1119,10 @@ fn downloadSelectedMod(width: f32, x: f32, y: f32) bool {
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
-    const catalog = if (state.mod_registry) |*value| value else return false;
-    var matches: [8]usize = undefined;
-    const count = registry.matching(catalog, titles[state.preview_scroll].content_crc32, &titles[state.preview_scroll].content_hash, &matches);
-    if (count == 0) return false;
-    const shown = @min(count, matches.len);
-    state.selected_mod = @min(state.selected_mod, shown - 1);
-    downloadRegistryIndex(matches[state.selected_mod]);
+    const data = selectedModBrowserData() orelse return false;
+    if (data.registry_count == 0) return false;
+    const selected = if (state.selected_mod > data.local_count and state.selected_mod <= data.count) state.selected_mod - 1 - data.local_count else 0;
+    downloadRegistryIndex(data.matches[@min(selected, data.registry_count - 1)]);
     return true;
 }
 
@@ -1085,19 +1137,34 @@ fn downloadRegistryIndex(registry_index: usize) void {
     setStatus(true, "Downloading and verifying mod patch...", .{});
 }
 
-fn searchMissingArtwork(width: f32, x: f32, y: f32) bool {
+fn advanceSelectedGameArtwork(width: f32, x: f32, y: f32) bool {
     const scan = state.scan orelse return false;
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
     const title = titles[state.preview_scroll];
-    if (title.artwork_path != null) return false;
-    const button = Rect{ .x = page_layout.detailContentX(width), .y = page_layout.artwork_button_y, .w = 196, .h = 30 };
+    const button_y = if (compatibleModCount(title) == 0) page_layout.artwork_cycle_y else page_layout.grid_y + 202;
+    const button = Rect{ .x = page_layout.detailContentX(width), .y = button_y, .w = 168, .h = 26 };
     if (width < 840 or !contains(button, x, y)) return false;
-    launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, title.display_name) catch |err| {
-        setStatus(false, "Could not open LaunchBox search: {s}.", .{@errorName(err)});
+    var config = ArtworkDownloadConfig{
+        .title_index = state.preview_scroll,
+        .display_name = .{},
+        .content_hash = title.content_hash,
+    };
+    if (!config.display_name.set(title.display_name) or !beginWorker()) return true;
+    const spawned = if (title.artwork_options > 1)
+        std.Thread.spawn(.{}, artworkCycleWorker, .{config})
+    else
+        std.Thread.spawn(.{}, artworkDiscoverAndAdvanceWorker, .{config});
+    state.worker = spawned catch |err| {
+        cancelWorker();
+        setStatus(false, "Could not start artwork download: {s}.", .{@errorName(err)});
         return true;
     };
-    setStatus(true, "Opened LaunchBox search for {s}.", .{title.display_name});
+    if (title.artwork_options > 1) {
+        setStatus(true, "Switching artwork...", .{});
+    } else {
+        setStatus(true, "Finding the next artwork option...", .{});
+    }
     return true;
 }
 
@@ -1132,6 +1199,10 @@ fn selectGridTitle(width: f32, height: f32, x: f32, y: f32) bool {
 fn handleDrop() void {
     if (isBusy() or sapp.getNumDroppedFiles() <= 0) return;
     const path = sapp.getDroppedFilePath(0);
+    if (isArtworkPath(path)) {
+        installDroppedArtwork(path);
+        return;
+    }
     if (state.drop_mode == .registry or std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".json")) {
         loadRegistry(path);
         return;
@@ -1157,6 +1228,56 @@ fn handleDrop() void {
         .automatic => unreachable,
     }
     runRefresh();
+}
+
+fn isArtworkPath(path: []const u8) bool {
+    const extension = std.fs.path.extension(path);
+    for ([_][]const u8{ ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff" }) |candidate| if (std.ascii.eqlIgnoreCase(extension, candidate)) return true;
+    return false;
+}
+
+fn installDroppedArtwork(path: []const u8) void {
+    const allocator = std.heap.c_allocator;
+    var decoded = importer.decodeArtwork(allocator, state.threaded.io(), path) catch |err| {
+        setStatus(false, "Could not decode dropped artwork: {s}.", .{@errorName(err)});
+        return;
+    };
+    decoded.deinit(allocator);
+    const cache = artworkCachePath(allocator) catch return;
+    defer allocator.free(cache);
+    if (state.mod_browser_open and state.selected_mod != 0) {
+        const data = selectedModBrowserData() orelse return;
+        if (state.selected_mod <= data.local_count) {
+            setStatus(false, "Revision artwork uses the base game's selected artwork.", .{});
+            return;
+        }
+        const registry_index = data.matches[state.selected_mod - 1 - data.local_count];
+        const entry = data.catalog.?.entries()[registry_index];
+        const selection = launchbox.installCustomArtwork(allocator, state.threaded.io(), path, entry.id, cache) catch |err| {
+            setStatus(false, "Could not use dropped artwork: {s}.", .{@errorName(err)});
+            return;
+        };
+        harvestModArtwork(.{ .registry_index = registry_index, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count });
+        setStatus(true, "Set dropped artwork for {s}.", .{entry.name});
+        return;
+    }
+    const scan = if (state.scan) |*value| value else return;
+    const titles = scan.previewMut().titles;
+    if (titles.len == 0 or state.preview_scroll >= titles.len) return;
+    const title = &titles[state.preview_scroll];
+    const key = std.fmt.bytesToHex(title.content_hash, .lower);
+    const selection = launchbox.installCustomArtwork(allocator, state.threaded.io(), path, &key, cache) catch |err| {
+        setStatus(false, "Could not use dropped artwork: {s}.", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(selection.path);
+    const replacement = allocator.dupe(u8, selection.path) catch return;
+    if (title.artwork_path) |old_path| allocator.free(old_path);
+    title.artwork_path = replacement;
+    title.artwork_status = .downloaded;
+    title.artwork_options = selection.count;
+    for (&state.artwork_textures) |*texture| if (texture.title_index == state.preview_scroll) destroyArtworkTexture(texture);
+    setStatus(true, "Set dropped artwork for {s}; it will be included in the next sync.", .{title.display_name});
 }
 
 fn loadRegistry(path: []const u8) void {
@@ -1235,7 +1356,54 @@ fn modDownloadWorker(config: ModDownloadConfig) void {
     finishWorker(.{ .mod_download = .{ .registry_index = config.registry_index, .path = path } });
 }
 
-fn syncModArtwork(registry_index: usize, entry: registry.Entry) void {
+fn artworkDiscoverAndAdvanceWorker(config: ArtworkDownloadConfig) void {
+    const allocator = std.heap.c_allocator;
+    const cache = artworkCachePath(allocator) catch |err| {
+        finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
+        return;
+    };
+    defer allocator.free(cache);
+    const key = std.fmt.bytesToHex(config.content_hash, .lower);
+    const existing = launchbox.cachedSelection(allocator, state.threaded.io(), &key, cache) catch null;
+    defer if (existing) |selection| allocator.free(selection.path);
+    if (existing == null) if (importer.findRetroArchArtwork(allocator, state.threaded.io(), state.threaded.environ.process_environ, config.display_name.slice()) catch null) |retro_path| {
+        defer allocator.free(retro_path);
+        const selection = launchbox.seedArtwork(allocator, state.threaded.io(), retro_path, &key, cache) catch |err| {
+            finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
+            return;
+        };
+        allocator.free(selection.path);
+    };
+    var selection = launchbox.downloadArtwork(allocator, state.threaded.io(), config.display_name.slice(), &key, cache) catch |err| {
+        finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
+        return;
+    };
+    if (selection.count > 1) {
+        allocator.free(selection.path);
+        selection = launchbox.cycleArtwork(allocator, state.threaded.io(), &key, cache) catch |err| {
+            finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
+            return;
+        };
+    }
+    finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count } });
+}
+
+fn artworkCycleWorker(config: ArtworkDownloadConfig) void {
+    const allocator = std.heap.c_allocator;
+    const cache = artworkCachePath(allocator) catch |err| {
+        finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
+        return;
+    };
+    defer allocator.free(cache);
+    const key = std.fmt.bytesToHex(config.content_hash, .lower);
+    const selection = launchbox.cycleArtwork(allocator, state.threaded.io(), &key, cache) catch |err| {
+        finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
+        return;
+    };
+    finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count } });
+}
+
+fn syncModArtwork(registry_index: usize) void {
     var empty: ?*ModArtworkSlot = null;
     for (&state.mod_artwork_slots) |*slot| {
         if (slot.registry_index == registry_index) return;
@@ -1243,7 +1411,6 @@ fn syncModArtwork(registry_index: usize, entry: registry.Entry) void {
     }
     const slot = empty orelse return;
     slot.registry_index = registry_index;
-    if (entry.artwork == null) return;
     if (isBusy()) {
         slot.registry_index = std.math.maxInt(usize);
         return;
@@ -1287,11 +1454,44 @@ fn handleModBrowserClick(width: f32, height: f32, x: f32, y: f32) void {
         }
     }
     if (state.selected_mod == 0) return;
+    if (state.selected_mod <= selected.local_count) return;
     if (contains(.{ .x = 44, .y = height - 74, .w = 168, .h = 30 }, x, y)) {
-        downloadRegistryIndex(selected.matches[state.selected_mod - 1]);
+        downloadRegistryIndex(selected.matches[state.selected_mod - 1 - selected.local_count]);
     } else if (contains(.{ .x = 224, .y = height - 74, .w = 168, .h = 30 }, x, y)) {
-        openRegistryEntryPage(selected.catalog.entries()[selected.matches[state.selected_mod - 1]]);
+        const registry_index = selected.matches[state.selected_mod - 1 - selected.local_count];
+        const slot = modArtworkSlot(registry_index);
+        if (slot != null and slot.?.gallery_count > 1) {
+            cycleModArtwork(registry_index);
+        } else openRegistryEntryPage(selected.catalog.?.entries()[registry_index]);
+    } else if (contains(.{ .x = 404, .y = height - 74, .w = 148, .h = 30 }, x, y)) {
+        const registry_index = selected.matches[state.selected_mod - 1 - selected.local_count];
+        const slot = modArtworkSlot(registry_index);
+        if (slot != null and slot.?.gallery_count > 1) openRegistryEntryPage(selected.catalog.?.entries()[registry_index]);
     }
+}
+
+fn cycleModArtwork(registry_index: usize) void {
+    if (!beginWorker()) return;
+    state.worker = std.Thread.spawn(.{}, modArtworkCycleWorker, .{registry_index}) catch {
+        cancelWorker();
+        return;
+    };
+    setStatus(true, "Switching mod artwork...", .{});
+}
+
+fn modArtworkCycleWorker(registry_index: usize) void {
+    const allocator = std.heap.c_allocator;
+    const catalog = &(state.mod_registry orelse return);
+    const cache = artworkCachePath(allocator) catch |err| {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
+        return;
+    };
+    defer allocator.free(cache);
+    const selection = launchbox.cycleArtwork(allocator, state.threaded.io(), catalog.entries()[registry_index].id, cache) catch |err| {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
+        return;
+    };
+    finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count } });
 }
 
 fn clearModArtworkSlots() void {
@@ -1307,19 +1507,42 @@ fn modArtworkWorker(registry_index: usize) void {
         finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = "RegistryUnavailable" } });
         return;
     });
-    const cache = registryCachePath(allocator) catch |err| {
+    const cache = artworkCachePath(allocator) catch |err| {
         finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
         return;
     };
     defer allocator.free(cache);
-    const path = (registry.downloadArtwork(allocator, state.threaded.io(), catalog.entries()[registry_index], cache) catch |err| {
-        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
-        return;
-    }) orelse {
-        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index } });
+    const entry = catalog.entries()[registry_index];
+    if (launchbox.customArtworkExists(allocator, state.threaded.io(), entry.id, cache)) if (tryCachedModArtwork(allocator, state.threaded.io(), entry.id, cache)) |selection| {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count } });
         return;
     };
-    finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .path = path } });
+    if (entry.artwork) |_| {
+        const registry_cache = registryCachePath(allocator) catch |err| {
+            finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
+            return;
+        };
+        defer allocator.free(registry_cache);
+        const path = (registry.downloadArtwork(allocator, state.threaded.io(), entry, registry_cache) catch |err| {
+            finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
+            return;
+        }) orelse return;
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .path = path } });
+        return;
+    }
+    if (tryCachedModArtwork(allocator, state.threaded.io(), entry.id, cache)) |selection| {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count } });
+        return;
+    }
+    const selection = launchbox.downloadArtwork(allocator, state.threaded.io(), entry.name, entry.id, cache) catch |err| {
+        finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .err = @errorName(err) } });
+        return;
+    };
+    finishWorker(.{ .mod_artwork = .{ .registry_index = registry_index, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count } });
+}
+
+fn tryCachedModArtwork(allocator: std.mem.Allocator, io: std.Io, key: []const u8, cache: []const u8) ?launchbox.GallerySelection {
+    return launchbox.cachedSelection(allocator, io, key, cache) catch null;
 }
 
 fn registryCachePath(allocator: std.mem.Allocator) ![]u8 {
@@ -1329,6 +1552,161 @@ fn registryCachePath(allocator: std.mem.Allocator) ![]u8 {
         try allocator.dupe(u8, ".");
     defer allocator.free(root);
     return std.fs.path.join(allocator, &.{ root, "m64menu", "patches" });
+}
+
+fn artworkCachePath(allocator: std.mem.Allocator) ![]u8 {
+    const environ = state.threaded.environ.process_environ;
+    const root = std.process.Environ.getAlloc(environ, allocator, if (@import("builtin").os.tag == .windows) "LOCALAPPDATA" else "XDG_CACHE_HOME") catch
+        std.process.Environ.getAlloc(environ, allocator, "HOME") catch
+        try allocator.dupe(u8, ".");
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "m64menu", "artwork" });
+}
+
+fn cartLibraryCachePath(allocator: std.mem.Allocator) ![]u8 {
+    const environ = state.threaded.environ.process_environ;
+    const root = std.process.Environ.getAlloc(environ, allocator, if (@import("builtin").os.tag == .windows) "LOCALAPPDATA" else "XDG_CACHE_HOME") catch
+        std.process.Environ.getAlloc(environ, allocator, "HOME") catch
+        try allocator.dupe(u8, ".");
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "m64menu", "cart-library" });
+}
+
+fn mirrorConnectedCart(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    card: ?CardSnapshot,
+    device: ?DeviceSnapshot,
+) !?[]u8 {
+    const cache = try cartLibraryCachePath(allocator);
+    defer allocator.free(cache);
+    try std.Io.Dir.cwd().createDirPath(io, cache);
+    var card_error: ?anyerror = null;
+    if (card) |mounted| {
+        if (mirrorMountedCart(allocator, io, cache, mounted)) |playlist| return playlist else |err| card_error = err;
+    }
+    if (device) |usb| if (usb.power == .off and usb.library != null) {
+        return try mirrorUsbCart(allocator, io, cache, usb);
+    };
+    if (card_error) |err| return err;
+    return null;
+}
+
+fn mirrorMountedCart(allocator: std.mem.Allocator, io: std.Io, cache: []const u8, mounted: CardSnapshot) ![]u8 {
+    const library = mounted.library orelse return error.CartLibraryUnavailable;
+    if (library.titles.len == 0) return error.NoRomsFound;
+    const source_root = try std.fs.path.join(allocator, &.{ cache, "mounted-sd" });
+    defer allocator.free(source_root);
+    const playlist = try std.fs.path.join(allocator, &.{ source_root, expected_playlist_name });
+    errdefer allocator.free(playlist);
+    const boxarts = try std.fs.path.join(allocator, &.{ source_root, "thumbnails", "Nintendo - Nintendo 64", "Named_Boxarts" });
+    defer allocator.free(boxarts);
+    try std.Io.Dir.cwd().createDirPath(io, boxarts);
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(allocator);
+    for (library.titles) |title| {
+        const id = title.idSlice();
+        const filename = try std.fmt.allocPrint(allocator, "{s}_e.z64", .{id});
+        defer allocator.free(filename);
+        const rom = try std.fs.path.join(allocator, &.{ mounted.root, "menu", "title", id, filename });
+        defer allocator.free(rom);
+        if (!usableRomFile(io, rom)) return error.IncompleteCartLibrary;
+        try appendPlaylistEntry(allocator, &contents, rom, title.name);
+        const sprite_name = try std.fmt.allocPrint(allocator, "{s}_e.sprite", .{id});
+        defer allocator.free(sprite_name);
+        const sprite = try std.fs.path.join(allocator, &.{ mounted.root, "menu", "title", id, sprite_name });
+        defer allocator.free(sprite);
+        try cacheInstalledArtwork(allocator, io, sprite, boxarts, title.name);
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = playlist, .data = contents.items });
+    return playlist;
+}
+
+fn mirrorUsbCart(allocator: std.mem.Allocator, io: std.Io, cache: []const u8, usb: DeviceSnapshot) ![]u8 {
+    const library = usb.library orelse return error.CartLibraryUnavailable;
+    if (library.titles.len == 0) return error.NoRomsFound;
+    const serial = try safePathComponent(allocator, usb.serial);
+    defer allocator.free(serial);
+    const source_root = try std.fs.path.join(allocator, &.{ cache, serial });
+    defer allocator.free(source_root);
+    const rom_root = try std.fs.path.join(allocator, &.{ source_root, "roms" });
+    defer allocator.free(rom_root);
+    const boxarts = try std.fs.path.join(allocator, &.{ source_root, "thumbnails", "Nintendo - Nintendo 64", "Named_Boxarts" });
+    defer allocator.free(boxarts);
+    const playlist = try std.fs.path.join(allocator, &.{ source_root, expected_playlist_name });
+    errdefer allocator.free(playlist);
+    try std.Io.Dir.cwd().createDirPath(io, rom_root);
+    try std.Io.Dir.cwd().createDirPath(io, boxarts);
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(allocator);
+    for (library.titles) |title| {
+        const id = title.idSlice();
+        const filename = try std.fmt.allocPrint(allocator, "{s}.z64", .{id});
+        defer allocator.free(filename);
+        const local = try std.fs.path.join(allocator, &.{ rom_root, filename });
+        defer allocator.free(local);
+        if (!usableRomFile(io, local)) {
+            std.Io.Dir.cwd().deleteFile(io, local) catch {};
+            const remote = try std.fmt.allocPrint(allocator, "/menu/title/{s}/{s}_e.z64", .{ id, id });
+            defer allocator.free(remote);
+            try downloadCartFileAtomic(allocator, io, usb, remote, local);
+        }
+        if (!usableRomFile(io, local)) return error.IncompleteCartLibrary;
+        try appendPlaylistEntry(allocator, &contents, local, title.name);
+        const sprite_name = try std.fmt.allocPrint(allocator, "{s}.sprite", .{id});
+        defer allocator.free(sprite_name);
+        const sprite = try std.fs.path.join(allocator, &.{ rom_root, sprite_name });
+        defer allocator.free(sprite);
+        const remote_sprite = try std.fmt.allocPrint(allocator, "/menu/title/{s}/{s}_e.sprite", .{ id, id });
+        defer allocator.free(remote_sprite);
+        downloadCartFileAtomic(allocator, io, usb, remote_sprite, sprite) catch {};
+        try cacheInstalledArtwork(allocator, io, sprite, boxarts, title.name);
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = playlist, .data = contents.items });
+    return playlist;
+}
+
+fn downloadCartFileAtomic(allocator: std.mem.Allocator, io: std.Io, usb: DeviceSnapshot, remote: []const u8, local: []const u8) !void {
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    const temporary = try std.fmt.allocPrint(allocator, "{s}.{s}.download", .{ local, std.fmt.bytesToHex(random, .lower) });
+    defer allocator.free(temporary);
+    errdefer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
+    try deployer.downloadFile(allocator, io, usb.deployer_path, usb.port, remote, temporary);
+    try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), local, io);
+}
+
+fn cacheInstalledArtwork(allocator: std.mem.Allocator, io: std.Io, sprite: []const u8, boxarts: []const u8, title: []const u8) !void {
+    if (!fileExists(io, sprite)) return;
+    const safe_name = try importer.retroArchThumbnailName(allocator, title);
+    defer allocator.free(safe_name);
+    const filename = try std.fmt.allocPrint(allocator, "{s}.bmp", .{safe_name});
+    defer allocator.free(filename);
+    const destination = try std.fs.path.join(allocator, &.{ boxarts, filename });
+    defer allocator.free(destination);
+    importer.convertMenuSpriteToBmp(allocator, io, sprite, destination) catch {};
+}
+
+fn appendPlaylistEntry(allocator: std.mem.Allocator, output: *std.ArrayList(u8), rom_path: []const u8, title: []const u8) !void {
+    try output.appendSlice(allocator, rom_path);
+    try output.append(allocator, '\n');
+    for (title) |byte| try output.append(allocator, if (byte == '\r' or byte == '\n') ' ' else byte);
+    try output.appendSlice(allocator, "\nDETECT\nDETECT\nDETECT\nNintendo - Nintendo 64.lpl\n");
+}
+
+fn safePathComponent(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const result = try allocator.alloc(u8, @max(value.len, 1));
+    if (value.len == 0) {
+        result[0] = '_';
+        return result;
+    }
+    for (value, 0..) |byte, index| result[index] = if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_') byte else '_';
+    return result;
+}
+
+fn usableRomFile(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return stat.kind == .file and stat.size >= 4 and stat.size <= importer.maximum_rom_size;
 }
 
 fn runPreferredSync() void {
@@ -1408,11 +1786,22 @@ fn refreshWorker(config: DiscoveryConfig) void {
     const allocator = std.heap.c_allocator;
     const io = state.threaded.io();
     var result = RefreshResult{};
+    const artwork_cache = artworkCachePath(allocator) catch null;
+    defer if (artwork_cache) |path| allocator.free(path);
+
+    var card_outcome = discoverCard(allocator, io);
+    result.card = card_outcome.card;
+    result.card_error = card_outcome.err;
+    card_outcome.card = null;
+    var device_outcome = discoverDevice(allocator, io);
+    result.device = device_outcome.device;
+    result.device_error = device_outcome.err;
+    device_outcome.device = null;
 
     result.scan = switch (config.source_kind) {
         .directory => directory: {
             const root = config.source_path.slice();
-            const preview = importer.scanLibrary(allocator, io, .{ .rom_root = root, .recursive = true }) catch |err| {
+            const preview = importer.scanLibrary(allocator, io, .{ .rom_root = root, .recursive = true, .artwork_cache_root = artwork_cache }) catch |err| {
                 result.scan_error = @errorName(err);
                 break :directory null;
             };
@@ -1428,7 +1817,54 @@ fn refreshWorker(config: DiscoveryConfig) void {
             } };
         },
         .automatic, .playlist => retroarch: {
-            const detected = importer.scanRetroArchLibrary(allocator, io, .{ .environ = state.threaded.environ.process_environ }) catch |auto_err| fallback: {
+            if (config.source_kind == .playlist and config.source_path.len != 0) {
+                const override_path = config.source_path.slice();
+                const parent = std.fs.path.dirname(override_path) orelse {
+                    result.scan_error = "InvalidPlaylistPath";
+                    break :retroarch null;
+                };
+                const roots = [_][]const u8{parent};
+                var exact = importer.scanRetroArchLibrary(allocator, io, .{
+                    .search_roots = &roots,
+                    .maximum_search_depth = 0,
+                    .environ = state.threaded.environ.process_environ,
+                    .artwork_cache_root = artwork_cache,
+                }) catch |err| {
+                    result.scan_error = @errorName(err);
+                    result.override_target_blocked = true;
+                    break :retroarch null;
+                };
+                if (!std.ascii.eqlIgnoreCase(exact.source.playlist_path, override_path)) {
+                    exact.deinit(allocator);
+                    result.scan_error = "ExactPlaylistTargetUnavailable";
+                    result.override_target_blocked = true;
+                    break :retroarch null;
+                }
+                result.source_kind = .playlist;
+                break :retroarch LibraryScan{ .retroarch = exact };
+            }
+            if (config.source_kind == .automatic) {
+                const cart_playlist = mirrorConnectedCart(allocator, io, result.card, result.device) catch |err| blk: {
+                    result.scan_error = @errorName(err);
+                    break :blk null;
+                };
+                if (cart_playlist) |playlist_path| {
+                    defer allocator.free(playlist_path);
+                    const parent = std.fs.path.dirname(playlist_path) orelse break :retroarch null;
+                    const roots = [_][]const u8{parent};
+                    const detected = importer.scanRetroArchLibrary(allocator, io, .{
+                        .search_roots = &roots,
+                        .maximum_search_depth = 0,
+                        .environ = state.threaded.environ.process_environ,
+                        .artwork_cache_root = artwork_cache,
+                    }) catch null;
+                    if (detected) |scan| {
+                        result.source_kind = .playlist;
+                        break :retroarch LibraryScan{ .retroarch = scan };
+                    }
+                }
+            }
+            const detected = importer.scanRetroArchLibrary(allocator, io, .{ .environ = state.threaded.environ.process_environ, .artwork_cache_root = artwork_cache }) catch |auto_err| fallback: {
                 if (config.source_kind != .playlist or config.source_path.len == 0) {
                     result.scan_error = @errorName(auto_err);
                     break :fallback null;
@@ -1443,6 +1879,7 @@ fn refreshWorker(config: DiscoveryConfig) void {
                     .search_roots = &roots,
                     .maximum_search_depth = 0,
                     .environ = state.threaded.environ.process_environ,
+                    .artwork_cache_root = artwork_cache,
                 }) catch |fallback_err| {
                     result.scan_error = @errorName(fallback_err);
                     result.override_target_blocked = !std.ascii.eqlIgnoreCase(std.fs.path.basename(override_path), expected_playlist_name);
@@ -1460,16 +1897,23 @@ fn refreshWorker(config: DiscoveryConfig) void {
             break :retroarch if (detected) |scan| LibraryScan{ .retroarch = scan } else null;
         },
     };
-
-    var card_outcome = discoverCard(allocator, io);
-    result.card = card_outcome.card;
-    result.card_error = card_outcome.err;
-    card_outcome.card = null;
-    var device_outcome = discoverDevice(allocator, io);
-    result.device = device_outcome.device;
-    result.device_error = device_outcome.err;
-    device_outcome.device = null;
+    if (result.scan) |*scan| if (artwork_cache) |cache| seedLocalArtwork(allocator, io, scan.previewMut().titles, cache);
     finishWorker(.{ .refresh = result });
+}
+
+fn seedLocalArtwork(allocator: std.mem.Allocator, io: std.Io, titles: []importer.Title, cache: []const u8) void {
+    for (titles) |*title| {
+        const source = title.artwork_path orelse continue;
+        if (title.artwork_status == .downloaded) continue;
+        const key = std.fmt.bytesToHex(title.content_hash, .lower);
+        const selection = launchbox.seedArtwork(allocator, io, source, &key, cache) catch continue;
+        defer allocator.free(selection.path);
+        const replacement = allocator.dupe(u8, selection.path) catch continue;
+        allocator.free(source);
+        title.artwork_path = replacement;
+        title.artwork_status = .downloaded;
+        title.artwork_options = selection.count;
+    }
 }
 
 fn discoverCard(allocator: std.mem.Allocator, io: std.Io) CardOutcome {
@@ -1586,6 +2030,8 @@ fn syncFromStaging(
     staging: []const u8,
     config: *const SyncConfig,
 ) !void {
+    const artwork_cache = try artworkCachePath(allocator);
+    defer allocator.free(artwork_cache);
     var imported_titles: []const importer.Title = &.{};
     switch (config.source_kind) {
         .directory => {
@@ -1593,6 +2039,7 @@ fn syncFromStaging(
                 .output_root = staging,
                 .rom_root = config.source_path.slice(),
                 .recursive = true,
+                .artwork_cache_root = artwork_cache,
             }, .{ .context = null, .callback = importProgress });
             defer imported.deinit(allocator);
             if (!std.mem.eql(u8, &libraryFingerprint(imported.titles), &config.source_fingerprint)) return error.SourceChanged;
@@ -1607,6 +2054,7 @@ fn syncFromStaging(
                 .search_roots = &roots,
                 .maximum_search_depth = 0,
                 .environ = state.threaded.environ.process_environ,
+                .artwork_cache_root = artwork_cache,
             }, .{ .context = null, .callback = importProgress });
             defer imported.deinit(allocator);
             if (!std.ascii.eqlIgnoreCase(imported.source.playlist_path, playlist_path)) return error.PlaylistChanged;
@@ -1641,11 +2089,12 @@ fn syncFromStaging(
 }
 
 fn stageCachedMods(allocator: std.mem.Allocator, io: std.Io, staging: []const u8, titles: []const importer.Title) !void {
+    const revisions = try importer.stageLocalRevisions(allocator, io, staging, titles);
     const catalog = &(state.mod_registry orelse return);
     const cache = try registryCachePath(allocator);
     defer allocator.free(cache);
     const count = try importer.stageCachedVariants(allocator, io, staging, titles, catalog, cache);
-    if (count != 0) setStatus(true, "Staged {d} downloaded mod(s).", .{count});
+    if (count + revisions != 0) setStatus(true, "Staged {d} alternate version(s).", .{count + revisions});
 }
 
 fn findMenuRom(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
@@ -1756,7 +2205,33 @@ fn harvestWorker() void {
         .sync => |sync_result| harvestSync(sync_result),
         .mod_download => |download_result| harvestModDownload(download_result),
         .mod_artwork => |artwork_result| harvestModArtwork(artwork_result),
+        .artwork_download => |artwork_result| harvestArtworkDownload(artwork_result),
     }
+}
+
+fn harvestArtworkDownload(result: ArtworkDownloadResult) void {
+    defer if (result.path) |path| std.heap.c_allocator.free(path);
+    if (result.err) |name| {
+        const scan = if (state.scan) |*value| value else return;
+        const titles = scan.preview().titles;
+        if (result.title_index < titles.len and std.mem.eql(u8, &titles[result.title_index].content_hash, &result.content_hash)) {
+            launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, titles[result.title_index].display_name) catch {};
+        }
+        setStatus(false, "Automatic LaunchBox artwork failed ({s}); opened search results as a fallback.", .{name});
+        return;
+    }
+    const path = result.path orelse return;
+    const scan = if (state.scan) |*value| value else return;
+    const titles = scan.previewMut().titles;
+    if (result.title_index >= titles.len or !std.mem.eql(u8, &titles[result.title_index].content_hash, &result.content_hash)) return;
+    const title = &titles[result.title_index];
+    const replacement = std.heap.c_allocator.dupe(u8, path) catch return;
+    if (title.artwork_path) |old_path| std.heap.c_allocator.free(old_path);
+    title.artwork_path = replacement;
+    title.artwork_status = .downloaded;
+    title.artwork_options = result.gallery_count;
+    for (&state.artwork_textures) |*texture| if (texture.title_index == result.title_index) destroyArtworkTexture(texture);
+    setStatus(true, "Using artwork {d}/{d} for {s}. It will be included in the next sync.", .{ result.gallery_index + 1, @max(result.gallery_count, 1), title.display_name });
 }
 
 fn harvestModArtwork(result: ModArtworkResult) void {
@@ -1768,7 +2243,14 @@ fn harvestModArtwork(result: ModArtworkResult) void {
     };
     const artwork_slot = slot orelse return;
     artwork_slot.loading = false;
+    if (result.err != null) {
+        artwork_slot.failed = true;
+        return;
+    }
+    artwork_slot.gallery_index = result.gallery_index;
+    artwork_slot.gallery_count = result.gallery_count;
     const path = result.path orelse return;
+    destroyArtworkTexture(&artwork_slot.texture);
     var decoded = importer.decodeArtwork(std.heap.c_allocator, state.threaded.io(), path) catch return;
     defer decoded.deinit(std.heap.c_allocator);
     var mip_levels: [sg.max_mipmaps]sg.Range = @splat(.{});
@@ -1966,6 +2448,11 @@ fn libraryFingerprint(titles: []const importer.Title) [32]u8 {
         hash.update("\x00");
         hash.update(title.display_name);
         hash.update("\x00");
+        for (title.local_revisions) |revision| {
+            hash.update(&revision.content_hash);
+            hash.update(revision.name);
+            hash.update("\x00");
+        }
     }
     return hash.finalResult();
 }

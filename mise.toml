@@ -19,5 +19,5 @@ description = "Run the cross-platform Sokol library importer"
 run = "mise --cd tools/library-importer run run"
 
 [tasks.deployer-build]
-description = "Build the patched batched sc64deployer"
+description = "Build the forked batched sc64deployer"
 run = "pwsh -NoProfile -File tools/library-importer/build-deployer.ps1 -OutputDirectory tools/library-importer/zig-out/bin"

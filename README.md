@@ -92,16 +92,21 @@ See [BUILDING.md](BUILDING.md).
 ## Library importer
 
 `m64importer` is a native Zig/Sokol application for Windows, Linux and macOS. It
-automatically finds RetroArch's Nintendo 64 playlist, resolves playlist ROM paths,
-reuses RetroArch's `Named_Boxarts` or `Named_Snaps`, and synchronizes the generated
-library directly to a powered-off SummerCart64 over USB. A ROM directory can also
-be dropped onto the window for recursive `.n64`, `.v64`, and `.z64` discovery.
+first checks a mounted SummerCart SD card or powered-off USB cart for the installed
+base-game library. Mounted ROMs are read directly; USB ROMs are mirrored into a local
+cache. If no cart library is available, it finds RetroArch's Nintendo 64 playlist and
+resolves its ROM paths. A ROM directory can also be dropped onto the window for
+recursive `.n64`, `.v64`, and `.z64` discovery.
 
 Playlist labels become menu names and Android `/storage/<volume>/...` paths are
 remapped to mounted desktop drives when possible. For dropped directories, filenames
 become menu names and images beside each ROM are selected automatically. ROMs without
-artwork are highlighted and include a button that opens a LaunchBox Games Database
-search. All supported ROM byte orders are normalized before stable IDs are generated.
+artwork are highlighted and include a button that downloads ranked Nintendo 64 images
+from the LaunchBox Games Database into a local cache. The closest match to the menu's
+landscape aspect ratio is selected first, and **Next Art** cycles the alternatives.
+Missing artwork for known mods uses the same gallery. All supported ROM byte orders
+are normalized before stable IDs are generated. As a final fallback, drop a supported
+image onto the window to assign it to the selected game or the selected mod.
 
 On refresh, the importer also reads the existing SummerCart `title.csv` and name
 sidecars. The UI shows the current installed library and a sync plan containing
@@ -146,6 +151,10 @@ Only base games remain in `title.csv`; generated full-ROM variants are staged un
 `menu/title/<id>/variants/` with a `variants.csv` manifest. In the N64 menu,
 C-Left/C-Right cycles the original game and up to eight variants before launching.
 Variant saves use separate filenames.
+
+ROMs with the same revision-stripped title and N64 cartridge identity are grouped as
+one game. The highest header revision becomes the base, while older revisions appear
+before downloaded mods in the same versions browser and `variants.csv`.
 
 Development commands:
 
