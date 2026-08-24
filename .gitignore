@@ -5,6 +5,7 @@ build/
 zig-out/
 .zig-cache/
 zig-pkg/
+.cargo-target/
 
 .libdragon
 
