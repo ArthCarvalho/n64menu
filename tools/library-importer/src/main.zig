@@ -59,8 +59,31 @@ const PowerState = enum { unknown, off, on };
 const SyncDestination = enum { direct_sd, usb };
 const SourceKind = enum { automatic, playlist, directory };
 const DropMode = enum { games, registry };
+const PickerKind = enum { games, catalog };
 const TitleSyncState = enum { ADD, KEEP, UPDATE };
 const UiLibraryDiff = struct { add: usize = 0, keep: usize = 0, update: usize = 0, remove: usize = 0 };
+
+const PickerEntry = struct {
+    name: [512]u8 = @splat(0),
+    len: usize = 0,
+    directory: bool = false,
+    absolute: bool = false,
+
+    fn setName(self: *PickerEntry, value: []const u8) bool {
+        if (value.len >= self.name.len) return false;
+        self.len = value.len;
+        @memcpy(self.name[0..value.len], value);
+        self.name[value.len] = 0;
+        return true;
+    }
+
+    fn slice(self: *const PickerEntry) []const u8 {
+        return self.name[0..self.len];
+    }
+};
+
+const picker_max_entries = 2048;
+const picker_visible_rows = 14;
 
 const page_layout = struct {
     const workflow_y: f32 = 142;
@@ -147,14 +170,27 @@ const DirectoryScanResult = struct {
     }
 };
 
+const AggregateScanResult = struct {
+    playlist_path: []u8,
+    preview: importer.ScanResult,
+
+    fn deinit(self: *AggregateScanResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.playlist_path);
+        self.preview.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const LibraryScan = union(enum) {
     retroarch: importer.RetroArchScanResult,
     directory: DirectoryScanResult,
+    aggregate: AggregateScanResult,
 
     fn deinit(self: *LibraryScan, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .retroarch => |*scan| scan.deinit(allocator),
             .directory => |*scan| scan.deinit(allocator),
+            .aggregate => |*scan| scan.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -163,6 +199,7 @@ const LibraryScan = union(enum) {
         return switch (self.*) {
             .retroarch => |*scan| &scan.preview,
             .directory => |*scan| &scan.preview,
+            .aggregate => |*scan| &scan.preview,
         };
     }
 
@@ -170,6 +207,7 @@ const LibraryScan = union(enum) {
         return switch (self.*) {
             .retroarch => |*scan| &scan.preview,
             .directory => |*scan| &scan.preview,
+            .aggregate => |*scan| &scan.preview,
         };
     }
 
@@ -177,6 +215,7 @@ const LibraryScan = union(enum) {
         return switch (self.*) {
             .retroarch => |scan| scan.source.playlist_path,
             .directory => |scan| scan.root,
+            .aggregate => |scan| scan.playlist_path,
         };
     }
 };
@@ -184,6 +223,8 @@ const LibraryScan = union(enum) {
 const DiscoveryConfig = struct {
     source_kind: SourceKind,
     source_path: FixedText,
+    discover_destinations: bool = true,
+    merge_existing: bool = false,
 };
 
 const SyncConfig = struct {
@@ -204,6 +245,7 @@ const ArtworkDownloadConfig = struct {
     title_index: usize,
     display_name: FixedText,
     content_hash: [32]u8,
+    advance_after_discovery: bool = false,
 };
 
 const CardOutcome = struct {
@@ -225,6 +267,8 @@ const RefreshResult = struct {
     device_error: ?[]const u8 = null,
     source_kind: SourceKind = .automatic,
     override_target_blocked: bool = false,
+    destinations_discovered: bool = true,
+    merge_existing: bool = false,
 };
 
 const SyncResult = struct {
@@ -311,9 +355,28 @@ const state = struct {
     var worker_busy = false;
     var worker_done = false;
     var worker_result: ?WorkerResult = null;
+    var progressive_scan: ?importer.ScanResult = null;
+    var progressive_completed: usize = 0;
+    var progressive_total: usize = 0;
+    var progressive_base: ?importer.ScanResult = null;
     var shutting_down = false;
     var preview_destination: SyncDestination = .usb;
     var startup_elapsed: f64 = 0;
+    var pending_drop_path = FixedText{};
+    var pending_drop = false;
+    var picker_open = false;
+    var picker_kind: PickerKind = .games;
+    var picker_path = FixedText{};
+    var picker_entries: [picker_max_entries]PickerEntry = @splat(.{});
+    var picker_count: usize = 0;
+    var picker_scroll: usize = 0;
+    var picker_selected: usize = std.math.maxInt(usize);
+    var artwork_fetch_index: usize = std.math.maxInt(usize);
+    var artwork_worker: ?std.Thread = null;
+    var artwork_worker_result: ?ArtworkDownloadResult = null;
+    var artwork_worker_done = false;
+    var artwork_failed_hashes: [128][32]u8 = @splat(@splat(0));
+    var artwork_failed_count: usize = 0;
 };
 
 const layout = struct {
@@ -381,7 +444,13 @@ export fn cleanup() void {
         worker.join();
         state.worker = null;
     }
+    if (state.artwork_worker) |worker| {
+        worker.join();
+        state.artwork_worker = null;
+    }
+    harvestVisibleArtworkWorker();
     harvestWorker();
+    clearProgressiveScan();
     clearArtworkTextures();
     clearModArtworkSlots();
     if (state.artwork_sampler.id != sg.invalid_id) sg.destroySampler(state.artwork_sampler);
@@ -397,8 +466,11 @@ export fn cleanup() void {
 }
 
 export fn frame() void {
+    harvestVisibleArtworkWorker();
+    harvestProgressiveScan();
     harvestWorker();
     state.startup_elapsed += sapp.frameDuration();
+    if (state.pending_drop and startup.frameAt(state.startup_elapsed).stage == .done and !isBusy()) processPendingDrop();
     const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
     const width = metrics.width;
     const height = metrics.height;
@@ -409,6 +481,9 @@ export fn frame() void {
 
     if (startup.frameAt(state.startup_elapsed).stage != .done) {
         drawStartup(width, height);
+    } else if (state.picker_open) {
+        drawSynthwaveBackground(width, height);
+        drawFilePicker(width, height);
     } else {
         drawSynthwaveBackground(width, height);
         drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 104 }, colors.panel);
@@ -658,6 +733,7 @@ fn drawTitles(width: f32, height: f32) void {
     const first_index = first_row * metrics.columns;
     const end_index = @min(titles.len, (first_row + metrics.visible_rows) * metrics.columns);
     syncArtworkTextures(titles, first_index, end_index);
+    scheduleVisibleArtwork(titles, first_index, end_index);
 
     for (titles[first_index..end_index], first_index..) |_, index| {
         if (index == state.preview_scroll) continue;
@@ -982,8 +1058,23 @@ fn drawMarker(x: f32, y: f32, size: f32, color: Color) void {
 
 export fn event(event_ptr: [*c]const sapp.Event) void {
     const input = event_ptr.*;
+    if (input.type == .FILES_DROPPED) {
+        queueDrop();
+        return;
+    }
     if (startup.frameAt(state.startup_elapsed).stage != .done) return;
     const scale = ui_scale.metrics(sapp.widthf(), sapp.heightf()).scale;
+    if (state.picker_open) {
+        switch (input.type) {
+            .MOUSE_DOWN => if (input.mouse_button == .LEFT) handlePickerClick(input.mouse_x / scale, input.mouse_y / scale),
+            .MOUSE_SCROLL => scrollPicker(input.scroll_y),
+            .KEY_DOWN => {
+                if (!input.key_repeat and input.key_code == .ESCAPE) state.picker_open = false;
+            },
+            else => {},
+        }
+        return;
+    }
     switch (input.type) {
         .MOUSE_DOWN => if (input.mouse_button == .LEFT) handleClick(input.mouse_x / scale, input.mouse_y / scale),
         .MOUSE_SCROLL => scrollTitles(input.scroll_y),
@@ -999,9 +1090,71 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
             } else sapp.requestQuit(),
             else => {},
         },
-        .FILES_DROPPED => handleDrop(),
         else => {},
     }
+}
+
+fn scheduleVisibleArtwork(titles: []const importer.Title, first: usize, end: usize) void {
+    if (state.artwork_worker != null or state.picker_open) return;
+    for (first..end) |index| {
+        if (titles[index].artwork_path != null or state.artwork_fetch_index == index or artworkLookupFailed(&titles[index].content_hash)) continue;
+        var config = ArtworkDownloadConfig{ .title_index = index, .display_name = .{}, .content_hash = titles[index].content_hash };
+        if (!config.display_name.set(titles[index].display_name)) return;
+        state.artwork_fetch_index = index;
+        state.artwork_worker = std.Thread.spawn(.{}, visibleArtworkWorker, .{config}) catch {
+            state.artwork_fetch_index = std.math.maxInt(usize);
+            return;
+        };
+        setStatus(true, "Finding artwork for visible game {s}...", .{titles[index].display_name});
+        return;
+    }
+}
+
+fn visibleArtworkWorker(config: ArtworkDownloadConfig) void {
+    const result = downloadArtworkResult(config);
+    lockWorker();
+    state.artwork_worker_result = result;
+    state.artwork_worker_done = true;
+    unlockWorker();
+}
+
+fn harvestVisibleArtworkWorker() void {
+    lockWorker();
+    if (!state.artwork_worker_done) {
+        unlockWorker();
+        return;
+    }
+    const result = state.artwork_worker_result.?;
+    state.artwork_worker_result = null;
+    state.artwork_worker_done = false;
+    const worker = state.artwork_worker;
+    state.artwork_worker = null;
+    unlockWorker();
+    if (worker) |thread| thread.join();
+    harvestArtworkDownload(result);
+}
+
+fn artworkLookupFailed(hash: *const [32]u8) bool {
+    for (state.artwork_failed_hashes[0..state.artwork_failed_count]) |failed| if (std.mem.eql(u8, &failed, hash)) return true;
+    return false;
+}
+
+fn rememberArtworkFailure(hash: [32]u8) void {
+    if (artworkLookupFailed(&hash)) return;
+    if (state.artwork_failed_count == state.artwork_failed_hashes.len) {
+        state.artwork_failed_hashes[0] = hash;
+        return;
+    }
+    state.artwork_failed_hashes[state.artwork_failed_count] = hash;
+    state.artwork_failed_count += 1;
+}
+
+fn clearArtworkFailure(hash: *const [32]u8) void {
+    for (state.artwork_failed_hashes[0..state.artwork_failed_count], 0..) |failed, index| if (std.mem.eql(u8, &failed, hash)) {
+        state.artwork_failed_count -= 1;
+        state.artwork_failed_hashes[index] = state.artwork_failed_hashes[state.artwork_failed_count];
+        return;
+    };
 }
 
 fn modBrowserColumns() usize {
@@ -1024,9 +1177,17 @@ fn activateSelectedMod() void {
 }
 
 fn handleClick(x: f32, y: f32) void {
-    if (isBusy()) return;
     const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
     const width = metrics.width;
+    if (contains(layout.addGames(), x, y)) {
+        openFilePicker(.games);
+        return;
+    }
+    if (contains(layout.loadCatalog(width), x, y)) {
+        openFilePicker(.catalog);
+        return;
+    }
+    if (isBusy()) return;
     if (state.mod_browser_open) {
         handleModBrowserClick(width, metrics.height, x, y);
         return;
@@ -1038,12 +1199,6 @@ fn handleClick(x: f32, y: f32) void {
     if (selectGridTitle(width, metrics.height, x, y)) return;
     if (contains(layout.refresh(width), x, y)) {
         runRefresh();
-    } else if (contains(layout.addGames(), x, y)) {
-        state.drop_mode = .games;
-        setStatus(true, "Drop a ROM folder or RetroArch .lpl playlist anywhere on this window.", .{});
-    } else if (contains(layout.loadCatalog(width), x, y)) {
-        state.drop_mode = .registry;
-        setStatus(true, "Drop a registry JSON file anywhere on this window.", .{});
     } else if (contains(layout.sdSync(width), x, y)) {
         state.preview_destination = .direct_sd;
         runSync(.direct_sd);
@@ -1145,10 +1300,16 @@ fn advanceSelectedGameArtwork(width: f32, x: f32, y: f32) bool {
     const button_y = if (compatibleModCount(title) == 0) page_layout.artwork_cycle_y else page_layout.grid_y + 202;
     const button = Rect{ .x = page_layout.detailContentX(width), .y = button_y, .w = 168, .h = 26 };
     if (width < 840 or !contains(button, x, y)) return false;
+    if (state.artwork_worker != null) {
+        setStatus(false, "Artwork lookup is already in progress.", .{});
+        return true;
+    }
+    clearArtworkFailure(&title.content_hash);
     var config = ArtworkDownloadConfig{
         .title_index = state.preview_scroll,
         .display_name = .{},
         .content_hash = title.content_hash,
+        .advance_after_discovery = true,
     };
     if (!config.display_name.set(title.display_name) or !beginWorker()) return true;
     const spawned = if (title.artwork_options > 1)
@@ -1196,38 +1357,257 @@ fn selectGridTitle(width: f32, height: f32, x: f32, y: f32) bool {
     return false;
 }
 
-fn handleDrop() void {
-    if (isBusy() or sapp.getNumDroppedFiles() <= 0) return;
+fn queueDrop() void {
+    if (sapp.getNumDroppedFiles() <= 0) return;
     const path = sapp.getDroppedFilePath(0);
+    if (!state.pending_drop_path.set(path)) {
+        setStatus(false, "Dropped path is too long.", .{});
+        return;
+    }
+    state.pending_drop = true;
+    if (isBusy() or startup.frameAt(state.startup_elapsed).stage != .done) {
+        setStatus(true, "Drop queued; waiting for current detection to finish...", .{});
+    } else processPendingDrop();
+}
+
+fn pickerPanel(width: f32, height: f32) Rect {
+    const panel_width = @min(760, width - 80);
+    const panel_height = @min(640, height - 80);
+    return .{ .x = (width - panel_width) * 0.5, .y = (height - panel_height) * 0.5, .w = panel_width, .h = panel_height };
+}
+
+fn drawFilePicker(width: f32, height: f32) void {
+    drawRect(.{ .x = 0, .y = 0, .w = width, .h = height }, colors.background);
+    const panel = pickerPanel(width, height);
+    drawRect(panel, colors.panel);
+    drawOutline(panel, colors.pink, 3);
+    if (state.picker_kind == .games) {
+        drawText(panel.x + 20, panel.y + 22, colors.yellow, "SELECT ROM FOLDER OR RETROARCH PLAYLIST", .{});
+    } else {
+        drawText(panel.x + 20, panel.y + 22, colors.yellow, "SELECT MOD CATALOG", .{});
+    }
+    const shown_path = if (state.picker_path.len == 0) "Computer" else state.picker_path.slice();
+    drawText(panel.x + 20, panel.y + 52, colors.dim, "{s}", .{head(shown_path, @max(@as(usize, 16), @as(usize, @intFromFloat((panel.w - 40) / 8))))});
+    drawButton(.{ .x = panel.x + 20, .y = panel.y + 78, .w = 80, .h = 28 }, colors.orange, "UP");
+    if (state.picker_kind == .games) {
+        drawButton(.{ .x = panel.x + 112, .y = panel.y + 78, .w = 176, .h = 28 }, colors.yellow, "USE THIS FOLDER");
+    } else {
+        drawButton(.{ .x = panel.x + 112, .y = panel.y + 78, .w = 176, .h = 28 }, colors.yellow, "OPEN SELECTED JSON");
+    }
+    drawButton(.{ .x = panel.x + panel.w - 112, .y = panel.y + 78, .w = 92, .h = 28 }, colors.border, "CANCEL");
+    const list = Rect{ .x = panel.x + 20, .y = panel.y + 120, .w = panel.w - 40, .h = panel.h - 140 };
+    drawRect(list, colors.inset);
+    drawOutline(list, colors.border, 1);
+    const end = @min(state.picker_count, state.picker_scroll + picker_visible_rows);
+    for (state.picker_scroll..end) |index| {
+        const row = Rect{ .x = list.x + 6, .y = list.y + 6 + @as(f32, @floatFromInt(index - state.picker_scroll)) * 32, .w = list.w - 12, .h = 28 };
+        const selected = index == state.picker_selected;
+        if (selected) drawRect(row, colors.border);
+        const entry = state.picker_entries[index];
+        drawText(row.x + 8, row.y + 8, if (entry.directory) colors.yellow else colors.white, "{s}{s}", .{ if (entry.directory) "[DIR] " else "", head(entry.slice(), @max(@as(usize, 8), @as(usize, @intFromFloat((row.w - 24) / 8)))) });
+    }
+    if (state.picker_count == 0) drawText(list.x + 12, list.y + 16, colors.dim, "No matching entries in this location.", .{});
+    if (state.picker_count == picker_max_entries) drawText(list.x + list.w - 188, list.y + list.h - 18, colors.orange, "LIST TRUNCATED", .{});
+}
+
+fn openFilePicker(kind: PickerKind) void {
+    state.picker_kind = kind;
+    state.picker_open = true;
+    const owned_start = pickerStartPath(std.heap.c_allocator) catch null;
+    defer if (owned_start) |path| std.heap.c_allocator.free(path);
+    const start = owned_start orelse ".";
+    _ = state.picker_path.set(start);
+    refreshPicker();
+}
+
+fn pickerStartPath(allocator: std.mem.Allocator) ![]u8 {
+    const environ = state.threaded.environ.process_environ;
+    return std.process.Environ.getAlloc(environ, allocator, if (@import("builtin").os.tag == .windows) "USERPROFILE" else "HOME") catch allocator.dupe(u8, ".");
+}
+
+fn refreshPicker() void {
+    state.picker_count = 0;
+    state.picker_scroll = 0;
+    state.picker_selected = std.math.maxInt(usize);
+    if (state.picker_path.len == 0 and @import("builtin").os.tag == .windows) {
+        for ('A'..'Z' + 1) |letter_value| {
+            if (state.picker_count == picker_max_entries) break;
+            const letter: u8 = @intCast(letter_value);
+            var root = [_]u8{ letter, ':', '\\' };
+            var dir = std.Io.Dir.cwd().openDir(state.threaded.io(), &root, .{}) catch continue;
+            dir.close(state.threaded.io());
+            var item = PickerEntry{ .directory = true, .absolute = true };
+            if (!item.setName(&root)) continue;
+            state.picker_entries[state.picker_count] = item;
+            state.picker_count += 1;
+        }
+        return;
+    }
+    var dir = std.Io.Dir.cwd().openDir(state.threaded.io(), state.picker_path.slice(), .{ .iterate = true }) catch |err| {
+        setStatus(false, "Could not browse folder: {s}.", .{@errorName(err)});
+        return;
+    };
+    defer dir.close(state.threaded.io());
+    var iterator = dir.iterate();
+    while (iterator.next(state.threaded.io()) catch null) |entry| {
+        if (state.picker_count == picker_max_entries) break;
+        const kind = if (entry.kind == .unknown) blk: {
+            const path = std.fs.path.join(std.heap.c_allocator, &.{ state.picker_path.slice(), entry.name }) catch continue;
+            defer std.heap.c_allocator.free(path);
+            break :blk (std.Io.Dir.cwd().statFile(state.threaded.io(), path, .{}) catch continue).kind;
+        } else entry.kind;
+        const directory = kind == .directory;
+        if (!directory and (kind != .file or !pickerFileAccepted(entry.name))) continue;
+        var item = PickerEntry{ .directory = directory };
+        if (!item.setName(entry.name)) continue;
+        state.picker_entries[state.picker_count] = item;
+        state.picker_count += 1;
+    }
+    std.mem.sort(PickerEntry, state.picker_entries[0..state.picker_count], {}, pickerEntryLessThan);
+}
+
+fn pickerFileAccepted(name: []const u8) bool {
+    const expected = if (state.picker_kind == .games) ".lpl" else ".json";
+    return std.ascii.eqlIgnoreCase(std.fs.path.extension(name), expected);
+}
+
+fn pickerEntryLessThan(_: void, a: PickerEntry, b: PickerEntry) bool {
+    if (a.directory != b.directory) return a.directory;
+    return std.ascii.lessThanIgnoreCase(a.slice(), b.slice());
+}
+
+fn scrollPicker(delta: f32) void {
+    const maximum = state.picker_count -| picker_visible_rows;
+    if (delta < 0) state.picker_scroll = @min(maximum, state.picker_scroll + 3);
+    if (delta > 0) state.picker_scroll -|= @min(state.picker_scroll, 3);
+}
+
+fn handlePickerClick(x: f32, y: f32) void {
+    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
+    const panel = pickerPanel(metrics.width, metrics.height);
+    if (contains(.{ .x = panel.x + panel.w - 112, .y = panel.y + 78, .w = 92, .h = 28 }, x, y)) {
+        state.picker_open = false;
+        return;
+    }
+    if (contains(.{ .x = panel.x + 20, .y = panel.y + 78, .w = 80, .h = 28 }, x, y)) {
+        pickerGoUp();
+        return;
+    }
+    if (contains(.{ .x = panel.x + 112, .y = panel.y + 78, .w = 176, .h = 28 }, x, y)) {
+        if (state.picker_kind == .games) {
+            const selected = if (state.picker_selected < state.picker_count) state.picker_entries[state.picker_selected] else PickerEntry{};
+            if (selected.len != 0 and !selected.directory) {
+                pickerUseEntry(selected);
+            } else pickerChoosePath(state.picker_path.slice());
+        } else if (state.picker_selected < state.picker_count and !state.picker_entries[state.picker_selected].directory) {
+            pickerUseEntry(state.picker_entries[state.picker_selected]);
+        }
+        return;
+    }
+    const list = Rect{ .x = panel.x + 20, .y = panel.y + 120, .w = panel.w - 40, .h = panel.h - 140 };
+    if (!contains(list, x, y)) return;
+    const row_index: usize = @intFromFloat(@max(0, @floor((y - list.y - 6) / 32)));
+    const index = state.picker_scroll + row_index;
+    if (index >= state.picker_count) return;
+    const entry = state.picker_entries[index];
+    if (entry.directory) {
+        pickerUseEntry(entry);
+    } else if (state.picker_selected == index) {
+        pickerUseEntry(entry);
+    } else state.picker_selected = index;
+}
+
+fn pickerUseEntry(entry: PickerEntry) void {
+    const path = if (entry.absolute)
+        std.heap.c_allocator.dupe(u8, entry.slice()) catch return
+    else
+        std.fs.path.join(std.heap.c_allocator, &.{ state.picker_path.slice(), entry.slice() }) catch return;
+    defer std.heap.c_allocator.free(path);
+    if (entry.directory) {
+        _ = state.picker_path.set(path);
+        refreshPicker();
+    } else pickerChoosePath(path);
+}
+
+fn pickerChoosePath(path: []const u8) void {
+    state.picker_open = false;
+    if (isBusy()) {
+        if (!state.pending_drop_path.set(path)) {
+            setStatus(false, "Selected path is too long.", .{});
+            return;
+        }
+        state.pending_drop = true;
+        setStatus(true, "Selection queued; waiting for current detection to finish...", .{});
+    } else handleDropPath(path);
+}
+
+fn pickerGoUp() void {
+    const current = state.picker_path.slice();
+    if (@import("builtin").os.tag == .windows and current.len == 3 and current[1] == ':' and (current[2] == '\\' or current[2] == '/')) {
+        state.picker_path.len = 0;
+        state.picker_path.buffer[0] = 0;
+        refreshPicker();
+        return;
+    }
+    const parent = std.fs.path.dirname(current) orelse {
+        if (@import("builtin").os.tag == .windows) {
+            state.picker_path.len = 0;
+            state.picker_path.buffer[0] = 0;
+            refreshPicker();
+        }
+        return;
+    };
+    if (parent.len == 0 or std.mem.eql(u8, parent, current)) {
+        if (@import("builtin").os.tag == .windows) {
+            state.picker_path.len = 0;
+            state.picker_path.buffer[0] = 0;
+            refreshPicker();
+        }
+        return;
+    }
+    state.picker_path.len = parent.len;
+    state.picker_path.buffer[parent.len] = 0;
+    refreshPicker();
+}
+
+fn processPendingDrop() void {
+    if (!state.pending_drop or isBusy()) return;
+    state.pending_drop = false;
+    handleDropPath(state.pending_drop_path.slice());
+}
+
+fn handleDropPath(path: []const u8) void {
     if (isArtworkPath(path)) {
         installDroppedArtwork(path);
         return;
     }
-    if (state.drop_mode == .registry or std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".json")) {
+    if (std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".json")) {
         loadRegistry(path);
         return;
     }
-    const kind: SourceKind = blk: {
-        const stat = std.Io.Dir.cwd().statFile(state.threaded.io(), path, .{}) catch |err| {
-            setStatus(false, "Could not inspect dropped path: {s}.", .{@errorName(err)});
-            return;
-        };
-        if (stat.kind == .directory) break :blk .directory;
-        if (stat.kind == .file and std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".lpl")) break :blk .playlist;
+    const kind = classifyDroppedSource(state.threaded.io(), path) catch |err| {
+        setStatus(false, "Could not inspect dropped path: {s}.", .{@errorName(err)});
+        return;
+    } orelse {
         setStatus(false, "Drop a ROM directory or a RetroArch .lpl playlist.", .{});
         return;
     };
-    if (!state.dropped_source_path.set(path)) {
-        setStatus(false, "Dropped source path is too long.", .{});
-        return;
-    }
+    if (!state.dropped_source_path.set(path)) unreachable;
     state.dropped_source_kind = kind;
+    state.drop_mode = .games;
     switch (kind) {
         .directory => setStatus(true, "Scanning dropped directory recursively...", .{}),
-        .playlist => setStatus(true, "Saved dropped playlist fallback; refreshing automatic detection first...", .{}),
+        .playlist => setStatus(true, "Loading dropped RetroArch playlist...", .{}),
         .automatic => unreachable,
     }
-    runRefresh();
+    runSourceRefresh(kind == .directory);
+}
+
+fn classifyDroppedSource(io: std.Io, path: []const u8) !?SourceKind {
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    if (stat.kind == .directory) return .directory;
+    if (stat.kind == .file and std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".lpl")) return .playlist;
+    return null;
 }
 
 fn isArtworkPath(path: []const u8) bool {
@@ -1237,6 +1617,10 @@ fn isArtworkPath(path: []const u8) bool {
 }
 
 fn installDroppedArtwork(path: []const u8) void {
+    if (state.artwork_worker != null) {
+        setStatus(false, "Wait for the current artwork lookup to finish, then retry.", .{});
+        return;
+    }
     const allocator = std.heap.c_allocator;
     var decoded = importer.decodeArtwork(allocator, state.threaded.io(), path) catch |err| {
         setStatus(false, "Could not decode dropped artwork: {s}.", .{@errorName(err)});
@@ -1338,6 +1722,27 @@ fn runRefresh() void {
     setStatus(true, "Detecting RetroArch and SummerCart...", .{});
 }
 
+fn runSourceRefresh(merge_existing: bool) void {
+    if (isBusy()) return;
+    const config = DiscoveryConfig{
+        .source_kind = state.dropped_source_kind,
+        .source_path = state.dropped_source_path,
+        .discover_destinations = false,
+        .merge_existing = merge_existing,
+    };
+    clearProgressiveScan();
+    if (merge_existing) if (state.scan) |scan| {
+        state.progressive_base = importer.cloneScanResult(std.heap.c_allocator, scan.preview().titles) catch null;
+    };
+    if (!beginWorker()) return;
+    state.worker = std.Thread.spawn(.{}, refreshWorker, .{config}) catch |err| {
+        cancelWorker();
+        setStatus(false, "Could not start import: {s}", .{@errorName(err)});
+        return;
+    };
+    setStatus(true, "Importing dropped game source recursively...", .{});
+}
+
 fn modDownloadWorker(config: ModDownloadConfig) void {
     const allocator = std.heap.c_allocator;
     const catalog = &(state.mod_registry orelse {
@@ -1357,10 +1762,13 @@ fn modDownloadWorker(config: ModDownloadConfig) void {
 }
 
 fn artworkDiscoverAndAdvanceWorker(config: ArtworkDownloadConfig) void {
+    finishWorker(.{ .artwork_download = downloadArtworkResult(config) });
+}
+
+fn downloadArtworkResult(config: ArtworkDownloadConfig) ArtworkDownloadResult {
     const allocator = std.heap.c_allocator;
     const cache = artworkCachePath(allocator) catch |err| {
-        finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
-        return;
+        return .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) };
     };
     defer allocator.free(cache);
     const key = std.fmt.bytesToHex(config.content_hash, .lower);
@@ -1369,23 +1777,20 @@ fn artworkDiscoverAndAdvanceWorker(config: ArtworkDownloadConfig) void {
     if (existing == null) if (importer.findRetroArchArtwork(allocator, state.threaded.io(), state.threaded.environ.process_environ, config.display_name.slice()) catch null) |retro_path| {
         defer allocator.free(retro_path);
         const selection = launchbox.seedArtwork(allocator, state.threaded.io(), retro_path, &key, cache) catch |err| {
-            finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
-            return;
+            return .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) };
         };
         allocator.free(selection.path);
     };
     var selection = launchbox.downloadArtwork(allocator, state.threaded.io(), config.display_name.slice(), &key, cache) catch |err| {
-        finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
-        return;
+        return .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) };
     };
-    if (selection.count > 1) {
+    if (config.advance_after_discovery and selection.count > 1) {
         allocator.free(selection.path);
         selection = launchbox.cycleArtwork(allocator, state.threaded.io(), &key, cache) catch |err| {
-            finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) } });
-            return;
+            return .{ .title_index = config.title_index, .content_hash = config.content_hash, .err = @errorName(err) };
         };
     }
-    finishWorker(.{ .artwork_download = .{ .title_index = config.title_index, .content_hash = config.content_hash, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count } });
+    return .{ .title_index = config.title_index, .content_hash = config.content_hash, .path = selection.path, .gallery_index = selection.index, .gallery_count = selection.count };
 }
 
 fn artworkCycleWorker(config: ArtworkDownloadConfig) void {
@@ -1786,22 +2191,26 @@ fn refreshWorker(config: DiscoveryConfig) void {
     const allocator = std.heap.c_allocator;
     const io = state.threaded.io();
     var result = RefreshResult{};
+    result.destinations_discovered = config.discover_destinations;
+    result.merge_existing = config.merge_existing;
     const artwork_cache = artworkCachePath(allocator) catch null;
     defer if (artwork_cache) |path| allocator.free(path);
 
-    var card_outcome = discoverCard(allocator, io);
-    result.card = card_outcome.card;
-    result.card_error = card_outcome.err;
-    card_outcome.card = null;
-    var device_outcome = discoverDevice(allocator, io);
-    result.device = device_outcome.device;
-    result.device_error = device_outcome.err;
-    device_outcome.device = null;
+    if (config.discover_destinations) {
+        var card_outcome = discoverCard(allocator, io);
+        result.card = card_outcome.card;
+        result.card_error = card_outcome.err;
+        card_outcome.card = null;
+        var device_outcome = discoverDevice(allocator, io);
+        result.device = device_outcome.device;
+        result.device_error = device_outcome.err;
+        device_outcome.device = null;
+    }
 
     result.scan = switch (config.source_kind) {
         .directory => directory: {
             const root = config.source_path.slice();
-            const preview = importer.scanLibrary(allocator, io, .{ .rom_root = root, .recursive = true, .artwork_cache_root = artwork_cache }) catch |err| {
+            const preview = importer.scanLibrary(allocator, io, .{ .rom_root = root, .recursive = true, .artwork_cache_root = artwork_cache, .preview_progress = .{ .callback = scanPreviewProgress } }) catch |err| {
                 result.scan_error = @errorName(err);
                 break :directory null;
             };
@@ -1819,27 +2228,15 @@ fn refreshWorker(config: DiscoveryConfig) void {
         .automatic, .playlist => retroarch: {
             if (config.source_kind == .playlist and config.source_path.len != 0) {
                 const override_path = config.source_path.slice();
-                const parent = std.fs.path.dirname(override_path) orelse {
-                    result.scan_error = "InvalidPlaylistPath";
-                    break :retroarch null;
-                };
-                const roots = [_][]const u8{parent};
-                var exact = importer.scanRetroArchLibrary(allocator, io, .{
-                    .search_roots = &roots,
-                    .maximum_search_depth = 0,
+                const exact = importer.scanRetroArchPlaylistPath(allocator, io, override_path, .{
                     .environ = state.threaded.environ.process_environ,
                     .artwork_cache_root = artwork_cache,
+                    .preview_progress = .{ .callback = scanPreviewProgress },
                 }) catch |err| {
                     result.scan_error = @errorName(err);
                     result.override_target_blocked = true;
                     break :retroarch null;
                 };
-                if (!std.ascii.eqlIgnoreCase(exact.source.playlist_path, override_path)) {
-                    exact.deinit(allocator);
-                    result.scan_error = "ExactPlaylistTargetUnavailable";
-                    result.override_target_blocked = true;
-                    break :retroarch null;
-                }
                 result.source_kind = .playlist;
                 break :retroarch LibraryScan{ .retroarch = exact };
             }
@@ -1857,6 +2254,7 @@ fn refreshWorker(config: DiscoveryConfig) void {
                         .maximum_search_depth = 0,
                         .environ = state.threaded.environ.process_environ,
                         .artwork_cache_root = artwork_cache,
+                        .preview_progress = .{ .callback = scanPreviewProgress },
                     }) catch null;
                     if (detected) |scan| {
                         result.source_kind = .playlist;
@@ -1864,7 +2262,7 @@ fn refreshWorker(config: DiscoveryConfig) void {
                     }
                 }
             }
-            const detected = importer.scanRetroArchLibrary(allocator, io, .{ .environ = state.threaded.environ.process_environ, .artwork_cache_root = artwork_cache }) catch |auto_err| fallback: {
+            const detected = importer.scanRetroArchLibrary(allocator, io, .{ .environ = state.threaded.environ.process_environ, .artwork_cache_root = artwork_cache, .preview_progress = .{ .callback = scanPreviewProgress } }) catch |auto_err| fallback: {
                 if (config.source_kind != .playlist or config.source_path.len == 0) {
                     result.scan_error = @errorName(auto_err);
                     break :fallback null;
@@ -1880,6 +2278,7 @@ fn refreshWorker(config: DiscoveryConfig) void {
                     .maximum_search_depth = 0,
                     .environ = state.threaded.environ.process_environ,
                     .artwork_cache_root = artwork_cache,
+                    .preview_progress = .{ .callback = scanPreviewProgress },
                 }) catch |fallback_err| {
                     result.scan_error = @errorName(fallback_err);
                     result.override_target_blocked = !std.ascii.eqlIgnoreCase(std.fs.path.basename(override_path), expected_playlist_name);
@@ -2048,16 +2447,11 @@ fn syncFromStaging(
         },
         .automatic, .playlist => {
             const playlist_path = config.source_path.slice();
-            const parent = std.fs.path.dirname(playlist_path) orelse return error.InvalidPlaylistPath;
-            const roots = [_][]const u8{parent};
-            var imported = try importer.importRetroArchLibrary(allocator, io, staging, .{
-                .search_roots = &roots,
-                .maximum_search_depth = 0,
+            var imported = try importer.importRetroArchPlaylistPath(allocator, io, staging, playlist_path, .{
                 .environ = state.threaded.environ.process_environ,
                 .artwork_cache_root = artwork_cache,
             }, .{ .context = null, .callback = importProgress });
             defer imported.deinit(allocator);
-            if (!std.ascii.eqlIgnoreCase(imported.source.playlist_path, playlist_path)) return error.PlaylistChanged;
             if (!std.mem.eql(u8, &libraryFingerprint(imported.preview.titles), &config.source_fingerprint)) return error.SourceChanged;
             imported_titles = imported.preview.titles;
             try stageCachedMods(allocator, io, staging, imported_titles);
@@ -2153,6 +2547,100 @@ fn importProgress(_: ?*anyopaque, progress_event: importer.ProgressEvent) void {
     setStatus(true, "Staging {d}/{d}: {s}", .{ progress_event.completed, progress_event.total, progress_event.title.display_name });
 }
 
+fn aggregateLibraryPath(allocator: std.mem.Allocator) ![]u8 {
+    const environ = state.threaded.environ.process_environ;
+    const root = std.process.Environ.getAlloc(environ, allocator, if (@import("builtin").os.tag == .windows) "LOCALAPPDATA" else "XDG_CACHE_HOME") catch
+        std.process.Environ.getAlloc(environ, allocator, "HOME") catch
+        try allocator.dupe(u8, ".");
+    defer allocator.free(root);
+    const directory = try std.fs.path.join(allocator, &.{ root, "m64menu", "aggregate-library" });
+    defer allocator.free(directory);
+    try std.Io.Dir.cwd().createDirPath(state.threaded.io(), directory);
+    return std.fs.path.join(allocator, &.{ directory, expected_playlist_name });
+}
+
+fn writeAggregatePlaylist(allocator: std.mem.Allocator, titles: []const importer.Title) ![]u8 {
+    const path = try aggregateLibraryPath(allocator);
+    errdefer allocator.free(path);
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(allocator);
+    for (titles) |title| {
+        try appendPlaylistEntry(allocator, &contents, title.rom_path, title.display_name);
+        for (title.local_revisions) |revision| try appendPlaylistEntry(allocator, &contents, revision.rom_path, revision.name);
+    }
+    try std.Io.Dir.cwd().writeFile(state.threaded.io(), .{ .sub_path = path, .data = contents.items });
+    return path;
+}
+
+fn scanPreviewProgress(_: ?*anyopaque, progress_event: importer.ScanProgressEvent) void {
+    if (progress_event.completed != progress_event.total and progress_event.completed % 4 != 0) return;
+    const snapshot = if (state.progressive_base) |base|
+        importer.mergeScanResults(std.heap.c_allocator, base.titles, progress_event.titles) catch return
+    else
+        importer.cloneScanResult(std.heap.c_allocator, progress_event.titles) catch return;
+    lockWorker();
+    if (state.worker_done) {
+        unlockWorker();
+        var discarded = snapshot;
+        discarded.deinit(std.heap.c_allocator);
+        return;
+    }
+    if (state.progressive_scan) |*previous| previous.deinit(std.heap.c_allocator);
+    state.progressive_scan = snapshot;
+    state.progressive_completed = progress_event.completed;
+    state.progressive_total = progress_event.total;
+    unlockWorker();
+}
+
+fn harvestProgressiveScan() void {
+    lockWorker();
+    var snapshot = state.progressive_scan;
+    if (snapshot == null) {
+        unlockWorker();
+        return;
+    }
+    state.progressive_scan = null;
+    const completed = state.progressive_completed;
+    const total = state.progressive_total;
+    unlockWorker();
+
+    clearArtworkTextures();
+    if (state.scan) |*scan| {
+        switch (scan.*) {
+            .retroarch => |*retroarch| {
+                retroarch.preview.deinit(std.heap.c_allocator);
+                retroarch.preview = snapshot.?;
+            },
+            .directory => |*directory| {
+                directory.preview.deinit(std.heap.c_allocator);
+                directory.preview = snapshot.?;
+            },
+            .aggregate => |*aggregate| {
+                aggregate.preview.deinit(std.heap.c_allocator);
+                aggregate.preview = snapshot.?;
+            },
+        }
+    } else {
+        const root = std.heap.c_allocator.dupe(u8, state.dropped_source_path.slice()) catch {
+            snapshot.?.deinit(std.heap.c_allocator);
+            return;
+        };
+        state.scan = .{ .directory = .{ .root = root, .preview = snapshot.? } };
+    }
+    const count = state.scan.?.preview().titles.len;
+    if (count != 0) state.preview_scroll = @min(state.preview_scroll, count - 1);
+    setStatus(true, "Found {d} game(s); scanning {d}/{d}...", .{ count, completed, total });
+}
+
+fn clearProgressiveScan() void {
+    lockWorker();
+    defer unlockWorker();
+    if (state.progressive_scan) |*scan| scan.deinit(std.heap.c_allocator);
+    state.progressive_scan = null;
+    if (state.progressive_base) |*scan| scan.deinit(std.heap.c_allocator);
+    state.progressive_base = null;
+}
+
 fn deployProgress(_: ?*anyopaque, progress_event: deployer.ProgressEvent) void {
     setStatus(true, "Syncing {d}/{d}: {s}", .{ progress_event.current, progress_event.total, progress_event.path });
 }
@@ -2181,6 +2669,8 @@ fn cancelWorker() void {
 fn finishWorker(result: WorkerResult) void {
     lockWorker();
     defer unlockWorker();
+    if (state.progressive_scan) |*scan| scan.deinit(std.heap.c_allocator);
+    state.progressive_scan = null;
     state.worker_result = result;
     state.worker_done = true;
 }
@@ -2210,14 +2700,11 @@ fn harvestWorker() void {
 }
 
 fn harvestArtworkDownload(result: ArtworkDownloadResult) void {
+    state.artwork_fetch_index = std.math.maxInt(usize);
     defer if (result.path) |path| std.heap.c_allocator.free(path);
     if (result.err) |name| {
-        const scan = if (state.scan) |*value| value else return;
-        const titles = scan.preview().titles;
-        if (result.title_index < titles.len and std.mem.eql(u8, &titles[result.title_index].content_hash, &result.content_hash)) {
-            launchbox.openSearch(std.heap.c_allocator, state.threaded.io(), state.threaded.environ.process_environ, titles[result.title_index].display_name) catch {};
-        }
-        setStatus(false, "Automatic LaunchBox artwork failed ({s}); opened search results as a fallback.", .{name});
+        rememberArtworkFailure(result.content_hash);
+        setStatus(false, "Automatic artwork lookup failed: {s}.", .{name});
         return;
     }
     const path = result.path orelse return;
@@ -2294,19 +2781,56 @@ fn harvestModDownload(result: ModDownloadResult) void {
 }
 
 fn harvestRefresh(result: *RefreshResult) void {
-    clearScan();
-    clearCard();
-    clearDevice();
-    state.scan = result.scan;
-    result.scan = null;
-    state.card = result.card;
-    result.card = null;
-    state.device = result.device;
-    result.device = null;
+    if (result.merge_existing and result.scan == null) {
+        if (state.progressive_base) |base| if (state.scan) |*scan| {
+            const restored = importer.cloneScanResult(std.heap.c_allocator, base.titles) catch null;
+            if (restored) |preview| {
+                clearArtworkTextures();
+                scan.previewMut().deinit(std.heap.c_allocator);
+                scan.previewMut().* = preview;
+            }
+        };
+        clearProgressiveScan();
+        state.scan_error = result.scan_error;
+        setStatus(false, "Folder import failed; existing library was kept.", .{});
+        return;
+    }
+    if (result.merge_existing and state.progressive_base != null and result.scan != null) {
+        var merged = importer.mergeScanResults(std.heap.c_allocator, state.progressive_base.?.titles, result.scan.?.preview().titles) catch null;
+        if (merged) |*preview| {
+            const playlist = writeAggregatePlaylist(std.heap.c_allocator, preview.titles) catch null;
+            if (playlist) |path| {
+                clearScan();
+                state.scan = .{ .aggregate = .{ .playlist_path = path, .preview = preview.* } };
+                merged = null;
+                state.active_source_kind = .playlist;
+                state.dropped_source_kind = .playlist;
+                _ = state.dropped_source_path.set(path);
+            }
+        }
+        if (merged) |*preview| preview.deinit(std.heap.c_allocator);
+        result.scan.?.deinit(std.heap.c_allocator);
+        result.scan = null;
+    } else {
+        clearScan();
+        state.scan = result.scan;
+        result.scan = null;
+        state.active_source_kind = result.source_kind;
+    }
+    clearProgressiveScan();
+    if (result.destinations_discovered) {
+        clearCard();
+        clearDevice();
+        state.card = result.card;
+        result.card = null;
+        state.device = result.device;
+        result.device = null;
+    }
     state.scan_error = result.scan_error;
-    state.card_error = result.card_error;
-    state.device_error = result.device_error;
-    state.active_source_kind = result.source_kind;
+    if (result.destinations_discovered) {
+        state.card_error = result.card_error;
+        state.device_error = result.device_error;
+    }
     state.preview_scroll = 0;
     state.mod_browser_open = false;
     clearModArtworkSlots();

@@ -24,6 +24,7 @@ pub const Config = struct {
     retroarch_thumbnail_root: ?[]const u8 = null,
     artwork_cache_root: ?[]const u8 = null,
     recursive: bool = false,
+    preview_progress: ?ScanProgress = null,
 };
 
 pub const ArtworkStatus = enum {
@@ -81,6 +82,132 @@ pub const ScanResult = struct {
         self.* = undefined;
     }
 };
+
+pub const ScanProgressEvent = struct {
+    completed: usize,
+    total: usize,
+    titles: []const Title,
+};
+
+pub const ScanProgress = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (?*anyopaque, ScanProgressEvent) void,
+};
+
+pub fn cloneScanResult(allocator: std.mem.Allocator, titles: []const Title) !ScanResult {
+    const cloned = try allocator.alloc(Title, titles.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*title| title.deinit(allocator);
+        allocator.free(cloned);
+    }
+    for (titles, cloned) |source, *destination| {
+        destination.* = try cloneTitle(allocator, source);
+        initialized += 1;
+    }
+    return .{ .titles = cloned };
+}
+
+pub fn mergeScanResults(allocator: std.mem.Allocator, existing: []const Title, added: []const Title) !ScanResult {
+    var merged: std.ArrayList(Title) = .empty;
+    errdefer {
+        for (merged.items) |*title| title.deinit(allocator);
+        merged.deinit(allocator);
+    }
+    for (existing) |title| try merged.append(allocator, try cloneTitle(allocator, title));
+    for (added) |title| try mergeTitleRecords(allocator, &merged, title);
+    return .{ .titles = try merged.toOwnedSlice(allocator) };
+}
+
+fn mergeTitleRecords(allocator: std.mem.Allocator, merged: *std.ArrayList(Title), source: Title) !void {
+    if (!containsContentHash(merged.items, &source.content_hash)) {
+        var base = try cloneTitle(allocator, source);
+        for (base.local_revisions) |*revision| revision.deinit(allocator);
+        if (base.local_revisions.len != 0) allocator.free(base.local_revisions);
+        base.local_revisions = &.{};
+        base.id = try uniqueIdForDigest(source.content_hash, merged.items);
+        try appendGroupedTitle(allocator, merged, base);
+    }
+    for (source.local_revisions) |revision| {
+        if (containsContentHash(merged.items, &revision.content_hash)) continue;
+        try appendGroupedTitle(allocator, merged, .{
+            .rom_path = try allocator.dupe(u8, revision.rom_path),
+            .display_name = try allocator.dupe(u8, revision.name),
+            .id = try uniqueIdForDigest(revision.content_hash, merged.items),
+            .content_hash = revision.content_hash,
+            .content_crc32 = revision.content_crc32,
+            .artwork_path = null,
+            .artwork_status = .generated,
+            .cartridge_identity = source.cartridge_identity,
+            .revision = revision.revision,
+        });
+    }
+}
+
+fn containsContentHash(titles: []const Title, hash: *const [32]u8) bool {
+    for (titles) |title| {
+        if (std.mem.eql(u8, &title.content_hash, hash)) return true;
+        for (title.local_revisions) |revision| if (std.mem.eql(u8, &revision.content_hash, hash)) return true;
+    }
+    return false;
+}
+
+fn uniqueIdForDigest(digest: [32]u8, titles: []const Title) !TitleId {
+    for (5..title_id_capacity + 1) |length| {
+        const candidate = normalizedId(digest, length);
+        var collision = false;
+        for (titles) |title| if (std.mem.eql(u8, titleIdSlice(&title.id), titleIdSlice(&candidate))) {
+            collision = true;
+            break;
+        };
+        if (!collision) return candidate;
+    }
+    return error.IdCollision;
+}
+
+fn cloneTitle(allocator: std.mem.Allocator, source: Title) !Title {
+    const rom_path = try allocator.dupe(u8, source.rom_path);
+    errdefer allocator.free(rom_path);
+    const display_name = try allocator.dupe(u8, source.display_name);
+    errdefer allocator.free(display_name);
+    const artwork_path = if (source.artwork_path) |path| try allocator.dupe(u8, path) else null;
+    errdefer if (artwork_path) |path| allocator.free(path);
+    const revisions = try allocator.alloc(LocalRevision, source.local_revisions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (revisions[0..initialized]) |*revision| revision.deinit(allocator);
+        allocator.free(revisions);
+    }
+    for (source.local_revisions, revisions) |revision, *destination| {
+        destination.* = try cloneRevision(allocator, revision);
+        initialized += 1;
+    }
+    return .{
+        .rom_path = rom_path,
+        .display_name = display_name,
+        .id = source.id,
+        .content_hash = source.content_hash,
+        .content_crc32 = source.content_crc32,
+        .artwork_path = artwork_path,
+        .artwork_status = source.artwork_status,
+        .artwork_options = source.artwork_options,
+        .cartridge_identity = source.cartridge_identity,
+        .revision = source.revision,
+        .local_revisions = revisions,
+    };
+}
+
+fn cloneRevision(allocator: std.mem.Allocator, source: LocalRevision) !LocalRevision {
+    const rom_path = try allocator.dupe(u8, source.rom_path);
+    errdefer allocator.free(rom_path);
+    return .{
+        .rom_path = rom_path,
+        .name = try allocator.dupe(u8, source.name),
+        .revision = source.revision,
+        .content_hash = source.content_hash,
+        .content_crc32 = source.content_crc32,
+    };
+}
 
 pub const DecodedArtwork = struct {
     width: usize,
@@ -231,6 +358,7 @@ pub const RetroArchDiscoveryOptions = struct {
     maximum_search_depth: usize = 7,
     environ: std.process.Environ = .empty,
     artwork_cache_root: ?[]const u8 = null,
+    preview_progress: ?ScanProgress = null,
 };
 
 pub const ProgressEvent = struct {
@@ -516,7 +644,7 @@ pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !Sc
         titles.deinit(allocator);
     }
 
-    for (roms.items) |rom_path| {
+    for (roms.items, 0..) |rom_path, rom_index| {
         const normalized = try readNormalizedRom(allocator, io, rom_path);
         defer allocator.free(normalized);
         const assigned = try uniqueNormalizedId(normalized, titles.items);
@@ -538,6 +666,11 @@ pub fn scanLibrary(allocator: std.mem.Allocator, io: std.Io, config: Config) !Sc
             .artwork_options = if (match) |found| found.options else 0,
             .cartridge_identity = cartridgeIdentity(normalized),
             .revision = romRevision(normalized),
+        });
+        if (config.preview_progress) |reporter| reporter.callback(reporter.context, .{
+            .completed = rom_index + 1,
+            .total = roms.items.len,
+            .titles = titles.items,
         });
     }
     return .{ .titles = try titles.toOwnedSlice(allocator) };
@@ -613,7 +746,7 @@ pub fn scanRetroArchLibrary(
     errdefer source.deinit(allocator);
     return .{
         .source = source,
-        .preview = try scanRetroArchPlaylist(allocator, io, source, mounted_roots, options.artwork_cache_root),
+        .preview = try scanRetroArchPlaylist(allocator, io, source, mounted_roots, options.artwork_cache_root, options.preview_progress),
     };
 }
 
@@ -913,6 +1046,7 @@ fn scanRetroArchPlaylist(
     source: RetroArchSource,
     mounted_roots: []const []const u8,
     artwork_cache_root: ?[]const u8,
+    preview_progress: ?ScanProgress,
 ) !ScanResult {
     var playlist = try readRetroArchPlaylist(allocator, io, source.playlist_path);
     defer playlist.deinit(allocator);
@@ -930,6 +1064,7 @@ fn scanRetroArchPlaylist(
         for (titles.items) |*title| title.deinit(allocator);
         titles.deinit(allocator);
     }
+    var completed: usize = 0;
     for (playlist.entries) |entry| {
         if (!isSupportedPlaylistRom(entry.path)) continue;
         const rom_path = resolvePlaylistRomPath(allocator, io, entry.path, mounted_roots) catch continue;
@@ -952,6 +1087,12 @@ fn scanRetroArchPlaylist(
             .artwork_options = if (artwork) |match| match.options else 0,
             .cartridge_identity = cartridgeIdentity(normalized),
             .revision = romRevision(normalized),
+        });
+        completed += 1;
+        if (preview_progress) |reporter| reporter.callback(reporter.context, .{
+            .completed = completed,
+            .total = source.resolved_entries,
+            .titles = titles.items,
         });
     }
     if (titles.items.len == 0) return error.NoRomsFound;
@@ -1944,6 +2085,119 @@ test "latest N64 revision becomes base and older revisions become variants" {
     defer allocator.free(manifest);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "revision-1,Game (Rev A),revision-1.z64") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "revision-0,Game,revision-0.z64") != null);
+}
+
+pub fn scanRetroArchPlaylistPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    playlist_path: []const u8,
+    options: RetroArchDiscoveryOptions,
+) !RetroArchScanResult {
+    var owned_mounts: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &owned_mounts);
+    const mounted_roots = if (options.mounted_roots.len != 0)
+        options.mounted_roots
+    else blk: {
+        try appendMountedRoots(allocator, io, &owned_mounts);
+        break :blk owned_mounts.items;
+    };
+    var source = try inspectPlaylistCandidate(allocator, io, playlist_path, mounted_roots);
+    errdefer source.deinit(allocator);
+    return .{
+        .source = source,
+        .preview = try scanRetroArchPlaylist(allocator, io, source, mounted_roots, options.artwork_cache_root, options.preview_progress),
+    };
+}
+
+pub fn importRetroArchPlaylistPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output_root: []const u8,
+    playlist_path: []const u8,
+    options: RetroArchDiscoveryOptions,
+    progress: ?Progress,
+) !RetroArchScanResult {
+    try validateDirectory(io, output_root);
+    var result = try scanRetroArchPlaylistPath(allocator, io, playlist_path, options);
+    errdefer result.deinit(allocator);
+    try stageTitles(allocator, io, output_root, result.preview.titles, progress);
+    return result;
+}
+
+test "recursive scan publishes progressive grouped previews" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "roms/nested");
+    for (0..6) |index| {
+        var rom: [64]u8 = @splat(0);
+        rom[0..4].* = .{ 0x80, 0x37, 0x12, 0x40 };
+        rom[0x3b..0x3f].* = .{ 'N', @intCast('A' + index), 'M', 'E' };
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "roms/nested/Game-{d}.z64", .{index});
+        try temp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = &rom });
+    }
+    const Capture = struct {
+        var calls: usize = 0;
+        var last_completed: usize = 0;
+        var last_titles: usize = 0;
+        fn callback(_: ?*anyopaque, event: ScanProgressEvent) void {
+            calls += 1;
+            last_completed = event.completed;
+            last_titles = event.titles.len;
+        }
+    };
+    Capture.calls = 0;
+    const root = try tempPath(allocator, temp, "roms");
+    defer allocator.free(root);
+    var result = try scanLibrary(allocator, std.testing.io, .{
+        .rom_root = root,
+        .recursive = true,
+        .preview_progress = .{ .callback = Capture.callback },
+    });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 6), Capture.calls);
+    try std.testing.expectEqual(@as(usize, 6), Capture.last_completed);
+    try std.testing.expectEqual(@as(usize, 6), Capture.last_titles);
+}
+
+test "scan result merge is additive and deduplicates content" {
+    const allocator = std.testing.allocator;
+    const first_titles = [_]Title{.{
+        .rom_path = try allocator.dupe(u8, "first.z64"),
+        .display_name = try allocator.dupe(u8, "First"),
+        .id = "FIRST\x00\x00".*,
+        .content_hash = @splat(1),
+        .artwork_path = null,
+        .artwork_status = .generated,
+    }};
+    var first = ScanResult{ .titles = try allocator.dupe(Title, &first_titles) };
+    defer first.deinit(allocator);
+    const added_titles = [_]Title{
+        .{
+            .rom_path = try allocator.dupe(u8, "first-copy.z64"),
+            .display_name = try allocator.dupe(u8, "First Copy"),
+            .id = "COPY1\x00\x00".*,
+            .content_hash = @splat(1),
+            .artwork_path = null,
+            .artwork_status = .generated,
+        },
+        .{
+            .rom_path = try allocator.dupe(u8, "second.z64"),
+            .display_name = try allocator.dupe(u8, "Second"),
+            .id = "SECON\x00\x00".*,
+            .content_hash = @splat(2),
+            .artwork_path = null,
+            .artwork_status = .generated,
+        },
+    };
+    var added = ScanResult{ .titles = try allocator.dupe(Title, &added_titles) };
+    defer added.deinit(allocator);
+    var merged = try mergeScanResults(allocator, first.titles, added.titles);
+    defer merged.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), merged.titles.len);
+    try std.testing.expectEqualStrings("First", merged.titles[0].display_name);
+    try std.testing.expectEqualStrings("Second", merged.titles[1].display_name);
 }
 
 test "variant IDs are manifest-safe" {
