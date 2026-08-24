@@ -6,14 +6,15 @@ const grid = @import("grid");
 const icon = @import("icon.zig");
 const launchbox = @import("launchbox");
 const registry = @import("registry");
+const sel = @import("selection");
 const sdcard = @import("sdcard");
+const font = @import("font");
 const startup = @import("startup");
 const ui_scale = @import("ui_scale");
 
 const sg = sokol.gfx;
 const sapp = sokol.app;
 const sgl = sokol.gl;
-const sdtx = sokol.debugtext;
 const sglue = sokol.glue;
 const slog = sokol.log;
 
@@ -30,7 +31,15 @@ const colors = struct {
     const pink = Color{ .r = 255, .g = 35, .b = 156 };
     const orange = Color{ .r = 255, .g = 122, .b = 0 };
     const yellow = Color{ .r = 255, .g = 214, .b = 0 };
-    const white = Color{ .r = 242, .g = 240, .b = 248 };
+    const white = Color{ .r = 255, .g = 255, .b = 255 };
+    const ribbon = Color{ .r = 113, .g = 48, .b = 183 };
+    const ribbon_dim = Color{ .r = 74, .g = 32, .b = 122 };
+    const a_dark = Color{ .r = 0, .g = 50, .b = 150 };
+    const a_mid = Color{ .r = 0, .g = 104, .b = 230 };
+    const a_light = Color{ .r = 62, .g = 160, .b = 255 };
+    const b_dark = Color{ .r = 0, .g = 96, .b = 40 };
+    const b_mid = Color{ .r = 0, .g = 183, .b = 73 };
+    const b_light = Color{ .r = 55, .g = 235, .b = 120 };
     const dim = Color{ .r = 178, .g = 168, .b = 198 };
     const good = Color{ .r = 76, .g = 220, .b = 130 };
     const bad = Color{ .r = 255, .g = 90, .b = 112 };
@@ -60,7 +69,7 @@ const SyncDestination = enum { direct_sd, usb };
 const SourceKind = enum { automatic, playlist, directory };
 const DropMode = enum { games, registry };
 const PickerKind = enum { games, catalog };
-const TitleSyncState = enum { ADD, KEEP, UPDATE };
+const TitleSyncState = enum { ADD, KEEP, UPDATE, SKIP, REMOVE };
 const UiLibraryDiff = struct { add: usize = 0, keep: usize = 0, update: usize = 0, remove: usize = 0 };
 
 const PickerEntry = struct {
@@ -85,22 +94,40 @@ const PickerEntry = struct {
 const picker_max_entries = 2048;
 const picker_visible_rows = 14;
 
+const text_scale: f32 = 2;
+const text_cell: f32 = 16;
+const button_height: f32 = 36;
+
+fn buttonWidth(label: []const u8) f32 {
+    return font.advance(label.len, text_scale) + 24;
+}
+
+fn fitChars(available: f32) usize {
+    if (available <= text_cell) return 1;
+    return @intFromFloat(available / text_cell);
+}
+
 const page_layout = struct {
-    const workflow_y: f32 = 142;
-    const workflow_height: f32 = 72;
-    const status_y: f32 = 226;
-    const library_top: f32 = 252;
-    const grid_y: f32 = library_top + 38;
+    const ribbon_top: f32 = 20;
+    const ribbon_full: f32 = 76;
+    const ribbon_lead: f32 = 68;
+    const ribbon_tab: f32 = 76;
+    const ribbon_gap: f32 = 6;
+    const rule_y: f32 = 100;
+    const workflow_y: f32 = 128;
+    const workflow_height: f32 = 126;
+    const status_y: f32 = 270;
+    const library_top: f32 = 302;
+    const grid_y: f32 = library_top + 60;
+    /// The versions page carries a subtitle under the rule, so its cards start lower.
+    const versions_grid_y: f32 = grid_y + 28;
     const grid_x: f32 = 44;
-    const detail_width: f32 = 392;
+    const detail_width: f32 = 480;
     const detail_gap: f32 = 20;
     const right_margin: f32 = 44;
-    const mod_first_y: f32 = grid_y + 118;
-    const mod_row_height: f32 = 18;
-    const mod_button_y: f32 = grid_y + 166;
-    const mod_page_button_offset: f32 = 176;
-    const artwork_button_y: f32 = grid_y + 136;
-    const artwork_cycle_y: f32 = grid_y + 112;
+    const mod_first_y: f32 = grid_y + 150;
+    const artwork_plain_y: f32 = grid_y + 120;
+    const artwork_versions_y: f32 = grid_y + 200;
 
     fn detailX(width: f32) f32 {
         return @max(616, width - right_margin - detail_width);
@@ -235,6 +262,7 @@ const SyncConfig = struct {
     card_root: FixedText,
     deployer_path: FixedText,
     port: FixedText,
+    selection: []const sel.Key = &.{},
 };
 
 const ModDownloadConfig = struct {
@@ -275,6 +303,7 @@ const SyncResult = struct {
     destination: SyncDestination,
     err: ?[]const u8 = null,
     cleanup_error: ?[]const u8 = null,
+    logged: bool = false,
 };
 
 const ModDownloadResult = struct {
@@ -377,30 +406,99 @@ const state = struct {
     var artwork_worker_done = false;
     var artwork_failed_hashes: [128][32]u8 = @splat(@splat(0));
     var artwork_failed_count: usize = 0;
+    /// Guards the held-SPACE bulk select so one hold applies once.
+    var space_hold_used = false;
+    /// What the next sync should place on the cart.
+    var selected: sel.Set = .{};
+    /// Every ROM the session has already applied an import default to, so a
+    /// rescan never revives a choice the user made.
+    var known: sel.Set = .{};
+};
+
+const RibbonTab = enum { library, versions };
+
+const labels = struct {
+    const refresh = "RESCAN";
+    const sd_sync = "SYNC TO SD";
+    const usb_sync = "SYNC TO USB";
+    const add_games = "ADD GAMES";
+    const load_catalog = "LOAD CATALOG";
 };
 
 const layout = struct {
-    fn refresh(width: f32) Rect {
-        return .{ .x = width - 552, .y = 50, .w = 104, .h = 38 };
+    const columns: usize = 4;
+    const column_gap: f32 = 12;
+
+    fn columnWidth(width: f32) f32 {
+        return (width - 88 - 32 - column_gap * 3) / @as(f32, @floatFromInt(columns));
     }
 
-    fn sdSync(width: f32) Rect {
-        return .{ .x = width - 436, .y = 50, .w = 190, .h = 38 };
+    fn columnX(width: f32, index: usize) f32 {
+        return 60 + @as(f32, @floatFromInt(index)) * (columnWidth(width) + column_gap);
     }
 
-    fn usbSync(width: f32) Rect {
-        return .{ .x = width - 234, .y = 50, .w = 190, .h = 38 };
+    fn columnButton(width: f32, index: usize, label: []const u8) Rect {
+        return .{ .x = columnX(width, index), .y = page_layout.workflow_y + 80, .w = buttonWidth(label), .h = button_height };
     }
 
-    fn addGames() Rect {
-        return .{ .x = 188, .y = page_layout.workflow_y + 34, .w = 104, .h = 24 };
+    fn addGames(width: f32) Rect {
+        return columnButton(width, 0, labels.add_games);
+    }
+
+    fn refresh(_: f32) Rect {
+        return .{ .x = 424, .y = 30, .w = buttonWidth(labels.refresh), .h = button_height };
     }
 
     fn loadCatalog(width: f32) Rect {
-        const panel_width = width - 88;
-        const column_width = (panel_width - 32 - 12 * 3) / 4;
-        const catalog_x = 60 + column_width + 12;
-        return .{ .x = catalog_x + 112, .y = page_layout.workflow_y + 34, .w = 120, .h = 24 };
+        return columnButton(width, 1, labels.load_catalog);
+    }
+
+    fn sdSync(width: f32) Rect {
+        return columnButton(width, 2, labels.sd_sync);
+    }
+
+    fn usbSync(width: f32) Rect {
+        return columnButton(width, 3, labels.usb_sync);
+    }
+
+    fn ribbonStart(width: f32) f32 {
+        return width - 44 - (page_layout.ribbon_tab + page_layout.ribbon_gap) * 2 + page_layout.ribbon_gap;
+    }
+
+    fn ribbonTab(width: f32, index: usize) Rect {
+        const x = ribbonStart(width) + @as(f32, @floatFromInt(index)) * (page_layout.ribbon_tab + page_layout.ribbon_gap);
+        return .{ .x = x - page_layout.ribbon_full, .y = page_layout.ribbon_top, .w = page_layout.ribbon_tab + page_layout.ribbon_full, .h = page_layout.ribbon_full };
+    }
+
+    fn modBack(width: f32) Rect {
+        const w = buttonWidth("BACK TO GAMES");
+        return .{ .x = width - 44 - w, .y = page_layout.library_top - 2, .w = w, .h = button_height };
+    }
+
+    fn modPrimary(height: f32) Rect {
+        return .{ .x = 44, .y = height - 92, .w = 248, .h = button_height };
+    }
+
+    fn modSecondary(height: f32) Rect {
+        return .{ .x = 308, .y = height - 92, .w = 232, .h = button_height };
+    }
+
+    fn modTertiary(height: f32) Rect {
+        return .{ .x = 556, .y = height - 92, .w = 232, .h = button_height };
+    }
+
+    fn pickerUp(panel: Rect) Rect {
+        return .{ .x = panel.x + 20, .y = panel.y + 90, .w = buttonWidth("UP"), .h = button_height };
+    }
+
+    fn pickerAccept(panel: Rect) Rect {
+        const previous = pickerUp(panel);
+        return .{ .x = previous.x + previous.w + 16, .y = previous.y, .w = buttonWidth(pickerAcceptLabel()), .h = button_height };
+    }
+
+    fn pickerCancel(panel: Rect) Rect {
+        const w = buttonWidth("CANCEL");
+        return .{ .x = panel.x + panel.w - 20 - w, .y = panel.y + 90, .w = w, .h = button_height };
     }
 };
 
@@ -417,14 +515,6 @@ export fn init() void {
         .label = "importer-artwork-sampler",
     });
     state.mod_registry = registry.parse(std.heap.c_allocator, registry.bundled_registry) catch null;
-    sdtx.setup(.{
-        .fonts = blk: {
-            var fonts: [8]sdtx.FontDesc = @splat(.{});
-            fonts[0] = sdtx.fontKc854();
-            break :blk fonts;
-        },
-        .logger = .{ .func = slog.func },
-    });
     state.pass_action.colors[0] = .{ .load_action = .CLEAR, .clear_value = .{ .r = 0.047, .g = 0.020, .b = 0.110, .a = 1 } };
     setStatus(true, "Detecting RetroArch and SummerCart...", .{});
     runRefresh();
@@ -459,7 +549,8 @@ export fn cleanup() void {
     clearDevice();
     if (state.mod_registry) |*catalog| catalog.deinit();
     state.mod_registry = null;
-    sdtx.shutdown();
+    state.selected.deinit(std.heap.c_allocator);
+    state.known.deinit(std.heap.c_allocator);
     sgl.shutdown();
     sg.shutdown();
     if (state.io_ready) state.threaded.deinit();
@@ -486,16 +577,7 @@ export fn frame() void {
         drawFilePicker(width, height);
     } else {
         drawSynthwaveBackground(width, height);
-        drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 104 }, colors.panel);
-        drawRect(.{ .x = 24, .y = 24, .w = width - 48, .h = 6 }, colors.pink);
-        drawText(44, 50, colors.yellow, "M64 RETROARCH SYNC", .{});
-        drawText(44, 78, colors.dim, "Automatic RetroArch -> SummerCart workflow", .{});
-
-        const busy = isBusy();
-        drawButton(layout.refresh(width), if (busy) colors.border else colors.orange, "REFRESH");
-        drawButton(layout.sdSync(width), if (canSyncSd() and !busy) colors.yellow else colors.border, "SYNC TO SD (FAST)");
-        drawButton(layout.usbSync(width), if (canSyncUsb() and !busy) colors.orange else colors.border, "SYNC OVER USB (SLOW)");
-
+        drawHeader(width);
         drawWorkflowStrip(width);
         drawStatus();
         if (state.mod_browser_open) {
@@ -503,11 +585,11 @@ export fn frame() void {
         } else {
             drawTitles(width, height);
         }
+        drawLegends(width, height);
     }
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
     sgl.draw();
-    sdtx.draw();
     sg.endPass();
     sg.commit();
 }
@@ -624,100 +706,252 @@ fn dimColor(color: Color, intensity: f32) Color {
     };
 }
 
-fn drawWorkflowStrip(width: f32) void {
-    const panel = Rect{ .x = 44, .y = page_layout.workflow_y, .w = width - 88, .h = page_layout.workflow_height };
-    drawRect(panel, colors.inset);
-    drawOutline(panel, colors.border, 2);
-    const gap: f32 = 12;
-    const column_width = (panel.w - 32 - gap * 3) / 4;
-    const library_x = panel.x + 16;
-    const catalog_x = library_x + column_width + gap;
-    const sd_x = catalog_x + column_width + gap;
-    const usb_x = sd_x + column_width + gap;
-    drawCompactLibrary(library_x, panel.y + 14);
-    drawCompactCatalog(catalog_x, panel.y + 14);
-    drawCompactSd(sd_x, panel.y + 14);
-    drawCompactUsb(usb_x, panel.y + 14);
+fn drawHeader(width: f32) void {
+    drawStartupLogo(64, 12, 2, 1);
+    drawButton(layout.refresh(width), colors.pink, labels.refresh, !isBusy());
+
+    const selected = selectedRibbonTab();
+    const selected_index: usize = if (selected == .library) 0 else 1;
+    const tab_x = layout.ribbonStart(width);
+    const step = page_layout.ribbon_tab + page_layout.ribbon_gap;
+    const rule_end = tab_x + @as(f32, @floatFromInt(selected_index)) * step;
+    drawSkewedQuad(64, page_layout.rule_y - 4, @max(420, rule_end), page_layout.rule_y, 4, colors.pink);
+
+    const versions_live = modBrowserAvailable();
+    for (0..2) |index| {
+        if (index == selected_index) continue;
+        const enabled = index == 0 or versions_live;
+        drawRibbonTab(tab_x + @as(f32, @floatFromInt(index)) * step, page_layout.ribbon_lead, if (enabled) colors.ribbon else colors.ribbon_dim);
+        drawRibbonIcon(tab_x + @as(f32, @floatFromInt(index)) * step, index, false, enabled);
+    }
+    drawRibbonTab(tab_x + @as(f32, @floatFromInt(selected_index)) * step, page_layout.ribbon_full, colors.pink);
+    drawRibbonIcon(tab_x + @as(f32, @floatFromInt(selected_index)) * step, selected_index, true, true);
 }
 
-fn drawCompactLibrary(x: f32, y: f32) void {
-    drawText(x, y, colors.pink, "GAME LIBRARY", .{});
+fn selectedRibbonTab() RibbonTab {
+    return if (state.mod_browser_open) .versions else .library;
+}
+
+fn modBrowserAvailable() bool {
+    const scan = state.scan orelse return false;
+    const titles = scan.preview().titles;
+    if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
+    return compatibleModCount(titles[state.preview_scroll]) != 0;
+}
+
+fn handleRibbonClick(width: f32, x: f32, y: f32) bool {
+    for (0..2) |index| {
+        if (!contains(layout.ribbonTab(width, index), x, y)) continue;
+        if (index == 0) {
+            state.mod_browser_open = false;
+            return true;
+        }
+        if (!modBrowserAvailable()) {
+            setStatus(false, "The selected game has no other versions.", .{});
+            return true;
+        }
+        state.selected_mod = 0;
+        state.mod_browser_open = true;
+        return true;
+    }
+    return false;
+}
+
+fn drawRibbonTab(top_x: f32, height: f32, color: Color) void {
+    drawSkewedQuad(top_x - height, page_layout.ribbon_top, top_x + page_layout.ribbon_tab, page_layout.ribbon_top + height, height, color);
+}
+
+fn drawSkewedQuad(x1: f32, y1: f32, x2: f32, y2: f32, skew: f32, color: Color) void {
+    sgl.beginTriangles();
+    sgl.c3b(color.r, color.g, color.b);
+    sgl.v2f(x1 + skew, y1);
+    sgl.v2f(x2, y1);
+    sgl.v2f(x1, y2);
+    sgl.v2f(x2, y1);
+    sgl.v2f(x2 - skew, y2);
+    sgl.v2f(x1, y2);
+    sgl.end();
+}
+
+fn drawRibbonIcon(top_x: f32, index: usize, selected: bool, enabled: bool) void {
+    const size: f32 = 38;
+    const x = top_x - size * 0.5;
+    const y = page_layout.ribbon_top + (page_layout.ribbon_full - size) * 0.5;
+    const fill = if (!enabled) colors.border else if (selected) colors.yellow else colors.white;
+    const shade = if (!enabled) colors.ribbon_dim else if (selected) colors.orange else colors.dim;
+    if (index == 0) drawGridIcon(x, y, size, fill, shade) else drawStackIcon(x, y, size, fill, shade);
+}
+
+fn drawGridIcon(x: f32, y: f32, size: f32, fill: Color, shade: Color) void {
+    const cell = size * 0.42;
+    const gap = size * 0.16;
+    drawRect(.{ .x = x, .y = y, .w = cell, .h = cell }, fill);
+    drawRect(.{ .x = x + cell + gap, .y = y, .w = cell, .h = cell }, shade);
+    drawRect(.{ .x = x, .y = y + cell + gap, .w = cell, .h = cell }, shade);
+    drawRect(.{ .x = x + cell + gap, .y = y + cell + gap, .w = cell, .h = cell }, fill);
+}
+
+fn drawStackIcon(x: f32, y: f32, size: f32, fill: Color, shade: Color) void {
+    const bar = size * 0.22;
+    drawRect(.{ .x = x, .y = y + size * 0.08, .w = size, .h = bar }, shade);
+    drawRect(.{ .x = x, .y = y + size * 0.39, .w = size, .h = bar }, fill);
+    drawRect(.{ .x = x, .y = y + size * 0.70, .w = size, .h = bar }, shade);
+}
+
+const Legend = struct { key: []const u8, action: []const u8, dark: Color, mid: Color, light: Color };
+
+fn currentToggleSelected() bool {
+    const title = selectedTitle() orelse return false;
+    if (!state.mod_browser_open) return state.selected.has(title.content_hash);
+    const data = selectedModBrowserData() orelse return false;
+    return variantSelected(title, data, state.selected_mod);
+}
+
+fn drawLegends(width: f32, height: f32) void {
+    var entries: [5]Legend = undefined;
+    var count: usize = 0;
+    if (state.mod_browser_open) {
+        entries[count] = .{ .key = "BACKSPACE", .action = "GAMES", .dark = colors.b_dark, .mid = colors.b_mid, .light = colors.b_light };
+        count += 1;
+    }
+    if (!isBusy()) {
+        if (selectedTitle()) |title| {
+            const opens_versions = !state.mod_browser_open and compatibleModCount(title) != 0;
+            entries[count] = .{
+                .key = "SPACE",
+                .action = if (opens_versions) "VERSIONS" else if (currentToggleSelected()) "REMOVE" else "ADD",
+                .dark = .{ .r = 150, .g = 10, .b = 80 },
+                .mid = colors.pink,
+                .light = .{ .r = 255, .g = 130, .b = 195 },
+            };
+            count += 1;
+        }
+        if (state.preview_destination == .direct_sd and canSyncSd()) {
+            entries[count] = .{ .key = "ENTER", .action = labels.sd_sync, .dark = colors.a_dark, .mid = colors.a_mid, .light = colors.a_light };
+            count += 1;
+        } else if (canSyncUsb()) {
+            entries[count] = .{ .key = "ENTER", .action = labels.usb_sync, .dark = colors.a_dark, .mid = colors.a_mid, .light = colors.a_light };
+            count += 1;
+        }
+        entries[count] = .{ .key = "F5", .action = labels.refresh, .dark = colors.ribbon_dim, .mid = colors.ribbon, .light = colors.dim };
+        count += 1;
+    }
+    if (count == 0) return;
+
+    var total: f32 = 0;
+    for (entries[0..count]) |entry| total += legendWidth(entry) + 28;
+    var x = width - 44 - total + 28;
+    const y = height - 40;
+    for (entries[0..count]) |entry| {
+        const cap = capWidth(entry.key);
+        drawKeyCap(x, y, cap, entry.key, entry.dark, entry.mid, entry.light);
+        drawTextSlice(x + cap + 10, y + 8, text_scale, colors.white, entry.action);
+        x += legendWidth(entry) + 28;
+    }
+}
+
+fn capWidth(key: []const u8) f32 {
+    return font.advance(key.len, text_scale) + 20;
+}
+
+fn legendWidth(entry: Legend) f32 {
+    return capWidth(entry.key) + 10 + font.advance(entry.action.len, text_scale);
+}
+
+fn drawKeyCap(x: f32, y: f32, w: f32, key: []const u8, dark: Color, mid: Color, light: Color) void {
+    const h: f32 = 30;
+    drawRect(.{ .x = x + 2, .y = y + 3, .w = w, .h = h }, colors.black);
+    drawRect(.{ .x = x, .y = y, .w = w, .h = h }, dark);
+    drawRect(.{ .x = x + 2, .y = y + 2, .w = w - 4, .h = h - 6 }, mid);
+    drawRect(.{ .x = x + 4, .y = y + 3, .w = w - 8, .h = 3 }, light);
+    drawTextSlice(x + 10, y + 7, text_scale, colors.black, key);
+}
+
+fn drawWorkflowStrip(width: f32) void {
+    const y = page_layout.workflow_y + 6;
+    const fit = fitChars(layout.columnWidth(width));
+    drawCompactLibrary(width, layout.columnX(width, 0), y, fit);
+    drawCompactCatalog(width, layout.columnX(width, 1), y, fit);
+    drawCompactSd(width, layout.columnX(width, 2), y, fit);
+    drawCompactUsb(width, layout.columnX(width, 3), y, fit);
+}
+
+fn drawCompactLibrary(width: f32, x: f32, y: f32, fit: usize) void {
+    drawText(x, y, colors.pink, "{s}", .{head("GAME LIBRARY", fit)});
     if (state.scan) |scan| {
         const preview = scan.preview();
-        const coverage = artworkCoverage(preview.*);
-        drawText(x, y + 28, colors.white, "{d} GAMES", .{preview.titles.len});
-        drawText(x + 72, y + 28, if (coverage == preview.titles.len) colors.good else colors.orange, "{d} ART", .{coverage});
+        drawText(x, y + 26, colors.white, "{d} GAMES", .{preview.titles.len});
+        const chosen = selectedTitleCount();
+        drawText(x, y + 50, if (chosen == 0) colors.dim else colors.good, "{d} SELECTED", .{chosen});
     } else {
-        drawText(x, y + 28, colors.dim, "LOOKING FOR GAMES...", .{});
+        drawText(x, y + 26, colors.dim, "{s}", .{head("SCANNING...", fit)});
     }
-    drawButton(layout.addGames(), if (state.drop_mode == .games) colors.orange else colors.border, "ADD GAMES");
+    drawButton(layout.addGames(width), colors.orange, labels.add_games, !isBusy());
 }
 
-fn drawCompactCatalog(x: f32, y: f32) void {
-    drawText(x, y, colors.pink, "MOD CATALOG", .{});
+fn drawCompactCatalog(width: f32, x: f32, y: f32, fit: usize) void {
+    drawText(x, y, colors.pink, "{s}", .{head("MOD CATALOG", fit)});
     if (state.mod_registry) |*catalog| {
-        drawText(x, y + 28, if (state.registry_is_demo) colors.orange else colors.good, "{d} {s}", .{ catalog.entries().len, if (state.registry_is_demo) "DEMO" else "LOADED" });
+        drawText(x, y + 26, if (state.registry_is_demo) colors.orange else colors.good, "{d} {s}", .{ catalog.entries().len, if (state.registry_is_demo) "DEMO" else "LOADED" });
     } else {
-        drawText(x, y + 28, colors.dim, "NOT LOADED", .{});
+        drawText(x, y + 26, colors.dim, "{s}", .{head("NOT LOADED", fit)});
     }
-    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
-    drawButton(layout.loadCatalog(metrics.width), if (state.drop_mode == .registry) colors.orange else colors.border, "LOAD CATALOG");
+    drawButton(layout.loadCatalog(width), colors.orange, labels.load_catalog, !isBusy());
 }
 
-fn drawCompactSd(x: f32, y: f32) void {
-    drawText(x, y, colors.pink, "SD CARD", .{});
+fn drawCompactSd(width: f32, x: f32, y: f32, fit: usize) void {
+    drawText(x, y, colors.pink, "{s}", .{head("SD CARD", fit)});
     if (state.card) |card| {
-        drawText(x, y + 28, colors.good, "READY", .{});
-        if (card.library) |library| drawCompactDiff(x + 72, y + 28, libraryDiffFor(library.titles));
+        drawText(x, y + 26, colors.good, "READY", .{});
+        if (card.library) |library| drawCompactDiff(x, y + 50, fit, libraryDiffFor(library.titles));
     } else {
-        drawText(x, y + 28, colors.dim, "NOT CONNECTED", .{});
+        drawText(x, y + 26, colors.dim, "{s}", .{head("NOT CONNECTED", fit)});
     }
+    drawButton(layout.sdSync(width), colors.yellow, labels.sd_sync, canSyncSd() and !isBusy());
 }
 
-fn drawCompactUsb(x: f32, y: f32) void {
-    drawText(x, y, colors.pink, "USB CART", .{});
+fn drawCompactUsb(width: f32, x: f32, y: f32, fit: usize) void {
+    drawText(x, y, colors.pink, "{s}", .{head("USB CART", fit)});
     if (state.device) |device| {
         const color = switch (device.power) {
             .off => colors.good,
             .on => colors.bad,
             .unknown => colors.orange,
         };
-        drawText(x, y + 28, color, "{s}", .{switch (device.power) {
+        drawText(x, y + 26, color, "{s}", .{head(switch (device.power) {
             .off => "READY",
             .on => "POWER OFF CONSOLE",
             .unknown => "CHECK CONNECTION",
-        }});
-        if (device.power == .off) if (device.library) |library| drawCompactDiff(x + 72, y + 28, libraryDiffFor(library.titles));
+        }, fit)});
+        if (device.power == .off) if (device.library) |library| drawCompactDiff(x, y + 50, fit, libraryDiffFor(library.titles));
     } else {
-        drawText(x, y + 28, colors.dim, "NOT CONNECTED", .{});
+        drawText(x, y + 26, colors.dim, "{s}", .{head("NOT CONNECTED", fit)});
     }
+    drawButton(layout.usbSync(width), colors.orange, labels.usb_sync, canSyncUsb() and !isBusy());
 }
 
-fn drawCompactDiff(x: f32, y: f32, diff: UiLibraryDiff) void {
-    var offset: f32 = 0;
-    if (diff.add != 0) {
-        drawText(x + offset, y, colors.good, "+{d} ADD", .{diff.add});
-        offset += 88;
+fn drawCompactDiff(x: f32, y: f32, fit: usize, diff: UiLibraryDiff) void {
+    var buffer: [96]u8 = undefined;
+    var used: usize = 0;
+    if (diff.add != 0) used += (std.fmt.bufPrint(buffer[used..], "+{d} ", .{diff.add}) catch return).len;
+    if (diff.update != 0) used += (std.fmt.bufPrint(buffer[used..], "~{d} ", .{diff.update}) catch return).len;
+    if (diff.remove != 0) used += (std.fmt.bufPrint(buffer[used..], "-{d}", .{diff.remove}) catch return).len;
+    if (used == 0) {
+        drawText(x, y, colors.dim, "{s}", .{head("NO CHANGES", fit)});
+        return;
     }
-    if (diff.update != 0) {
-        drawText(x + offset, y, colors.orange, "{d} UPDATE", .{diff.update});
-        offset += 104;
-    }
-    if (diff.remove != 0) {
-        drawText(x + offset, y, colors.bad, "-{d} REMOVE", .{diff.remove});
-        offset += 104;
-    }
-    if (offset == 0) drawText(x, y, colors.dim, "NO CHANGES", .{});
+    const color = if (diff.remove != 0) colors.bad else if (diff.update != 0) colors.orange else colors.good;
+    drawText(x, y, color, "{s}", .{head(buffer[0..used], fit)});
 }
 
 fn drawTitles(width: f32, height: f32) void {
     const top: f32 = page_layout.library_top;
     const bottom_margin: f32 = 36;
     if (height <= top + 100) return;
-    drawText(44, top, colors.white, "LIBRARY", .{});
-    drawRect(.{ .x = 44, .y = top + 22, .w = width - 88, .h = 2 }, colors.border);
+    drawTextSlice(44, top, 4, colors.white, "LIBRARY");
+    drawRect(.{ .x = 44, .y = top + 42, .w = width - 88, .h = 2 }, colors.pink);
     const scan = state.scan orelse {
-        drawText(44, top + 42, colors.dim, "No resolved N64 titles.", .{});
+        drawText(44, top + 60, colors.dim, "No resolved N64 titles.", .{});
         return;
     };
     const titles = scan.preview().titles;
@@ -740,6 +974,7 @@ fn drawTitles(width: f32, height: f32) void {
         const card = fromGridRect(grid.cardRect(area_x, area_y, metrics, first_row, index));
         drawCover(card, textureForTitle(index), titles[index].display_name, false);
         drawModsBadge(card, titles[index]);
+        drawSelectionBadge(card, state.selected.has(titles[index].content_hash));
     }
     const selected_index = state.preview_scroll;
     if (selected_index >= first_index and selected_index < end_index) {
@@ -754,37 +989,62 @@ fn drawTitles(width: f32, height: f32) void {
         card.h += growth;
         drawCover(card, textureForTitle(selected_index), title.display_name, true);
         drawModsBadge(card, title);
+        drawSelectionBadge(card, state.selected.has(title.content_hash));
     }
 
     drawSelectedTitle(width, area_y, titles[state.preview_scroll]);
 }
 
+/// A filled check means the ROM is queued for the cart; an empty box means it is
+/// present in the library but will not be written.
+fn drawSelectionBadge(card: Rect, chosen: bool) void {
+    const box = Rect{ .x = card.x + 6, .y = card.y + 6, .w = 22, .h = 22 };
+    if (!chosen) {
+        drawRect(box, colors.background);
+        drawOutline(box, colors.dim, 2);
+        return;
+    }
+    drawRect(box, colors.good);
+    drawRect(.{ .x = box.x + 4, .y = box.y + 11, .w = 4, .h = 4 }, colors.black);
+    drawRect(.{ .x = box.x + 7, .y = box.y + 14, .w = 4, .h = 4 }, colors.black);
+    drawRect(.{ .x = box.x + 10, .y = box.y + 10, .w = 4, .h = 5 }, colors.black);
+    drawRect(.{ .x = box.x + 13, .y = box.y + 6, .w = 4, .h = 5 }, colors.black);
+    drawRect(.{ .x = box.x + 16, .y = box.y + 4, .w = 3, .h = 4 }, colors.black);
+}
+
 fn drawModsBadge(card: Rect, title: importer.Title) void {
     const count = compatibleModCount(title);
     if (count == 0) return;
-    const badge = Rect{ .x = card.x + card.w - 54, .y = card.y + 6, .w = 48, .h = 18 };
+    const badge = Rect{ .x = card.x + card.w - 92, .y = card.y + card.h - 32, .w = 86, .h = 24 };
     drawRect(badge, colors.pink);
-    drawText(badge.x + 5, badge.y + 5, colors.background, "{d} MOD", .{count});
+    drawText(badge.x + 7, badge.y + 4, colors.background, "{d} MOD", .{count});
+}
+
+fn selectedArtworkButton(width: f32, has_versions: bool) Rect {
+    const y = if (has_versions) page_layout.artwork_versions_y else page_layout.artwork_plain_y;
+    return .{ .x = page_layout.detailContentX(width), .y = y, .w = buttonWidth("NEXT ART"), .h = button_height };
 }
 
 fn drawSelectedTitle(width: f32, top: f32, title: importer.Title) void {
     const mod_count = compatibleModCount(title);
-    const panel_height: f32 = if (mod_count != 0) 238 else if (title.artwork_path == null) 174 else if (title.artwork_options > 1) 154 else 112;
+    const panel_height: f32 = if (mod_count != 0) 252 else 172;
     const panel = Rect{ .x = page_layout.detailX(width), .y = top, .w = @min(page_layout.detail_width, @max(0, width - page_layout.detailX(width) - page_layout.right_margin)), .h = panel_height };
-    if (panel.w < 180) return;
+    if (panel.w < 260) return;
     drawRect(panel, colors.inset);
     drawOutline(panel, colors.border, 2);
-    drawText(panel.x + 16, panel.y + 18, colors.pink, "SELECTED GAME", .{});
-    drawText(panel.x + 16, panel.y + 48, if (title.artwork_path == null) colors.orange else colors.white, "{s}", .{head(title.display_name, 46)});
+    const content_x = panel.x + 16;
+    const fit = fitChars(panel.w - 32);
+    drawText(content_x, panel.y + 16, colors.pink, "SELECTED GAME", .{});
+    drawText(content_x, panel.y + 50, if (title.artwork_path == null) colors.orange else colors.white, "{s}", .{head(title.display_name, fit)});
     const sync_state = titleSyncState(title);
-    drawText(panel.x + 16, panel.y + 76, syncStateColor(sync_state), "{s}", .{syncStateDescription(sync_state)});
+    drawText(content_x, panel.y + 84, syncStateColor(sync_state), "{s}", .{syncStateDescription(sync_state)});
     if (mod_count != 0) {
-        drawText(panel.x + 16, panel.y + 100, colors.yellow, "{d} VERSION(S) AVAILABLE", .{mod_count});
-        drawText(panel.x + 16, panel.y + 126, colors.dim, "Click this game again to browse versions.", .{});
+        drawText(content_x, panel.y + 118, colors.yellow, "{d} VERSION(S)", .{mod_count});
+        drawText(content_x, panel.y + 152, colors.dim, "{s}", .{head("SPACE opens them, hold for all.", fit)});
     }
-    const artwork_y = if (mod_count == 0) panel.y + 112 else panel.y + 202;
-    if (title.artwork_path == null) drawText(panel.x + 16, artwork_y - 28, colors.orange, "ARTWORK NEEDED", .{});
-    drawButton(.{ .x = panel.x + 16, .y = artwork_y, .w = 168, .h = 26 }, if (title.artwork_path == null) colors.yellow else colors.orange, "NEXT ART");
+    const artwork_y = if (mod_count == 0) page_layout.artwork_plain_y else page_layout.artwork_versions_y;
+    if (title.artwork_path == null) drawText(content_x, artwork_y - 30, colors.orange, "ARTWORK NEEDED", .{});
+    drawButton(selectedArtworkButton(width, mod_count != 0), if (title.artwork_path == null) colors.yellow else colors.orange, "NEXT ART", !isBusy());
 }
 
 fn drawModBrowser(width: f32, height: f32) void {
@@ -797,12 +1057,13 @@ fn drawModBrowser(width: f32, height: f32) void {
         state.mod_browser_open = false;
         return;
     }
-    drawText(44, page_layout.library_top, colors.white, "{s} - VERSIONS", .{head(title.display_name, 64)});
-    drawButton(.{ .x = width - 184, .y = page_layout.library_top - 10, .w = 140, .h = 30 }, colors.orange, "BACK TO GAMES");
-    drawRect(.{ .x = 44, .y = page_layout.library_top + 22, .w = width - 88, .h = 2 }, colors.border);
+    drawTextSlice(44, page_layout.library_top, 4, colors.white, "VERSIONS");
+    drawButton(layout.modBack(width), colors.pink, "BACK TO GAMES", true);
+    drawRect(.{ .x = 44, .y = page_layout.library_top + 42, .w = width - 88, .h = 2 }, colors.pink);
+    drawText(44, page_layout.library_top + 52, colors.dim, "{s}", .{head(title.display_name, fitChars(width - 88))});
 
     const cards = data.count + 1;
-    const area = Rect{ .x = 44, .y = page_layout.grid_y, .w = width - 88, .h = height - page_layout.grid_y - 118 };
+    const area = Rect{ .x = 44, .y = page_layout.versions_grid_y, .w = width - 88, .h = height - page_layout.versions_grid_y - 130 };
     const columns = std.math.clamp(@as(usize, @intFromFloat(@ceil((area.w + 16) / 220))), 2, 5);
     const gutter: f32 = 16;
     const card_width = (area.w - gutter * @as(f32, @floatFromInt(columns - 1))) / @as(f32, @floatFromInt(columns));
@@ -817,36 +1078,38 @@ fn drawModBrowser(width: f32, height: f32) void {
             .h = card_height,
         };
         const selected = card_index == state.selected_mod;
+        const chosen = variantSelected(title, data, card_index);
         if (card_index == 0) {
-            drawModBrowserCard(rect, textureForTitle(state.preview_scroll), title.display_name, "LATEST / BASE", selected);
+            drawModBrowserCard(rect, textureForTitle(state.preview_scroll), title.display_name, "LATEST / BASE", selected, chosen);
         } else if (card_index <= data.local_count) {
             const revision = title.local_revisions[card_index - 1];
-            drawModBrowserCard(rect, textureForTitle(state.preview_scroll), revision.name, revisionLabel(revision.revision), selected);
+            drawModBrowserCard(rect, textureForTitle(state.preview_scroll), revision.name, revisionLabel(revision.revision), selected, chosen);
         } else {
             const registry_index = data.matches[card_index - 1 - data.local_count];
             const entry = data.catalog.?.entries()[registry_index];
             syncModArtwork(registry_index);
-            drawModBrowserCard(rect, textureForMod(registry_index), entry.name, entry.version, selected);
+            drawModBrowserCard(rect, textureForMod(registry_index), entry.name, entry.version, selected, chosen);
         }
     }
     if (state.selected_mod != 0) {
         if (state.selected_mod <= data.local_count) {
             const revision = title.local_revisions[state.selected_mod - 1];
-            drawButton(.{ .x = 44, .y = height - 74, .w = 168, .h = 30 }, colors.good, "READY FOR SYNC");
-            drawText(224, height - 66, colors.dim, "{s} - {s}", .{ revision.name, revisionLabel(revision.revision) });
+            drawButton(layout.modPrimary(height), colors.good, "READY FOR SYNC", true);
+            drawText(layout.modSecondary(height).x, height - 84, colors.dim, "{s} - {s}", .{ head(revision.name, 24), revisionLabel(revision.revision) });
             return;
         }
         const registry_index = data.matches[state.selected_mod - 1 - data.local_count];
         const entry = data.catalog.?.entries()[registry_index];
         const cached = isModCached(entry);
-        drawButton(.{ .x = 44, .y = height - 74, .w = 168, .h = 30 }, if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else "DOWNLOAD MOD");
+        drawButton(layout.modPrimary(height), if (cached) colors.good else colors.yellow, if (cached) "READY FOR SYNC" else "DOWNLOAD MOD", !isBusy());
         const artwork_slot = modArtworkSlot(registry_index);
         const has_gallery = artwork_slot != null and artwork_slot.?.gallery_count > 1;
-        drawButton(.{ .x = 224, .y = height - 74, .w = 168, .h = 30 }, colors.orange, if (has_gallery) "NEXT ART" else "VIEW MOD PAGE");
-        if (has_gallery) drawButton(.{ .x = 404, .y = height - 74, .w = 148, .h = 30 }, colors.border, "VIEW MOD PAGE");
-        drawText(if (has_gallery) 572 else 416, height - 66, colors.dim, "{s} {s}", .{ entry.name, entry.version });
+        drawButton(layout.modSecondary(height), colors.orange, if (has_gallery) "NEXT ART" else "VIEW MOD PAGE", !isBusy());
+        if (has_gallery) drawButton(layout.modTertiary(height), colors.ribbon, "VIEW MOD PAGE", true);
+        const text_x = if (has_gallery) layout.modTertiary(height).x + 248 else layout.modTertiary(height).x;
+        drawText(text_x, height - 84, colors.dim, "{s} {s}", .{ head(entry.name, 20), entry.version });
     } else {
-        drawText(44, height - 66, colors.dim, "Original game", .{});
+        drawText(44, height - 84, colors.dim, "Original game", .{});
     }
 }
 
@@ -860,17 +1123,18 @@ fn revisionLabel(revision: u8) []const u8 {
     };
 }
 
-fn drawModBrowserCard(rect: Rect, texture: ?*const ArtworkTexture, name: []const u8, version: []const u8, selected: bool) void {
+fn drawModBrowserCard(rect: Rect, texture: ?*const ArtworkTexture, name: []const u8, version: []const u8, selected: bool, chosen: bool) void {
     drawRect(rect, colors.inset);
-    const image_rect = Rect{ .x = rect.x + 8, .y = rect.y + 8, .w = rect.w - 16, .h = rect.h - 52 };
+    const image_rect = Rect{ .x = rect.x + 8, .y = rect.y + 8, .w = rect.w - 16, .h = rect.h - 62 };
     if (texture) |artwork| {
         drawModArtwork(image_rect, artwork);
     } else {
         drawCoverName(image_rect, name);
     }
-    drawText(rect.x + 10, rect.y + rect.h - 32, selectedColor(selected), "{s}", .{head(name, @max(@as(usize, 8), @as(usize, @intFromFloat((rect.w - 20) / 8))))});
-    drawText(rect.x + 10, rect.y + rect.h - 14, colors.dim, "{s}", .{version});
+    drawText(rect.x + 10, rect.y + rect.h - 42, selectedColor(selected), "{s}", .{head(name, fitChars(rect.w - 20))});
+    drawText(rect.x + 10, rect.y + rect.h - 20, colors.dim, "{s}", .{head(version, fitChars(rect.w - 20))});
     drawOutline(rect, if (selected) colors.yellow else colors.border, if (selected) 3 else 1);
+    drawSelectionBadge(rect, chosen);
 }
 
 fn selectedColor(selected: bool) Color {
@@ -940,7 +1204,7 @@ fn drawCover(rect: Rect, texture: ?*const ArtworkTexture, display_name: []const 
 }
 
 fn drawCoverName(rect: Rect, display_name: []const u8) void {
-    const maximum = @max(@as(usize, 8), @as(usize, @intFromFloat((rect.w - 20) / 8)));
+    const maximum = @max(@as(usize, 6), fitChars(rect.w - 20));
     var offset: usize = 0;
     var lines: [3][]const u8 = @splat("");
     var count: usize = 0;
@@ -957,10 +1221,10 @@ fn drawCoverName(rect: Rect, display_name: []const u8) void {
         while (offset < display_name.len and display_name[offset] == ' ') offset += 1;
     }
     const visible_count = @min(count, lines.len);
-    const first_y = rect.y + (rect.h - @as(f32, @floatFromInt(visible_count)) * 16) * 0.5 + 4;
+    const first_y = rect.y + (rect.h - @as(f32, @floatFromInt(visible_count)) * (text_cell + 4)) * 0.5 + 4;
     for (lines[0..visible_count], 0..) |line, index| {
-        const width = @as(f32, @floatFromInt(line.len * 8));
-        drawText(rect.x + (rect.w - width) * 0.5, first_y + @as(f32, @floatFromInt(index)) * 16, colors.orange, "{s}", .{line});
+        const width = font.advance(line.len, text_scale);
+        drawText(rect.x + (rect.w - width) * 0.5, first_y + @as(f32, @floatFromInt(index)) * (text_cell + 4), colors.orange, "{s}", .{line});
     }
 }
 
@@ -1078,9 +1342,17 @@ export fn event(event_ptr: [*c]const sapp.Event) void {
     switch (input.type) {
         .MOUSE_DOWN => if (input.mouse_button == .LEFT) handleClick(input.mouse_x / scale, input.mouse_y / scale),
         .MOUSE_SCROLL => scrollTitles(input.scroll_y),
-        .KEY_DOWN => if (!input.key_repeat) switch (input.key_code) {
+        .KEY_UP => if (input.key_code == .SPACE) {
+            state.space_hold_used = false;
+        },
+        .KEY_DOWN => if (input.key_code == .SPACE) {
+            if (input.key_repeat) handleSpaceHold() else handleSpaceTap();
+        } else if (!input.key_repeat) switch (input.key_code) {
             .F5 => runRefresh(),
             .ENTER => if (state.mod_browser_open) activateSelectedMod() else runPreferredSync(),
+            .BACKSPACE => if (state.mod_browser_open) {
+                state.mod_browser_open = false;
+            },
             .LEFT => if (state.mod_browser_open) moveModBrowserSelection(-1) else moveTitleSelection(-1),
             .RIGHT => if (state.mod_browser_open) moveModBrowserSelection(1) else moveTitleSelection(1),
             .UP => if (state.mod_browser_open) moveModBrowserSelection(-@as(isize, @intCast(modBrowserColumns()))) else moveTitleSelection(-@as(isize, @intCast(currentGridLayout().columns))),
@@ -1176,10 +1448,122 @@ fn activateSelectedMod() void {
     downloadRegistryIndex(data.matches[state.selected_mod - 1 - data.local_count]);
 }
 
+fn selectedTitle() ?importer.Title {
+    const scan = state.scan orelse return null;
+    const titles = scan.preview().titles;
+    if (titles.len == 0 or state.preview_scroll >= titles.len) return null;
+    return titles[state.preview_scroll];
+}
+
+/// A tap opens the version list when a game has alternates, because choosing
+/// between them is the real decision. Games with nothing to choose toggle
+/// directly.
+fn handleSpaceTap() void {
+    if (state.mod_browser_open) {
+        toggleSelectedVariant();
+        return;
+    }
+    const title = selectedTitle() orelse return;
+    if (compatibleModCount(title) == 0) {
+        toggleSelectedTitle();
+        return;
+    }
+    state.selected_mod = 0;
+    state.mod_browser_open = true;
+    setStatus(true, "{s}: pick versions with SPACE, BACKSPACE to go back.", .{head(title.display_name, 40)});
+}
+
+/// Holding takes the whole set, base ROM included, so a game with many versions
+/// does not need one press each.
+fn handleSpaceHold() void {
+    if (state.space_hold_used) return;
+    const title = selectedTitle() orelse return;
+    if (compatibleModCount(title) == 0) return;
+    state.space_hold_used = true;
+    selectAllVariants(title);
+}
+
+fn selectAllVariants(title: importer.Title) void {
+    const allocator = std.heap.c_allocator;
+    const data = selectedModBrowserData() orelse return;
+    var chosen: usize = 0;
+    for (0..data.count + 1) |index| {
+        const key = variantKey(title, data, index) orelse continue;
+        state.selected.select(allocator, key) catch break;
+        chosen += 1;
+    }
+    setStatus(true, "{s}: {d} version(s) selected.", .{ head(title.display_name, 36), chosen });
+}
+
+fn toggleSelectedTitle() void {
+    const title = selectedTitle() orelse return;
+    const now = state.selected.toggle(std.heap.c_allocator, title.content_hash) catch {
+        setStatus(false, "Could not update the selection.", .{});
+        return;
+    };
+    if (!now) deselectVariantsOf(title);
+    setStatus(true, "{s}: {s}", .{
+        head(title.display_name, 48),
+        if (now) "selected for the cart." else "left off the cart.",
+    });
+}
+
+/// A variant is stored beside its base ROM, so dropping the base drops every
+/// alternate version with it.
+fn deselectVariantsOf(title: importer.Title) void {
+    for (title.local_revisions) |revision| state.selected.deselect(revision.content_hash);
+    const catalog = if (state.mod_registry) |*value| value else return;
+    var matches: [registry.maximum_variants_per_title]usize = undefined;
+    const count = @min(importer.matchingRegistryVariants(title, catalog, &matches), matches.len);
+    for (matches[0..count]) |index| state.selected.deselect(sel.modKey(catalog.entries()[index].id));
+}
+
+fn variantKey(title: importer.Title, data: ModBrowserData, index: usize) ?sel.Key {
+    if (index == 0) return title.content_hash;
+    if (index <= data.local_count) return title.local_revisions[index - 1].content_hash;
+    const catalog = data.catalog orelse return null;
+    if (index > data.count) return null;
+    return sel.modKey(catalog.entries()[data.matches[index - 1 - data.local_count]].id);
+}
+
+fn variantName(title: importer.Title, data: ModBrowserData, index: usize) []const u8 {
+    if (index == 0) return title.display_name;
+    if (index <= data.local_count) return title.local_revisions[index - 1].name;
+    const catalog = data.catalog orelse return title.display_name;
+    if (index > data.count) return title.display_name;
+    return catalog.entries()[data.matches[index - 1 - data.local_count]].name;
+}
+
+fn variantSelected(title: importer.Title, data: ModBrowserData, index: usize) bool {
+    const key = variantKey(title, data, index) orelse return false;
+    return state.selected.has(key);
+}
+
+fn toggleSelectedVariant() void {
+    const title = selectedTitle() orelse return;
+    const data = selectedModBrowserData() orelse return;
+    const key = variantKey(title, data, state.selected_mod) orelse return;
+    const allocator = std.heap.c_allocator;
+    const now = state.selected.toggle(allocator, key) catch {
+        setStatus(false, "Could not update the selection.", .{});
+        return;
+    };
+    if (state.selected_mod == 0) {
+        if (!now) deselectVariantsOf(title);
+    } else if (now) {
+        // The cart stores a variant under its base title, so the base comes too.
+        state.selected.select(allocator, title.content_hash) catch {};
+    }
+    setStatus(true, "{s}: {s}", .{
+        head(variantName(title, data, state.selected_mod), 48),
+        if (now) "selected for the cart." else "left off the cart.",
+    });
+}
+
 fn handleClick(x: f32, y: f32) void {
     const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
     const width = metrics.width;
-    if (contains(layout.addGames(), x, y)) {
+    if (contains(layout.addGames(width), x, y)) {
         openFilePicker(.games);
         return;
     }
@@ -1188,13 +1572,11 @@ fn handleClick(x: f32, y: f32) void {
         return;
     }
     if (isBusy()) return;
+    if (handleRibbonClick(width, x, y)) return;
     if (state.mod_browser_open) {
         handleModBrowserClick(width, metrics.height, x, y);
         return;
     }
-    if (downloadSelectedMod(width, x, y)) return;
-    if (openSelectedModPage(width, x, y)) return;
-    if (selectCompatibleMod(width, x, y)) return;
     if (advanceSelectedGameArtwork(width, x, y)) return;
     if (selectGridTitle(width, metrics.height, x, y)) return;
     if (contains(layout.refresh(width), x, y)) {
@@ -1206,14 +1588,6 @@ fn handleClick(x: f32, y: f32) void {
         state.preview_destination = .usb;
         runSync(.usb);
     }
-}
-
-fn openSelectedModPage(width: f32, x: f32, y: f32) bool {
-    const button = Rect{ .x = page_layout.detailX(width) + page_layout.mod_page_button_offset, .y = page_layout.mod_button_y, .w = 152, .h = 26 };
-    if (!contains(button, x, y)) return false;
-    const selected = selectedRegistryEntry() orelse return false;
-    openRegistryEntryPage(selected);
-    return true;
 }
 
 fn openRegistryEntryPage(selected: registry.Entry) void {
@@ -1234,13 +1608,6 @@ fn openRegistryEntryPage(selected: registry.Entry) void {
     setStatus(true, "Opened {s}'s project page.", .{selected.name});
 }
 
-fn selectedRegistryEntry() ?registry.Entry {
-    const data = selectedModBrowserData() orelse return null;
-    if (state.selected_mod <= data.local_count or state.selected_mod > data.count) return null;
-    const catalog = data.catalog orelse return null;
-    return catalog.entries()[data.matches[state.selected_mod - 1 - data.local_count]];
-}
-
 fn selectedModBrowserData() ?ModBrowserData {
     const scan = state.scan orelse return null;
     const titles = scan.preview().titles;
@@ -1250,35 +1617,6 @@ fn selectedModBrowserData() ?ModBrowserData {
     const registry_count = if (catalog) |value| @min(importer.matchingRegistryVariants(titles[state.preview_scroll], value, &matches), matches.len) else 0;
     const local_count = @min(titles[state.preview_scroll].local_revisions.len, registry.maximum_variants_per_title);
     return .{ .catalog = catalog, .matches = matches, .local_count = local_count, .registry_count = registry_count, .count = @min(local_count + registry_count, registry.maximum_variants_per_title) };
-}
-
-fn selectCompatibleMod(width: f32, x: f32, y: f32) bool {
-    if (width < 840 or x < page_layout.detailContentX(width) or x > width - page_layout.right_margin) return false;
-    const scan = state.scan orelse return false;
-    const titles = scan.preview().titles;
-    if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
-    const data = selectedModBrowserData() orelse return false;
-    const shown = @min(data.count, 3);
-    for (0..shown) |row| {
-        const row_y = page_layout.mod_first_y + @as(f32, @floatFromInt(row)) * page_layout.mod_row_height;
-        if (y >= row_y - 8 and y <= row_y + 12) {
-            state.selected_mod = row + 1;
-            return true;
-        }
-    }
-    return false;
-}
-
-fn downloadSelectedMod(width: f32, x: f32, y: f32) bool {
-    if (width < 840 or !contains(.{ .x = page_layout.detailContentX(width), .y = page_layout.mod_button_y, .w = 196, .h = 30 }, x, y)) return false;
-    const scan = state.scan orelse return false;
-    const titles = scan.preview().titles;
-    if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
-    const data = selectedModBrowserData() orelse return false;
-    if (data.registry_count == 0) return false;
-    const selected = if (state.selected_mod > data.local_count and state.selected_mod <= data.count) state.selected_mod - 1 - data.local_count else 0;
-    downloadRegistryIndex(data.matches[@min(selected, data.registry_count - 1)]);
-    return true;
 }
 
 fn downloadRegistryIndex(registry_index: usize) void {
@@ -1297,9 +1635,7 @@ fn advanceSelectedGameArtwork(width: f32, x: f32, y: f32) bool {
     const titles = scan.preview().titles;
     if (titles.len == 0 or state.preview_scroll >= titles.len) return false;
     const title = titles[state.preview_scroll];
-    const button_y = if (compatibleModCount(title) == 0) page_layout.artwork_cycle_y else page_layout.grid_y + 202;
-    const button = Rect{ .x = page_layout.detailContentX(width), .y = button_y, .w = 168, .h = 26 };
-    if (width < 840 or !contains(button, x, y)) return false;
+    if (width < 840 or !contains(selectedArtworkButton(width, compatibleModCount(title) != 0), x, y)) return false;
     if (state.artwork_worker != null) {
         setStatus(false, "Artwork lookup is already in progress.", .{});
         return true;
@@ -1371,8 +1707,8 @@ fn queueDrop() void {
 }
 
 fn pickerPanel(width: f32, height: f32) Rect {
-    const panel_width = @min(760, width - 80);
-    const panel_height = @min(640, height - 80);
+    const panel_width = @min(940, width - 80);
+    const panel_height = @min(720, height - 80);
     return .{ .x = (width - panel_width) * 0.5, .y = (height - panel_height) * 0.5, .w = panel_width, .h = panel_height };
 }
 
@@ -1381,33 +1717,34 @@ fn drawFilePicker(width: f32, height: f32) void {
     const panel = pickerPanel(width, height);
     drawRect(panel, colors.panel);
     drawOutline(panel, colors.pink, 3);
-    if (state.picker_kind == .games) {
-        drawText(panel.x + 20, panel.y + 22, colors.yellow, "SELECT ROM FOLDER OR RETROARCH PLAYLIST", .{});
-    } else {
-        drawText(panel.x + 20, panel.y + 22, colors.yellow, "SELECT MOD CATALOG", .{});
-    }
+    const accept_label = pickerAcceptLabel();
+    drawText(panel.x + 20, panel.y + 22, colors.yellow, "{s}", .{if (state.picker_kind == .games) "SELECT ROM FOLDER OR PLAYLIST" else "SELECT MOD CATALOG"});
     const shown_path = if (state.picker_path.len == 0) "Computer" else state.picker_path.slice();
-    drawText(panel.x + 20, panel.y + 52, colors.dim, "{s}", .{head(shown_path, @max(@as(usize, 16), @as(usize, @intFromFloat((panel.w - 40) / 8))))});
-    drawButton(.{ .x = panel.x + 20, .y = panel.y + 78, .w = 80, .h = 28 }, colors.orange, "UP");
-    if (state.picker_kind == .games) {
-        drawButton(.{ .x = panel.x + 112, .y = panel.y + 78, .w = 176, .h = 28 }, colors.yellow, "USE THIS FOLDER");
-    } else {
-        drawButton(.{ .x = panel.x + 112, .y = panel.y + 78, .w = 176, .h = 28 }, colors.yellow, "OPEN SELECTED JSON");
-    }
-    drawButton(.{ .x = panel.x + panel.w - 112, .y = panel.y + 78, .w = 92, .h = 28 }, colors.border, "CANCEL");
-    const list = Rect{ .x = panel.x + 20, .y = panel.y + 120, .w = panel.w - 40, .h = panel.h - 140 };
+    drawText(panel.x + 20, panel.y + 56, colors.dim, "{s}", .{head(shown_path, fitChars(panel.w - 40))});
+    drawButton(layout.pickerUp(panel), colors.orange, "UP", true);
+    drawButton(layout.pickerAccept(panel), colors.yellow, accept_label, true);
+    drawButton(layout.pickerCancel(panel), colors.ribbon, "CANCEL", true);
+    const list = Rect{ .x = panel.x + 20, .y = panel.y + 140, .w = panel.w - 40, .h = panel.h - 160 };
     drawRect(list, colors.inset);
     drawOutline(list, colors.border, 1);
     const end = @min(state.picker_count, state.picker_scroll + picker_visible_rows);
     for (state.picker_scroll..end) |index| {
-        const row = Rect{ .x = list.x + 6, .y = list.y + 6 + @as(f32, @floatFromInt(index - state.picker_scroll)) * 32, .w = list.w - 12, .h = 28 };
+        const row = pickerRow(list, index);
         const selected = index == state.picker_selected;
-        if (selected) drawRect(row, colors.border);
+        if (selected) drawRect(row, colors.ribbon_dim);
         const entry = state.picker_entries[index];
-        drawText(row.x + 8, row.y + 8, if (entry.directory) colors.yellow else colors.white, "{s}{s}", .{ if (entry.directory) "[DIR] " else "", head(entry.slice(), @max(@as(usize, 8), @as(usize, @intFromFloat((row.w - 24) / 8)))) });
+        drawText(row.x + 8, row.y + 8, if (entry.directory) colors.yellow else colors.white, "{s}{s}", .{ if (entry.directory) "[DIR] " else "", head(entry.slice(), fitChars(row.w - 24) -| 6) });
     }
     if (state.picker_count == 0) drawText(list.x + 12, list.y + 16, colors.dim, "No matching entries in this location.", .{});
-    if (state.picker_count == picker_max_entries) drawText(list.x + list.w - 188, list.y + list.h - 18, colors.orange, "LIST TRUNCATED", .{});
+    if (state.picker_count == picker_max_entries) drawText(list.x + 12, list.y + list.h - 24, colors.orange, "LIST TRUNCATED", .{});
+}
+
+fn pickerAcceptLabel() []const u8 {
+    return if (state.picker_kind == .games) "USE THIS FOLDER" else "OPEN SELECTED JSON";
+}
+
+fn pickerRow(list: Rect, index: usize) Rect {
+    return .{ .x = list.x + 6, .y = list.y + 6 + @as(f32, @floatFromInt(index - state.picker_scroll)) * 36, .w = list.w - 12, .h = 32 };
 }
 
 fn openFilePicker(kind: PickerKind) void {
@@ -1485,15 +1822,15 @@ fn scrollPicker(delta: f32) void {
 fn handlePickerClick(x: f32, y: f32) void {
     const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
     const panel = pickerPanel(metrics.width, metrics.height);
-    if (contains(.{ .x = panel.x + panel.w - 112, .y = panel.y + 78, .w = 92, .h = 28 }, x, y)) {
+    if (contains(layout.pickerCancel(panel), x, y)) {
         state.picker_open = false;
         return;
     }
-    if (contains(.{ .x = panel.x + 20, .y = panel.y + 78, .w = 80, .h = 28 }, x, y)) {
+    if (contains(layout.pickerUp(panel), x, y)) {
         pickerGoUp();
         return;
     }
-    if (contains(.{ .x = panel.x + 112, .y = panel.y + 78, .w = 176, .h = 28 }, x, y)) {
+    if (contains(layout.pickerAccept(panel), x, y)) {
         if (state.picker_kind == .games) {
             const selected = if (state.picker_selected < state.picker_count) state.picker_entries[state.picker_selected] else PickerEntry{};
             if (selected.len != 0 and !selected.directory) {
@@ -1504,9 +1841,9 @@ fn handlePickerClick(x: f32, y: f32) void {
         }
         return;
     }
-    const list = Rect{ .x = panel.x + 20, .y = panel.y + 120, .w = panel.w - 40, .h = panel.h - 140 };
+    const list = Rect{ .x = panel.x + 20, .y = panel.y + 140, .w = panel.w - 40, .h = panel.h - 160 };
     if (!contains(list, x, y)) return;
-    const row_index: usize = @intFromFloat(@max(0, @floor((y - list.y - 6) / 32)));
+    const row_index: usize = @intFromFloat(@max(0, @floor((y - list.y - 6) / 36)));
     const index = state.picker_scroll + row_index;
     if (index >= state.picker_count) return;
     const entry = state.picker_entries[index];
@@ -1833,13 +2170,13 @@ fn syncModArtwork(registry_index: usize) void {
 }
 
 fn handleModBrowserClick(width: f32, height: f32, x: f32, y: f32) void {
-    if (contains(.{ .x = width - 184, .y = page_layout.library_top - 10, .w = 140, .h = 30 }, x, y)) {
+    if (contains(layout.modBack(width), x, y)) {
         state.mod_browser_open = false;
         return;
     }
     const selected = selectedModBrowserData() orelse return;
     const cards = selected.count + 1;
-    const area = Rect{ .x = 44, .y = page_layout.grid_y, .w = width - 88, .h = height - page_layout.grid_y - 118 };
+    const area = Rect{ .x = 44, .y = page_layout.versions_grid_y, .w = width - 88, .h = height - page_layout.versions_grid_y - 130 };
     const columns = std.math.clamp(@as(usize, @intFromFloat(@ceil((area.w + 16) / 220))), 2, 5);
     const gutter: f32 = 16;
     const card_width = (area.w - gutter * @as(f32, @floatFromInt(columns - 1))) / @as(f32, @floatFromInt(columns));
@@ -1860,15 +2197,15 @@ fn handleModBrowserClick(width: f32, height: f32, x: f32, y: f32) void {
     }
     if (state.selected_mod == 0) return;
     if (state.selected_mod <= selected.local_count) return;
-    if (contains(.{ .x = 44, .y = height - 74, .w = 168, .h = 30 }, x, y)) {
+    if (contains(layout.modPrimary(height), x, y)) {
         downloadRegistryIndex(selected.matches[state.selected_mod - 1 - selected.local_count]);
-    } else if (contains(.{ .x = 224, .y = height - 74, .w = 168, .h = 30 }, x, y)) {
+    } else if (contains(layout.modSecondary(height), x, y)) {
         const registry_index = selected.matches[state.selected_mod - 1 - selected.local_count];
         const slot = modArtworkSlot(registry_index);
         if (slot != null and slot.?.gallery_count > 1) {
             cycleModArtwork(registry_index);
         } else openRegistryEntryPage(selected.catalog.?.entries()[registry_index]);
-    } else if (contains(.{ .x = 404, .y = height - 74, .w = 148, .h = 30 }, x, y)) {
+    } else if (contains(layout.modTertiary(height), x, y)) {
         const registry_index = selected.matches[state.selected_mod - 1 - selected.local_count];
         const slot = modArtworkSlot(registry_index);
         if (slot != null and slot.?.gallery_count > 1) openRegistryEntryPage(selected.catalog.?.entries()[registry_index]);
@@ -1966,6 +2303,79 @@ fn artworkCachePath(allocator: std.mem.Allocator) ![]u8 {
         try allocator.dupe(u8, ".");
     defer allocator.free(root);
     return std.fs.path.join(allocator, &.{ root, "m64menu", "artwork" });
+}
+
+/// Card writes are slow in ways throughput alone does not explain, so each
+/// file's filesystem phases are recorded and flushed to a log the user can read
+/// after a sync, successful or not.
+const sync_log = struct {
+    var buffer: [128 * 1024]u8 = @splat(0);
+    var len: usize = 0;
+    var truncated = false;
+
+    fn reset() void {
+        len = 0;
+        truncated = false;
+    }
+
+    fn append(comptime format: []const u8, args: anytype) void {
+        if (truncated) return;
+        const written = std.fmt.bufPrint(buffer[len..], format, args) catch {
+            truncated = true;
+            return;
+        };
+        len += written.len;
+    }
+
+    fn slice() []const u8 {
+        return buffer[0..len];
+    }
+};
+
+fn microseconds(nanoseconds: u64) u64 {
+    return nanoseconds / 1000;
+}
+
+fn syncTrace(_: ?*anyopaque, entry: sdcard.TraceEvent) void {
+    switch (entry.phase) {
+        .begin => sync_log.append("BEGIN {s}\n", .{entry.path}),
+        .done => sync_log.append(
+            "DONE  {s} bytes={d} total={d}us mkdir={d}us open={d}us write={d}us commit={d}us\n",
+            .{
+                entry.path,
+                entry.bytes,
+                microseconds(entry.total_ns),
+                microseconds(entry.mkdir_ns),
+                microseconds(entry.open_ns),
+                microseconds(entry.write_ns),
+                microseconds(entry.commit_ns),
+            },
+        ),
+    }
+}
+
+fn syncLogPath(allocator: std.mem.Allocator) ![]u8 {
+    const environ = state.threaded.environ.process_environ;
+    const root = std.process.Environ.getAlloc(environ, allocator, if (@import("builtin").os.tag == .windows) "LOCALAPPDATA" else "XDG_CACHE_HOME") catch
+        std.process.Environ.getAlloc(environ, allocator, "HOME") catch
+        try allocator.dupe(u8, ".");
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "m64menu", "sd-sync.log" });
+}
+
+fn writeSyncLog(allocator: std.mem.Allocator, io: std.Io, failure: ?[]const u8) ?[]u8 {
+    if (failure) |name| sync_log.append("FAILED {s}\n", .{name});
+    if (sync_log.truncated) sync_log.append("(log truncated)\n", .{});
+    const path = syncLogPath(allocator) catch return null;
+    if (std.fs.path.dirname(path)) |parent| std.Io.Dir.cwd().createDirPath(io, parent) catch {
+        allocator.free(path);
+        return null;
+    };
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = sync_log.slice() }) catch {
+        allocator.free(path);
+        return null;
+    };
+    return path;
 }
 
 fn cartLibraryCachePath(allocator: std.mem.Allocator) ![]u8 {
@@ -2128,6 +2538,10 @@ fn runSync(destination: SyncDestination) void {
         setStatus(false, "Sync refused: no N64 library is ready.", .{});
         return;
     };
+    if (selectedTitleCount() == 0) {
+        setStatus(false, "Sync refused: no games are selected. Press SPACE on a game to select it.", .{});
+        return;
+    }
 
     var config = SyncConfig{
         .destination = destination,
@@ -2176,7 +2590,13 @@ fn runSync(destination: SyncDestination) void {
         },
     }
     if (!beginWorker()) return;
+    config.selection = selectionForCurrentLibrary(std.heap.c_allocator) catch {
+        cancelWorker();
+        setStatus(false, "Sync refused: the selection could not be captured.", .{});
+        return;
+    };
     state.worker = std.Thread.spawn(.{}, syncWorker, .{config}) catch |err| {
+        std.heap.c_allocator.free(config.selection);
         cancelWorker();
         setStatus(false, "Could not start sync: {s}", .{@errorName(err)});
         return;
@@ -2390,8 +2810,10 @@ fn discoverDevice(allocator: std.mem.Allocator, io: std.Io) DeviceOutcome {
 
 fn syncWorker(config: SyncConfig) void {
     const allocator = std.heap.c_allocator;
+    defer allocator.free(config.selection);
     const io = state.threaded.io();
     var result = SyncResult{ .destination = config.destination };
+    sync_log.reset();
 
     if (config.destination == .usb) {
         var info = deployer.probeDevice(allocator, io, config.deployer_path.slice(), config.port.slice()) catch |err| {
@@ -2417,6 +2839,12 @@ fn syncWorker(config: SyncConfig) void {
 
     const operation = syncFromStaging(allocator, io, staging, &config);
     if (operation) |_| {} else |err| result.err = @errorName(err);
+    if (config.destination == .direct_sd) {
+        if (writeSyncLog(allocator, io, result.err)) |path| {
+            allocator.free(path);
+            result.logged = true;
+        }
+    }
     std.Io.Dir.cwd().deleteTree(io, staging) catch |err| {
         result.cleanup_error = @errorName(err);
     };
@@ -2439,22 +2867,24 @@ fn syncFromStaging(
                 .rom_root = config.source_path.slice(),
                 .recursive = true,
                 .artwork_cache_root = artwork_cache,
+                .selection = config.selection,
             }, .{ .context = null, .callback = importProgress });
             defer imported.deinit(allocator);
             if (!std.mem.eql(u8, &libraryFingerprint(imported.titles), &config.source_fingerprint)) return error.SourceChanged;
             imported_titles = imported.titles;
-            try stageCachedMods(allocator, io, staging, imported_titles);
+            try stageCachedMods(allocator, io, staging, imported_titles, config.selection);
         },
         .automatic, .playlist => {
             const playlist_path = config.source_path.slice();
             var imported = try importer.importRetroArchPlaylistPath(allocator, io, staging, playlist_path, .{
                 .environ = state.threaded.environ.process_environ,
                 .artwork_cache_root = artwork_cache,
+                .selection = config.selection,
             }, .{ .context = null, .callback = importProgress });
             defer imported.deinit(allocator);
             if (!std.mem.eql(u8, &libraryFingerprint(imported.preview.titles), &config.source_fingerprint)) return error.SourceChanged;
             imported_titles = imported.preview.titles;
-            try stageCachedMods(allocator, io, staging, imported_titles);
+            try stageCachedMods(allocator, io, staging, imported_titles, config.selection);
         },
     }
 
@@ -2469,7 +2899,7 @@ fn syncFromStaging(
             try sdcard.syncFromStaging(allocator, io, staging, config.card_root.slice(), .{
                 .context = null,
                 .callback = sdProgress,
-            });
+            }, .{ .context = null, .callback = syncTrace });
         },
         .usb => {
             setStatus(true, "Staging complete; syncing over USB...", .{});
@@ -2482,12 +2912,14 @@ fn syncFromStaging(
     }
 }
 
-fn stageCachedMods(allocator: std.mem.Allocator, io: std.Io, staging: []const u8, titles: []const importer.Title) !void {
-    const revisions = try importer.stageLocalRevisions(allocator, io, staging, titles);
+fn stageCachedMods(allocator: std.mem.Allocator, io: std.Io, staging: []const u8, titles: []const importer.Title, selection: []const sel.Key) !void {
+    const revisions = try importer.stageLocalRevisions(allocator, io, staging, titles, selection);
     const catalog = &(state.mod_registry orelse return);
     const cache = try registryCachePath(allocator);
     defer allocator.free(cache);
-    const count = try importer.stageCachedVariants(allocator, io, staging, titles, catalog, cache);
+    const artwork_cache = try artworkCachePath(allocator);
+    defer allocator.free(artwork_cache);
+    const count = try importer.stageCachedVariants(allocator, io, staging, titles, catalog, cache, artwork_cache, selection);
     if (count + revisions != 0) setStatus(true, "Staged {d} alternate version(s).", .{count + revisions});
 }
 
@@ -2496,6 +2928,9 @@ fn findMenuRom(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
     defer allocator.free(executable_dir);
     const candidates = [_][]const []const u8{
         &.{ executable_dir, "sc64menu.n64" },
+        // Native menu builds land here. Prefer it to the legacy repository-root
+        // copy, which may be stale after `zig build menu`.
+        &.{ executable_dir, "..", "..", "..", "..", "zig-out", "bin", "sc64menu.n64" },
         &.{ executable_dir, "..", "..", "..", "..", "sc64menu.n64" },
         &.{"sc64menu.n64"},
     };
@@ -2781,6 +3216,9 @@ fn harvestModDownload(result: ModDownloadResult) void {
 }
 
 fn harvestRefresh(result: *RefreshResult) void {
+    // The merged library reports itself as a playlist, so the import that
+    // produced the new titles decides their default, not the aggregate.
+    const incoming_kind = result.source_kind;
     if (result.merge_existing and result.scan == null) {
         if (state.progressive_base) |base| if (state.scan) |*scan| {
             const restored = importer.cloneScanResult(std.heap.c_allocator, base.titles) catch null;
@@ -2835,6 +3273,7 @@ fn harvestRefresh(result: *RefreshResult) void {
     state.mod_browser_open = false;
     clearModArtworkSlots();
     state.preview_destination = if (state.card != null) .direct_sd else .usb;
+    seedSelection(incoming_kind);
 
     if (result.override_target_blocked) {
         setStatus(false, "That playlist could not be used. Drop {s} or a ROM folder instead.", .{expected_playlist_name});
@@ -2870,6 +3309,8 @@ fn harvestSync(result: SyncResult) void {
             setStatus(false, "USB sync refused: console is powered on.", .{});
         } else if (result.cleanup_error) |cleanup_name| {
             setStatus(false, "{s} failed: {s}; staging cleanup also failed: {s}.", .{ destination, name, cleanup_name });
+        } else if (result.logged) {
+            setStatus(false, "{s} failed: {s}. Details in %LOCALAPPDATA%\\m64menu\\sd-sync.log", .{ destination, name });
         } else {
             setStatus(false, "{s} failed: {s}.", .{ destination, name });
         }
@@ -2900,18 +3341,20 @@ fn titleSyncState(title: importer.Title) TitleSyncState {
             if (device.library) |library| return titleSyncStateFor(title, library.titles);
         },
     }
-    return .ADD;
+    return if (state.selected.has(title.content_hash)) .ADD else .SKIP;
 }
 
 fn titleSyncStateFor(title: importer.Title, installed_titles: anytype) TitleSyncState {
+    const selected = state.selected.has(title.content_hash);
     for (installed_titles) |installed| {
         if (!std.mem.eql(u8, installed.idSlice(), importer.titleIdSlice(&title.id))) continue;
+        if (!selected) return .REMOVE;
         // Legacy libraries did not have name sidecars, so the deployer falls back
         // to the ID. Matching IDs still mean the ROM is already installed.
         if (std.mem.eql(u8, installed.name, installed.idSlice()) or asciiNameEqual(installed.name, title.display_name)) return .KEEP;
         return .UPDATE;
     }
-    return .ADD;
+    return if (selected) .ADD else .SKIP;
 }
 
 fn libraryDiffFor(installed_titles: anytype) UiLibraryDiff {
@@ -2921,6 +3364,8 @@ fn libraryDiffFor(installed_titles: anytype) UiLibraryDiff {
         .ADD => result.add += 1,
         .KEEP => result.keep += 1,
         .UPDATE => result.update += 1,
+        .REMOVE => result.remove += 1,
+        .SKIP => {},
     };
     for (installed_titles) |installed| {
         var found = false;
@@ -2931,6 +3376,62 @@ fn libraryDiffFor(installed_titles: anytype) UiLibraryDiff {
         if (!found) result.remove += 1;
     }
     return result;
+}
+
+fn installedOnTarget(title: importer.Title) bool {
+    if (state.card) |card| if (card.library) |library| {
+        for (library.titles) |installed| if (std.mem.eql(u8, installed.idSlice(), importer.titleIdSlice(&title.id))) return true;
+    };
+    if (state.device) |device| if (device.library) |library| {
+        for (library.titles) |installed| if (std.mem.eql(u8, installed.idSlice(), importer.titleIdSlice(&title.id))) return true;
+    };
+    return false;
+}
+
+/// Folder imports are opt in and playlist imports are opt out, so a recursive
+/// sweep never silently queues everything it found. Anything already on the cart
+/// starts selected so a sync cannot quietly delete it.
+fn seedSelection(kind: SourceKind) void {
+    const scan = state.scan orelse return;
+    const allocator = std.heap.c_allocator;
+    const opt_out = kind != .directory;
+    for (scan.preview().titles) |title| {
+        if (state.known.has(title.content_hash)) continue;
+        state.known.select(allocator, title.content_hash) catch return;
+        if (opt_out or installedOnTarget(title)) state.selected.select(allocator, title.content_hash) catch return;
+    }
+}
+
+fn selectedTitleCount() usize {
+    const scan = state.scan orelse return 0;
+    var count: usize = 0;
+    for (scan.preview().titles) |title| {
+        if (state.selected.has(title.content_hash)) count += 1;
+    }
+    return count;
+}
+
+fn selectionForCurrentLibrary(allocator: std.mem.Allocator) ![]sel.Key {
+    var keys: std.ArrayList(sel.Key) = .empty;
+    errdefer keys.deinit(allocator);
+    const scan = state.scan orelse return keys.toOwnedSlice(allocator);
+    const catalog = if (state.mod_registry) |*value| value else null;
+    for (scan.preview().titles) |title| {
+        if (!state.selected.has(title.content_hash)) continue;
+        try keys.append(allocator, title.content_hash);
+        for (title.local_revisions) |revision| {
+            if (state.selected.has(revision.content_hash)) try keys.append(allocator, revision.content_hash);
+        }
+        if (catalog) |value| {
+            var matches: [registry.maximum_variants_per_title]usize = undefined;
+            const count = @min(importer.matchingRegistryVariants(title, value, &matches), matches.len);
+            for (matches[0..count]) |index| {
+                const key = sel.modKey(value.entries()[index].id);
+                if (state.selected.has(key)) try keys.append(allocator, key);
+            }
+        }
+    }
+    return keys.toOwnedSlice(allocator);
 }
 
 fn asciiNameEqual(installed: []const u8, desired: []const u8) bool {
@@ -2946,6 +3447,8 @@ fn syncStateColor(sync_state: TitleSyncState) Color {
         .ADD => colors.good,
         .KEEP => colors.dim,
         .UPDATE => colors.orange,
+        .SKIP => colors.dim,
+        .REMOVE => colors.bad,
     };
 }
 
@@ -2954,6 +3457,8 @@ fn syncStateDescription(sync_state: TitleSyncState) []const u8 {
         .ADD => "WILL BE ADDED",
         .KEEP => "ALREADY ON CART",
         .UPDATE => "WILL BE UPDATED",
+        .SKIP => "NOT SELECTED",
+        .REMOVE => "WILL BE REMOVED",
     };
 }
 
@@ -3020,9 +3525,10 @@ fn setStatus(good: bool, comptime format: []const u8, args: anytype) void {
 }
 
 fn drawStatus() void {
+    const width = ui_scale.metrics(sapp.widthf(), sapp.heightf()).width;
     lockWorker();
     defer unlockWorker();
-    drawText(44, page_layout.status_y, if (state.status_good) colors.good else colors.bad, "{s}", .{state.status[0..state.status_len]});
+    drawText(44, page_layout.status_y, if (state.status_good) colors.good else colors.bad, "{s}", .{head(state.status[0..state.status_len], fitChars(width - 88))});
 }
 
 fn head(value: []const u8, maximum: usize) []const u8 {
@@ -3046,18 +3552,50 @@ fn drawOutline(rect: Rect, color: Color, thickness: f32) void {
     drawRect(.{ .x = rect.x + rect.w - thickness, .y = rect.y, .w = thickness, .h = rect.h }, color);
 }
 
-fn drawButton(rect: Rect, color: Color, label: []const u8) void {
-    drawRect(rect, color);
-    drawText(rect.x + 12, rect.y + 11, colors.background, "{s}", .{label});
+fn drawButton(rect: Rect, color: Color, label: []const u8, enabled: bool) void {
+    const body = Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h - 4 };
+    const text_x = rect.x + (rect.w - font.advance(label.len, text_scale)) * 0.5;
+    const text_y = body.y + (body.h - text_cell) * 0.5;
+    if (!enabled) {
+        drawRect(body, colors.inset);
+        drawOutline(body, colors.border, 2);
+        drawTextSlice(text_x, text_y, text_scale, colors.dim, label);
+        return;
+    }
+    drawPill(rect, color);
+    drawTextSlice(text_x, text_y, text_scale, colors.black, label);
+}
+
+fn drawPill(rect: Rect, color: Color) void {
+    drawRect(.{ .x = rect.x + 2, .y = rect.y + 4, .w = rect.w, .h = rect.h - 4 }, colors.black);
+    drawRect(.{ .x = rect.x, .y = rect.y + 2, .w = rect.w, .h = rect.h - 2 }, colors.yellow);
+    drawRect(.{ .x = rect.x + 2, .y = rect.y, .w = rect.w - 4, .h = rect.h - 4 }, color);
 }
 
 fn drawText(x: f32, y: f32, color: Color, comptime format: []const u8, args: anytype) void {
-    const metrics = ui_scale.metrics(sapp.widthf(), sapp.heightf());
-    sdtx.canvas(metrics.width, metrics.height);
-    sdtx.font(0);
-    sdtx.color3b(color.r, color.g, color.b);
-    sdtx.pos(x / 8.0, y / 8.0);
-    sdtx.print(format, args);
+    var buffer: [768]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, format, args) catch return;
+    drawTextSlice(x, y, text_scale, color, text);
+}
+
+fn drawTextSlice(x: f32, y: f32, scale: f32, color: Color, text: []const u8) void {
+    const cell = @as(f32, @floatFromInt(font.cell)) * scale;
+    sgl.beginQuads();
+    sgl.c3b(color.r, color.g, color.b);
+    for (text, 0..) |code, index| {
+        const origin_x = x + @as(f32, @floatFromInt(index)) * cell;
+        for (font.glyph(code)) |run| {
+            const left = origin_x + @as(f32, @floatFromInt(run.x)) * scale;
+            const top = y + @as(f32, @floatFromInt(run.y)) * scale;
+            const right = left + @as(f32, @floatFromInt(run.width)) * scale;
+            const bottom = top + scale;
+            sgl.v2f(left, top);
+            sgl.v2f(right, top);
+            sgl.v2f(right, bottom);
+            sgl.v2f(left, bottom);
+        }
+    }
+    sgl.end();
 }
 
 fn contains(rect: Rect, x: f32, y: f32) bool {
@@ -3070,8 +3608,8 @@ pub fn main() void {
         .frame_cb = frame,
         .cleanup_cb = cleanup,
         .event_cb = event,
-        .width = 1120,
-        .height = 820,
+        .width = 1440,
+        .height = 900,
         .sample_count = 4,
         .high_dpi = true,
         .enable_dragndrop = true,

@@ -3,6 +3,7 @@ const zigimg = @import("zigimg");
 const builtin = @import("builtin");
 const bps = @import("bps");
 const registry = @import("registry");
+const sel = @import("selection");
 const vcdiff = @import("vcdiff");
 
 pub const maximum_rom_size = 78 * 1024 * 1024;
@@ -24,6 +25,9 @@ pub const Config = struct {
     retroarch_thumbnail_root: ?[]const u8 = null,
     artwork_cache_root: ?[]const u8 = null,
     recursive: bool = false,
+    /// Restricts staging to these content hashes. Scanning always reports every
+    /// ROM it finds; null stages all of them.
+    selection: ?[]const sel.Key = null,
     preview_progress: ?ScanProgress = null,
 };
 
@@ -358,6 +362,8 @@ pub const RetroArchDiscoveryOptions = struct {
     maximum_search_depth: usize = 7,
     environ: std.process.Environ = .empty,
     artwork_cache_root: ?[]const u8 = null,
+    /// Restricts staging to these content hashes; null stages every scanned ROM.
+    selection: ?[]const sel.Key = null,
     preview_progress: ?ScanProgress = null,
 };
 
@@ -399,22 +405,28 @@ pub fn stageLocalRevisions(
     io: std.Io,
     output_root: []const u8,
     titles: []const Title,
+    selection: ?[]const sel.Key,
 ) !usize {
     var staged: usize = 0;
     for (titles) |title| {
         if (title.local_revisions.len == 0) continue;
+        if (selection) |keys| if (!sel.containsKey(keys, title.content_hash)) continue;
         const title_id = titleIdSlice(&title.id);
-        const variants_root = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants" });
-        defer allocator.free(variants_root);
-        try std.Io.Dir.cwd().createDirPath(io, variants_root);
         var manifest: std.Io.Writer.Allocating = .init(allocator);
         defer manifest.deinit();
+        var wrote: usize = 0;
         for (title.local_revisions[0..@min(title.local_revisions.len, registry.maximum_variants_per_title)]) |revision| {
+            if (selection) |keys| if (!sel.containsKey(keys, revision.content_hash)) continue;
+            if (wrote == 0) {
+                const variants_root = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants" });
+                defer allocator.free(variants_root);
+                try std.Io.Dir.cwd().createDirPath(io, variants_root);
+            }
             const id = try std.fmt.allocPrint(allocator, "revision-{d}", .{revision.revision});
             defer allocator.free(id);
             const filename = try std.fmt.allocPrint(allocator, "{s}.z64", .{id});
             defer allocator.free(filename);
-            const destination = try std.fs.path.join(allocator, &.{ variants_root, filename });
+            const destination = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants", filename });
             defer allocator.free(destination);
             const rom = try readNormalizedRom(allocator, io, revision.rom_path);
             defer allocator.free(rom);
@@ -423,6 +435,7 @@ pub fn stageLocalRevisions(
             defer allocator.free(name);
             try manifest.writer.print("{s},{s},{s},\n", .{ id, name, filename });
             staged += 1;
+            wrote += 1;
         }
         const manifest_path = try std.fs.path.join(allocator, &.{ output_root, "menu", "title", title_id, "variants.csv" });
         defer allocator.free(manifest_path);
@@ -438,12 +451,15 @@ pub fn stageCachedVariants(
     titles: []const Title,
     catalog: *const registry.Registry,
     cache_directory: []const u8,
+    artwork_cache_directory: []const u8,
+    selection: ?[]const sel.Key,
 ) !usize {
     var staged: usize = 0;
     for (titles) |title| {
         var matches: [registry.maximum_variants_per_title]usize = undefined;
         const count = @min(matchingRegistryVariants(title, catalog, &matches), matches.len);
         if (count == 0) continue;
+        if (selection) |keys| if (!sel.containsKey(keys, title.content_hash)) continue;
         var manifest: std.Io.Writer.Allocating = .init(allocator);
         defer manifest.deinit();
         const title_id = titleIdSlice(&title.id);
@@ -456,6 +472,7 @@ pub fn stageCachedVariants(
         for (matches[0..count]) |registry_index| {
             if (used >= registry.maximum_variants_per_title) break;
             const entry = catalog.entries()[registry_index];
+            if (selection) |keys| if (!sel.containsKey(keys, sel.modKey(entry.id))) continue;
             const base_path = matchingRevisionPath(title, entry.base.normalizedCrc32, entry.base.normalizedSha256) orelse continue;
             const base_rom = try readNormalizedRom(allocator, io, base_path);
             defer allocator.free(base_rom);
@@ -485,15 +502,19 @@ pub fn stageCachedVariants(
             const rom_filename = try std.fmt.allocPrint(allocator, "{s}.z64", .{rom_path});
             defer allocator.free(rom_filename);
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rom_filename, .data = target });
+            const sprite_filename = try std.fmt.allocPrint(allocator, "{s}.sprite", .{rom_path});
+            defer allocator.free(sprite_filename);
+            if (findCachedVariantArtwork(allocator, io, artwork_cache_directory, entry.id)) |artwork| {
+                defer allocator.free(artwork);
+                try writeArtworkSprite(allocator, io, artwork, sprite_filename);
+            } else |_| {}
             const variant_name = try asciiText(allocator, entry.name);
             defer allocator.free(variant_name);
             try manifest.writer.print("{s},{s},{s}.z64,{s}\n", .{ variant_id, variant_name, variant_id, entry.saveType orelse "" });
             staged += 1;
             used += 1;
         }
-        if (manifest.written().len != 0) {
-            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest.written() });
-        }
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest.written() });
     }
     return staged;
 }
@@ -687,7 +708,7 @@ pub fn importLibrary(
     var result = try scanLibrary(allocator, io, config);
     errdefer result.deinit(allocator);
 
-    try stageTitles(allocator, io, config.output_root, result.titles, progress);
+    try stageTitles(allocator, io, config.output_root, result.titles, config.selection, progress);
     return result;
 }
 
@@ -761,7 +782,7 @@ pub fn importRetroArchLibrary(
     try validateDirectory(io, output_root);
     var result = try scanRetroArchLibrary(allocator, io, options);
     errdefer result.deinit(allocator);
-    try stageTitles(allocator, io, output_root, result.preview.titles, progress);
+    try stageTitles(allocator, io, output_root, result.preview.titles, options.selection, progress);
     return result;
 }
 
@@ -770,14 +791,22 @@ fn stageTitles(
     io: std.Io,
     output_root: []const u8,
     titles: []Title,
+    selection: ?[]const sel.Key,
     progress: ?Progress,
 ) !void {
+    var staged: std.ArrayList(Title) = .empty;
+    defer staged.deinit(allocator);
+    for (titles) |title| {
+        if (selection) |keys| if (!sel.containsKey(keys, title.content_hash)) continue;
+        try staged.append(allocator, title);
+    }
+
     const cwd = std.Io.Dir.cwd();
     const title_root = try std.fs.path.join(allocator, &.{ output_root, "menu", "title" });
     defer allocator.free(title_root);
     try cwd.createDirPath(io, title_root);
 
-    for (titles, 0..) |*title, index| {
+    for (staged.items, 0..) |*title, index| {
         const destination = try std.fs.path.join(allocator, &.{ title_root, titleIdSlice(&title.id) });
         defer allocator.free(destination);
         try cwd.createDirPath(io, destination);
@@ -803,12 +832,12 @@ fn stageTitles(
         }
         if (progress) |reporter| reporter.callback(reporter.context, .{
             .completed = index + 1,
-            .total = titles.len,
+            .total = staged.items.len,
             .title = title,
         });
     }
 
-    const csv = try titleCsvBytes(allocator, titles);
+    const csv = try titleCsvBytes(allocator, staged.items);
     defer allocator.free(csv);
     const csv_path = try std.fs.path.join(allocator, &.{ output_root, "menu", "title.csv" });
     defer allocator.free(csv_path);
@@ -2077,14 +2106,103 @@ test "latest N64 revision becomes base and older revisions become variants" {
     const output = try tempPath(allocator, temp, "output");
     defer allocator.free(output);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, output);
-    try stageTitles(allocator, std.testing.io, output, result.titles, null);
-    try std.testing.expectEqual(@as(usize, 2), try stageLocalRevisions(allocator, std.testing.io, output, result.titles));
+    try stageTitles(allocator, std.testing.io, output, result.titles, null, null);
+    try std.testing.expectEqual(@as(usize, 2), try stageLocalRevisions(allocator, std.testing.io, output, result.titles, null));
     const manifest_path = try std.fs.path.join(allocator, &.{ output, "menu", "title", titleIdSlice(&result.titles[0].id), "variants.csv" });
     defer allocator.free(manifest_path);
     const manifest = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, allocator, .limited(1024));
     defer allocator.free(manifest);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "revision-1,Game (Rev A),revision-1.z64") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "revision-0,Game,revision-0.z64") != null);
+}
+
+test "staging writes only the selected games" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "roms");
+    for (0..2) |index| {
+        var rom: [64]u8 = @splat(0);
+        rom[0..4].* = .{ 0x80, 0x37, 0x12, 0x40 };
+        rom[0x3b..0x3f].* = .{ 'G', @intCast('A' + index), 'M', 'E' };
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "roms/Game-{d}.z64", .{index});
+        try temp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = &rom });
+    }
+    const root = try tempPath(allocator, temp, "roms");
+    defer allocator.free(root);
+    var result = try scanLibrary(allocator, std.testing.io, .{ .rom_root = root, .recursive = true });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), result.titles.len);
+
+    const output = try tempPath(allocator, temp, "output");
+    defer allocator.free(output);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, output);
+    const keep = result.titles[0];
+    const skip = result.titles[1];
+    try stageTitles(allocator, std.testing.io, output, result.titles, &.{keep.content_hash}, null);
+
+    const csv_path = try std.fs.path.join(allocator, &.{ output, "menu", "title.csv" });
+    defer allocator.free(csv_path);
+    const csv = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, csv_path, allocator, .limited(4096));
+    defer allocator.free(csv);
+    try std.testing.expect(std.mem.indexOf(u8, csv, titleIdSlice(&keep.id)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, csv, titleIdSlice(&skip.id)) == null);
+
+    const skipped_root = try std.fs.path.join(allocator, &.{ output, "menu", "title", titleIdSlice(&skip.id) });
+    defer allocator.free(skipped_root);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, skipped_root, .{}));
+}
+
+test "an empty selection stages nothing" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "roms");
+    var rom: [64]u8 = @splat(0);
+    rom[0..4].* = .{ 0x80, 0x37, 0x12, 0x40 };
+    rom[0x3b..0x3f].* = .{ 'G', 'A', 'M', 'E' };
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "roms/Game.z64", .data = &rom });
+    const root = try tempPath(allocator, temp, "roms");
+    defer allocator.free(root);
+    var result = try scanLibrary(allocator, std.testing.io, .{ .rom_root = root, .recursive = true });
+    defer result.deinit(allocator);
+
+    const output = try tempPath(allocator, temp, "output");
+    defer allocator.free(output);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, output);
+    try stageTitles(allocator, std.testing.io, output, result.titles, &.{}, null);
+
+    const csv_path = try std.fs.path.join(allocator, &.{ output, "menu", "title.csv" });
+    defer allocator.free(csv_path);
+    const csv = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, csv_path, allocator, .limited(4096));
+    defer allocator.free(csv);
+    try std.testing.expect(std.mem.indexOf(u8, csv, titleIdSlice(&result.titles[0].id)) == null);
+
+    const skipped_root = try std.fs.path.join(allocator, &.{ output, "menu", "title", titleIdSlice(&result.titles[0].id) });
+    defer allocator.free(skipped_root);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, skipped_root, .{}));
+}
+
+const cached_artwork_extensions = [_][]const u8{ ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff" };
+
+fn findCachedVariantArtwork(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, key: []const u8) ![]u8 {
+    for (cached_artwork_extensions) |extension| {
+        const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ key, extension });
+        defer allocator.free(filename);
+        const path = try std.fs.path.join(allocator, &.{ directory, filename });
+        errdefer allocator.free(path);
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                allocator.free(path);
+                continue;
+            },
+            else => return err,
+        };
+        if (stat.kind == .file) return path;
+        allocator.free(path);
+    }
+    return error.FileNotFound;
 }
 
 pub fn scanRetroArchPlaylistPath(
@@ -2120,7 +2238,7 @@ pub fn importRetroArchPlaylistPath(
     try validateDirectory(io, output_root);
     var result = try scanRetroArchPlaylistPath(allocator, io, playlist_path, options);
     errdefer result.deinit(allocator);
-    try stageTitles(allocator, io, output_root, result.preview.titles, progress);
+    try stageTitles(allocator, io, output_root, result.preview.titles, options.selection, progress);
     return result;
 }
 

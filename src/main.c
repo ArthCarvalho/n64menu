@@ -677,6 +677,7 @@ typedef struct TitleBox_s {
     float outlineCounter;
     float screenX;
     float screenY;
+    int variant_count;
 } TitleBox;
 
 #define MAX_VARIANTS 8
@@ -694,6 +695,8 @@ Variant selected_variants[MAX_VARIANTS];
 int selected_variant_count = 0;
 int selected_variant_index = 0;
 TitleBox *variants_title = NULL;
+sprite_t *selected_variant_image = NULL;
+static sprite_t *cover_load(char *filename);
 
 float title_brightness = 1.0f;
 
@@ -754,6 +757,7 @@ void TitleBox_create(TitleBox * title, sprite_t * image, float x, float y) {
     title->scaleGrow = 0.0f;
     title->selectedOutline = 0.0f;
     title->outlineCounter = 0.0f;
+    title->variant_count = 0;
 }
 
 void TitleBox_create2(TitleBox * title, sprite_t * image, char * id) {
@@ -773,6 +777,7 @@ void TitleBox_create2(TitleBox * title, sprite_t * image, char * id) {
     title->scaleGrow = 0.0f;
     title->selectedOutline = 0.0f;
     title->outlineCounter = 0.0f;
+    title->variant_count = 0;
 }
 
 void TitleBox_update(TitleBox * title) {
@@ -827,12 +832,15 @@ void TitleBox_draw(TitleBox * title) {
     // Unselected art recedes into the black field; the active cover is the only one at full strength.
     float level = title->isSelected ? 1.0f : 0.40f;
     int b = title_brightness * level * 255.0f;
-    if(title->image != NULL) {
+    sprite_t *draw_image = title->image;
+    bool separate_variant_image = title == selectedTitle && selected_variant_index > 0 && selected_variant_image != NULL;
+    if(separate_variant_image) draw_image = selected_variant_image;
+    if(draw_image != NULL) {
         rdpq_set_mode_standard();
         rdpq_mode_filter(FILTER_BILINEAR);
         rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
         rdpq_set_prim_color(RGBA32(b, b, b, 255));
-        rdpq_sprite_blit(title->image, offsetX, screenY, &(rdpq_blitparms_t){
+        rdpq_sprite_blit(draw_image, offsetX, screenY, &(rdpq_blitparms_t){
             .scale_x = titleScale, .scale_y = titleScale,
         });
     } else {
@@ -842,9 +850,30 @@ void TitleBox_draw(TitleBox * title) {
     }
 
     if(title->isSelected) {
+        if(title->variant_count > 0) {
+            // Three filled backs behind the active card make the collection read
+            // as a stack instead of a thick outline around one image.
+            rdpq_set_mode_fill(RGBA32(44, 18, 78, 255));
+            rdpq_fill_rectangle(offsetX + 12, screenY - 12, offsetX + scaledWidth + 12, screenY + scaledHeight - 12);
+            outline_draw(offsetX + 12, screenY - 12, scaledWidth, scaledHeight, 2, RGBA32(178, 168, 198, 255));
+            rdpq_set_mode_fill(RGBA32(74, 32, 122, 255));
+            rdpq_fill_rectangle(offsetX + 8, screenY - 8, offsetX + scaledWidth + 8, screenY + scaledHeight - 8);
+            outline_draw(offsetX + 8, screenY - 8, scaledWidth, scaledHeight, 2, RGBA32(206, 206, 216, 255));
+            // Repaint the front face above the backs.
+            if(draw_image != NULL) {
+                rdpq_set_mode_standard();
+                rdpq_mode_filter(FILTER_BILINEAR);
+                rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+                rdpq_set_prim_color(RGBA32(b, b, b, 255));
+                rdpq_sprite_blit(draw_image, offsetX, screenY, &(rdpq_blitparms_t){
+                    .scale_x = titleScale, .scale_y = titleScale,
+                });
+            }
+        }
         focus_draw(offsetX - 3, screenY - 3, scaledWidth + 6, scaledHeight + 6);
         if(title == selectedTitle && selected_variant_index > 0 && selected_variant_index <= selected_variant_count) {
             Variant *variant = &selected_variants[selected_variant_index - 1];
+            if(separate_variant_image) return;
             rdpq_set_scissor(offsetX, screenY, offsetX + scaledWidth, screenY + scaledHeight);
             rdpq_set_mode_fill(RGBA32(0, 0, 0, 190));
             rdpq_fill_rectangle(offsetX, screenY + scaledHeight - 28, offsetX + scaledWidth, screenY + scaledHeight);
@@ -852,15 +881,6 @@ void TitleBox_draw(TitleBox * title) {
                 .align = ALIGN_CENTER,
                 .width = scaledWidth - 8,
             }, FONT_SMALL, offsetX + 4, screenY + scaledHeight - 10, "^01%s", variant->name);
-            rdpq_set_scissor(GRID_SCISSOR_X_MIN, GRID_SCISSOR_Y_MIN, GRID_SCISSOR_X_MAX, GRID_SCISSOR_Y_MAX);
-        } else if(title == selectedTitle && selected_variant_count > 0) {
-            rdpq_set_scissor(offsetX, screenY, offsetX + scaledWidth, screenY + scaledHeight);
-            rdpq_set_mode_fill(RGBA32(0, 0, 0, 150));
-            rdpq_fill_rectangle(offsetX, screenY + scaledHeight - 28, offsetX + scaledWidth, screenY + scaledHeight);
-            rdpq_text_printf(&(rdpq_textparms_t){
-                .align = ALIGN_CENTER,
-                .width = scaledWidth - 8,
-            }, FONT_SMALL, offsetX + 4, screenY + scaledHeight - 10, "^01ORIGINAL");
             rdpq_set_scissor(GRID_SCISSOR_X_MIN, GRID_SCISSOR_Y_MIN, GRID_SCISSOR_X_MAX, GRID_SCISSOR_Y_MAX);
         }
     }
@@ -871,6 +891,12 @@ static void load_variants(TitleBox *title) {
     variants_title = title;
     selected_variant_count = 0;
     selected_variant_index = 0;
+    if(selected_variant_image != NULL) {
+        rspq_wait();
+        sprite_free(selected_variant_image);
+        selected_variant_image = NULL;
+    }
+    if(title != NULL) title->variant_count = 0;
     if(title == NULL) return;
     char path[128];
     snprintf(path, sizeof(path), "sd:/menu/title/%s/variants.csv", title->id);
@@ -908,6 +934,51 @@ static void load_variants(TitleBox *title) {
         selected_variant_count++;
     }
     fclose(f);
+    title->variant_count = selected_variant_count;
+}
+
+static void octagon_draw(float cx, float cy, int radius, color_t color) {
+    rdpq_set_mode_fill(color);
+    for(int y = -radius; y <= radius; y++) {
+        int inset = 0;
+        int edge = abs(y);
+        if(edge == radius) inset = 4;
+        else if(edge == radius - 1) inset = 2;
+        else if(edge == radius - 2) inset = 1;
+        rdpq_fill_rectangle(cx - radius + inset, cy + y,
+            cx + radius - inset + 1, cy + y + 1);
+    }
+}
+
+// Yellow C-button cap from the M64 footer: orange octagonal shell, yellow face,
+// then the directional orange inset. This is the button, not merely an arrow.
+void c_button_draw(float cx, float cy, bool right) {
+    color_t shadow = RGBA32(44, 18, 78, 255);
+    color_t edge = RGBA32(255, 122, 0, 255);
+    color_t fill = RGBA32(255, 214, 0, 255);
+    float direction = right ? 1.0f : -1.0f;
+    float x0 = cx - direction * 5.0f;
+    float x1 = cx + direction * 5.0f;
+
+    octagon_draw(cx + 1, cy + 2, 10, shadow);
+    octagon_draw(cx, cy, 10, edge);
+    octagon_draw(cx, cy - 1, 8, fill);
+    rdpq_set_mode_fill(edge);
+    rdpq_triangle(&TRIFMT_FILL,
+        (float[]){ x0, cy - 5 }, (float[]){ x0, cy + 5 }, (float[]){ x1, cy });
+}
+
+static void load_selected_variant_image(void) {
+    if(selected_variant_image != NULL) {
+        rspq_wait();
+        sprite_free(selected_variant_image);
+        selected_variant_image = NULL;
+    }
+    if(selectedTitle == NULL || selected_variant_index <= 0 || selected_variant_index > selected_variant_count) return;
+    Variant *variant = &selected_variants[selected_variant_index - 1];
+    char path[160];
+    snprintf(path, sizeof(path), "sd:/menu/title/%s/variants/%s.sprite", selectedTitle->id, variant->id);
+    selected_variant_image = cover_load(path);
 }
 
 static void cover_cache_init(void) {
@@ -1428,10 +1499,12 @@ void menu_update() {
         if(p1_buttons_press.c_left && selected_variant_count > 0) {
             selected_variant_index--;
             if(selected_variant_index < 0) selected_variant_index = selected_variant_count;
+            load_selected_variant_image();
         }
         if(p1_buttons_press.c_right && selected_variant_count > 0) {
             selected_variant_index++;
             if(selected_variant_index > selected_variant_count) selected_variant_index = 0;
+            load_selected_variant_image();
         }
         if(p1_buttons_press.a) {
             main_state = 4;
@@ -1592,21 +1665,21 @@ void draw(int cur_frame) {
         // dim violet was chosen against black and lost most of its contrast once the
         // ground became violet too.
         rdpq_text_printf(NULL, FONT_SMALL, BOX_REGION_X_MIN, HINT_Y + 12,
-            title_catalog_incomplete ? "^00%zu ^02TITLES (PARTIAL)" : "^00%zu ^02TITLES", title_count);
+            title_catalog_incomplete ? "^00%u ^02TITLES (PARTIAL)" : "^00%u ^02TITLES", (unsigned int)title_count);
 
         // Circular M64-style caps. The letter is centred on the cap and drawn in
         // black, so it reads as printed on the button rather than floating over it.
-        button_cap_draw(427, HINT_Y + 9,
+        button_cap_draw(510, HINT_Y + 9,
             RGBA32(0, 50, 150, 255), RGBA32(0, 104, 230, 255), RGBA32(62, 160, 255, 255));
-        button_letter_draw(427, HINT_Y + 9, "^05A");
-        rdpq_text_print(NULL, FONT_SMALL, 446, HINT_Y + 14, "PLAY");
-
-        button_cap_draw(527, HINT_Y + 9,
-            RGBA32(0, 96, 40, 255), RGBA32(0, 183, 73, 255), RGBA32(55, 235, 120, 255));
-        button_letter_draw(527, HINT_Y + 9, "^05B");
-        rdpq_text_print(NULL, FONT_SMALL, 546, HINT_Y + 14, "BACK");
+        button_letter_draw(510, HINT_Y + 9, "^05A");
+        rdpq_text_print(NULL, FONT_SMALL, 529, HINT_Y + 14, "PLAY");
         if(selected_variant_count > 0) {
-            rdpq_text_print(NULL, FONT_SMALL, 300, HINT_Y + 14, "C< / C> VERSION");
+            // Fixed slots: 21px cap, 12px gap, 84px text, 12px gap, 21px cap.
+            // Keeping the right cap beyond the text box prevents the final N
+            // from being clipped while leaving clear space before A / PLAY.
+            c_button_draw(317, HINT_Y + 9, false);
+            rdpq_text_print(NULL, FONT_SMALL, 337, HINT_Y + 14, "VERSION");
+            c_button_draw(443, HINT_Y + 9, true);
         }
     }
 
@@ -1674,6 +1747,7 @@ int main(void)
     rdpq_font_style(font_title, STYLE_WHITE,  &white);
     rdpq_font_style(font_title, STYLE_YELLOW, &yellow);
     rdpq_font_style(font_small, STYLE_WHITE, &white);
+    rdpq_font_style(font_small, STYLE_YELLOW, &yellow);
     rdpq_font_style(font_small, STYLE_DIM, &dim);
     rdpq_font_style(font_small, STYLE_GREY, &grey);
     rdpq_font_style(font_small, STYLE_OUTLINE, &keyline);

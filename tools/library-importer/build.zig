@@ -28,9 +28,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const selection_mod = b.createModule(.{
+        .root_source_file = b.path("src/selection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     core.addImport("bps", bps_mod);
     core.addImport("registry", registry_mod);
     core.addImport("vcdiff", vcdiff_mod);
+    core.addImport("selection", selection_mod);
     const sdcard = b.createModule(.{
         .root_source_file = b.path("src/sdcard.zig"),
         .target = target,
@@ -55,8 +61,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }));
     app.addImport("registry", registry_mod);
+    app.addImport("selection", selection_mod);
     app.addImport("bps", bps_mod);
     app.addImport("sdcard", sdcard);
+    app.addImport("font", b.createModule(.{
+        .root_source_file = b.path("src/font.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     app.addImport("startup", b.createModule(.{
         .root_source_file = b.path("src/startup.zig"),
         .target = target,
@@ -93,6 +105,7 @@ pub fn build(b: *std.Build) void {
     tests_mod.addImport("bps", bps_mod);
     tests_mod.addImport("registry", registry_mod);
     tests_mod.addImport("vcdiff", vcdiff_mod);
+    tests_mod.addImport("selection", selection_mod);
     const tests = b.addTest(.{ .root_module = tests_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run importer core tests");
@@ -198,6 +211,28 @@ pub fn build(b: *std.Build) void {
     const run_ui_scale_tests = b.addRunArtifact(ui_scale_tests);
     run_ui_scale_tests.step.dependOn(&run_startup_tests.step);
     test_step.dependOn(&run_ui_scale_tests.step);
+
+    const font_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/font.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_font_tests = b.addRunArtifact(font_tests);
+    run_font_tests.step.dependOn(&run_ui_scale_tests.step);
+    test_step.dependOn(&run_font_tests.step);
+
+    const selection_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/selection.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_selection_tests = b.addRunArtifact(selection_tests);
+    run_selection_tests.step.dependOn(&run_font_tests.step);
+    test_step.dependOn(&run_selection_tests.step);
 
     const inspect_mod = b.createModule(.{
         .root_source_file = b.path("src/inspect.zig"),

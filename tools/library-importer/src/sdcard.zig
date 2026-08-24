@@ -51,6 +51,27 @@ pub const Progress = struct {
     callback: *const fn (?*anyopaque, ProgressEvent) void,
 };
 
+pub const TracePhase = enum { begin, done };
+
+/// Per-file timings for the direct-SD copy. Cards are slow in ways that are not
+/// obvious from throughput alone, so each filesystem step is measured
+/// separately rather than inferred.
+pub const TraceEvent = struct {
+    phase: TracePhase,
+    path: []const u8,
+    bytes: u64 = 0,
+    mkdir_ns: u64 = 0,
+    open_ns: u64 = 0,
+    write_ns: u64 = 0,
+    commit_ns: u64 = 0,
+    total_ns: u64 = 0,
+};
+
+pub const Trace = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (?*anyopaque, TraceEvent) void,
+};
+
 pub const PlannedFile = struct {
     relative_path: []u8,
 };
@@ -219,6 +240,64 @@ pub fn planSync(
     return .{ .files = try files.toOwnedSlice(allocator) };
 }
 
+/// `Dir.copyFile` streams through a 1 KiB stack buffer, and Windows offers no
+/// file-to-file fast path, so `sendFile` reports `Unimplemented` and the copy
+/// falls back to that buffer. A 32 MiB ROM then becomes tens of thousands of
+/// one-kilobyte writes, and Windows mounts removable cards write-through by
+/// default, so every one of them reaches the card. Copying through a large
+/// buffer keeps a ROM to a few hundred writes instead.
+pub const copy_buffer_bytes: usize = 4 << 20;
+
+const FileTimings = struct {
+    bytes: u64 = 0,
+    open_ns: u64 = 0,
+    write_ns: u64 = 0,
+    commit_ns: u64 = 0,
+};
+
+fn elapsedNanoseconds(io: std.Io, from: std.Io.Timestamp) u64 {
+    const delta = from.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+    return if (delta <= 0) 0 else @intCast(delta);
+}
+
+fn copyThroughBuffer(
+    io: std.Io,
+    source: []const u8,
+    destination: []const u8,
+    buffer: []u8,
+    timings: *FileTimings,
+) !void {
+    const cwd = std.Io.Dir.cwd();
+    const open_start = std.Io.Timestamp.now(io, .awake);
+    const file = try cwd.openFile(io, source, .{});
+    var file_reader: std.Io.File.Reader = .init(file, io, &.{});
+    defer file_reader.file.close(io);
+    const stat = try file_reader.file.stat(io);
+    file_reader.size = stat.size;
+    timings.bytes = stat.size;
+
+    var atomic_file = try cwd.createFileAtomic(io, destination, .{
+        .permissions = stat.permissions,
+        .make_path = false,
+        .replace = true,
+    });
+    defer atomic_file.deinit(io);
+    timings.open_ns = elapsedNanoseconds(io, open_start);
+
+    const write_start = std.Io.Timestamp.now(io, .awake);
+    var file_writer = atomic_file.file.writer(io, buffer);
+    _ = file_writer.interface.sendFileAll(&file_reader, .unlimited) catch |err| switch (err) {
+        error.ReadFailed => return file_reader.err.?,
+        error.WriteFailed => return file_writer.err.?,
+    };
+    try file_writer.flush();
+    timings.write_ns = elapsedNanoseconds(io, write_start);
+
+    const commit_start = std.Io.Timestamp.now(io, .awake);
+    try atomic_file.replace(io);
+    timings.commit_ns = elapsedNanoseconds(io, commit_start);
+}
+
 /// Copies a staging tree directly onto a selected card without deleting any
 /// destination content. Save files are excluded even if present in staging.
 pub fn syncFromStaging(
@@ -227,6 +306,7 @@ pub fn syncFromStaging(
     staging_root: []const u8,
     card_root: []const u8,
     progress: ?Progress,
+    trace: ?Trace,
 ) !void {
     if (!directoryExists(io, card_root)) return error.CardRootNotFound;
     const menu_marker = try std.fs.path.join(allocator, &.{ card_root, "sc64menu.n64" });
@@ -237,15 +317,41 @@ pub fn syncFromStaging(
     var plan = try planSync(allocator, io, staging_root);
     defer plan.deinit(allocator);
 
+    const copy_buffer = try allocator.alloc(u8, copy_buffer_bytes);
+    defer allocator.free(copy_buffer);
+
     const cwd = std.Io.Dir.cwd();
     for (plan.files, 0..) |file, index| {
+        const file_start = std.Io.Timestamp.now(io, .awake);
+        if (trace) |reporter| reporter.callback(reporter.context, .{ .phase = .begin, .path = file.relative_path });
+
+        // Reported before the copy: a ROM takes seconds, so naming it only on
+        // completion leaves the previous file on screen for the whole transfer.
+        if (progress) |reporter| reporter.callback(reporter.context, .{
+            .current = index + 1,
+            .total = plan.files.len,
+            .path = file.relative_path,
+        });
+
         const source = try std.fs.path.join(allocator, &.{ staging_root, file.relative_path });
         defer allocator.free(source);
         const destination = try std.fs.path.join(allocator, &.{ card_root, file.relative_path });
         defer allocator.free(destination);
-        if (std.fs.path.dirname(destination)) |parent| try cwd.createDirPath(io, parent);
 
+        // Only nested files need their parent built. Taking the dirname of the
+        // destination instead would hand the drive root to createDirPath for a
+        // file such as sc64menu.n64, which fails with BadPathName.
+        const mkdir_start = std.Io.Timestamp.now(io, .awake);
+        if (std.fs.path.dirname(file.relative_path)) |relative_parent| {
+            const parent = try std.fs.path.join(allocator, &.{ card_root, relative_parent });
+            defer allocator.free(parent);
+            try cwd.createDirPath(io, parent);
+        }
+        const mkdir_ns = elapsedNanoseconds(io, mkdir_start);
+
+        var timings = FileTimings{};
         if (isTitleCsv(file.relative_path)) {
+            const open_start = std.Io.Timestamp.now(io, .awake);
             var random_bytes: [8]u8 = undefined;
             io.random(&random_bytes);
             const temporary = try std.fmt.allocPrint(
@@ -256,18 +362,27 @@ pub fn syncFromStaging(
             defer allocator.free(temporary);
             errdefer cwd.deleteFile(io, temporary) catch {};
             try cwd.copyFile(source, cwd, temporary, io, .{});
+            timings.open_ns = elapsedNanoseconds(io, open_start);
+
+            const commit_start = std.Io.Timestamp.now(io, .awake);
             var temporary_file = try cwd.openFile(io, temporary, .{ .mode = .read_write });
             defer temporary_file.close(io);
             try temporary_file.sync(io);
             try cwd.rename(temporary, cwd, destination, io);
+            timings.commit_ns = elapsedNanoseconds(io, commit_start);
         } else {
-            try cwd.copyFile(source, cwd, destination, io, .{});
+            try copyThroughBuffer(io, source, destination, copy_buffer, &timings);
         }
 
-        if (progress) |reporter| reporter.callback(reporter.context, .{
-            .current = index + 1,
-            .total = plan.files.len,
+        if (trace) |reporter| reporter.callback(reporter.context, .{
+            .phase = .done,
             .path = file.relative_path,
+            .bytes = timings.bytes,
+            .mkdir_ns = mkdir_ns,
+            .open_ns = timings.open_ns,
+            .write_ns = timings.write_ns,
+            .commit_ns = timings.commit_ns,
+            .total_ns = elapsedNanoseconds(io, file_start),
         });
     }
 }
@@ -498,7 +613,7 @@ test "sync copies menu tree and ROM while preserving saves and unrelated files" 
     try syncFromStaging(allocator, std.testing.io, staging, card, .{
         .context = &capture,
         .callback = ProgressCapture.report,
-    });
+    }, .{ .context = &capture, .callback = ProgressCapture.trace });
     try expectFile(temp, "card/sc64menu.n64", "new menu");
     try expectFile(temp, "card/menu/title/ABCDE/ABCDE_e.z64", "rom");
     try expectFile(temp, "card/menu/title/ABCDE/ABCDE_e.sprite", "sprite");
@@ -507,9 +622,12 @@ test "sync copies menu tree and ROM while preserving saves and unrelated files" 
     try expectFile(temp, "card/unrelated.txt", "keep me");
     try std.testing.expect(capture.count > 0);
     try std.testing.expect(pathsEqual(capture.last_path[0..capture.last_len], titleCsvRelativePath()));
+    try std.testing.expectEqual(capture.count, capture.traced_begin);
+    try std.testing.expectEqual(capture.count, capture.traced_done);
+    try std.testing.expect(capture.traced_bytes > 0);
 
     try temp.dir.deleteFile(std.testing.io, "card/sc64menu.n64");
-    try std.testing.expectError(error.CardIdentityChanged, syncFromStaging(allocator, std.testing.io, staging, card, null));
+    try std.testing.expectError(error.CardIdentityChanged, syncFromStaging(allocator, std.testing.io, staging, card, null, null));
 }
 
 test "sync plan puts title csv last and excludes saves" {
@@ -536,6 +654,9 @@ const ProgressCapture = struct {
     count: usize = 0,
     last_path: [512]u8 = undefined,
     last_len: usize = 0,
+    traced_begin: usize = 0,
+    traced_done: usize = 0,
+    traced_bytes: u64 = 0,
 
     fn report(context: ?*anyopaque, event: ProgressEvent) void {
         const self: *ProgressCapture = @ptrCast(@alignCast(context.?));
@@ -543,6 +664,17 @@ const ProgressCapture = struct {
         self.last_len = @min(event.path.len, self.last_path.len);
         @memcpy(self.last_path[0..self.last_len], event.path[0..self.last_len]);
         std.debug.assert(event.current <= event.total);
+    }
+
+    fn trace(context: ?*anyopaque, event: TraceEvent) void {
+        const self: *ProgressCapture = @ptrCast(@alignCast(context.?));
+        switch (event.phase) {
+            .begin => self.traced_begin += 1,
+            .done => {
+                self.traced_done += 1;
+                self.traced_bytes += event.bytes;
+            },
+        }
     }
 };
 
@@ -554,4 +686,48 @@ fn expectFile(temp: std.testing.TmpDir, relative_path: []const u8, expected: []c
 
 fn tempPath(allocator: std.mem.Allocator, temp: std.testing.TmpDir, child: []const u8) ![]u8 {
     return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &temp.sub_path, child });
+}
+
+test "buffered copy reproduces payloads larger than the buffer" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+
+    const payload = try allocator.alloc(u8, 5000);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index *% 7);
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "source.bin", .data = payload });
+
+    const source = try tempPath(allocator, temp, "source.bin");
+    defer allocator.free(source);
+    const destination = try tempPath(allocator, temp, "destination.bin");
+    defer allocator.free(destination);
+
+    var buffer: [512]u8 = undefined;
+    var timings = FileTimings{};
+    try copyThroughBuffer(std.testing.io, source, destination, &buffer, &timings);
+
+    const copied = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, destination, allocator, .limited(8192));
+    defer allocator.free(copied);
+    try std.testing.expectEqualSlices(u8, payload, copied);
+    try std.testing.expectEqual(@as(u64, payload.len), timings.bytes);
+}
+
+test "buffered copy replaces an existing destination" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "source.bin", .data = "fresh" });
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "destination.bin", .data = "stale payload" });
+
+    const source = try tempPath(allocator, temp, "source.bin");
+    defer allocator.free(source);
+    const destination = try tempPath(allocator, temp, "destination.bin");
+    defer allocator.free(destination);
+
+    var buffer: [64]u8 = undefined;
+    var timings = FileTimings{};
+    try copyThroughBuffer(std.testing.io, source, destination, &buffer, &timings);
+    try expectFile(temp, "destination.bin", "fresh");
 }
